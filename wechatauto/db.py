@@ -48,6 +48,22 @@ CONFIG_XOR_MASK = bytes.fromhex(
 )
 HEX_LITERAL_RE = re.compile(rb"[xX]'([0-9a-fA-F]{64,192})'")
 
+# 主密钥 cfg 提取(ReadWeixinKey-rev 同源, 每版本需重采锚点):
+#   weixin.dll 特征码(sub_1803308D0 机器码前缀, 其后 4×movabs 立即数 = XOR 材料)
+MASTER_DLL_PATTERN = bytes.fromhex(
+    "83ec404889d64889cb0f57c00f1142100f11024c8bb1c8020000"
+    "4883b9d0020000107209488b9bb8020000eb074881c3b8020000"
+    "4d85f60f880a0200004983fe10736d4c89761048c746180f0000"
+    "000f10030f110648b8"
+)
+MASTER_DLL_VERIFY = (b"488944242048b8", b"488944242848b8", b"488944243048b8")
+CFG_LANDMARK = b"global_config"   # cfg 对象地标字符串(SSO 内联)
+CFG_PTR_BACK = 0x138              # 地标前指针链回退偏移(版本敏感: 4.1.10.31=0x130)
+CFG_OFFSET = 0x68                 # v18 → cfg 指针偏移(版本敏感)
+CFG_DWORD_OFF = 0x40              # cfgDword(图片密钥派生源)
+CFG_WXID_OFF = 0x48               # wxId std::string
+CFG_CIPHER_OFF = 0x2B8            # dbKey 密文 std::string
+
 MSG_TYPE_NAMES = {
     1: "文本",
     3: "图片",
@@ -71,6 +87,21 @@ class _MBI(ctypes.Structure):
         ("Protect", wintypes.DWORD),
         ("Type", wintypes.DWORD),
         ("__alignment2", wintypes.DWORD),
+    ]
+
+
+class _MODULEENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("th32ModuleID", wintypes.DWORD),
+        ("th32ProcessID", wintypes.DWORD),
+        ("GlblcntUsage", wintypes.DWORD),
+        ("ProccntUsage", wintypes.DWORD),
+        ("modBaseAddr", ctypes.c_void_p),
+        ("modBaseSize", wintypes.DWORD),
+        ("hModule", wintypes.HMODULE),
+        ("szModule", ctypes.c_wchar * 256),
+        ("szExePath", ctypes.c_wchar * 260),
     ]
 
 
@@ -139,6 +170,172 @@ def _sqlite_text_factory(data: bytes):
         return data.decode("utf-8")
     except UnicodeDecodeError:
         return data
+
+
+# ---------------------------------------------------------------------------
+# 主密钥 cfg 提取(ReadWeixinKey-rev 同源; 锚点每版本重采)
+# ---------------------------------------------------------------------------
+def _find_weixin_module(pid: int) -> Optional[Tuple[int, int, str]]:
+    """返回 (模块基址, 模块大小, 路径); weixin.dll 为微信 4.x 主模块"""
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    k32.CloseHandle.argtypes = [ctypes.c_void_p]
+    k32.Module32FirstW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_MODULEENTRY32W)]
+    k32.Module32NextW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_MODULEENTRY32W)]
+    snap = k32.CreateToolhelp32Snapshot(0x08 | 0x10, pid)
+    if not snap or snap == -1 or snap == (1 << 64) - 1:
+        return None
+    try:
+        me = _MODULEENTRY32W()
+        me.dwSize = ctypes.sizeof(me)
+        ok = k32.Module32FirstW(snap, ctypes.byref(me))
+        while ok:
+            if me.szModule and me.szModule.lower() == "weixin.dll":
+                return (me.modBaseAddr or 0), me.modBaseSize, me.szExePath
+            me.dwSize = ctypes.sizeof(me)
+            ok = k32.Module32NextW(snap, ctypes.byref(me))
+    finally:
+        k32.CloseHandle(snap)
+    return None
+
+
+def _extract_movabs_xor_key(dll_path: str) -> Optional[bytes]:
+    """从 weixin.dll 特征码后提取 4×movabs 立即数拼接成 32 字节 XOR 材料。
+
+    特征码(sub_1803308D0 前缀)后紧跟 4 个 '48 b8 <imm64>' movabs 指令,
+    立即数即主密钥的 XOR 材料。小版本通常不改此代码段, 大版本需重采。
+    """
+    try:
+        with open(dll_path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    hit = data.find(MASTER_DLL_PATTERN)
+    if hit < 0:
+        return None
+    take = min(200, len(data) - hit)
+    hex_txt = data[hit:hit + take].hex()
+    hex_txt = hex_txt[len(MASTER_DLL_PATTERN) * 2:]  # 丢弃特征码自身
+    key = ""
+    for vf in MASTER_DLL_VERIFY:
+        if len(hex_txt) < 30 or hex_txt[16:30] != vf.decode():
+            return None
+        key += hex_txt[0:16]
+        hex_txt = hex_txt[30:]
+    if len(hex_txt) < 16:
+        return None
+    key += hex_txt[0:16]
+    try:
+        return bytes.fromhex(key)
+    except ValueError:
+        return None
+
+
+def _read_remote_string(h, read, addr: int) -> str:
+    """跨进程读 MSVC x64 std::string(SSO: size<=15 内联, 否则堆指针)"""
+    sz_buf = read(addr + 16, 8)
+    if not sz_buf:
+        return ""
+    size = struct.unpack_from("<Q", sz_buf)[0]
+    if size <= 0 or size > 0x7FFFFFFF:
+        return ""
+    if size <= 15:
+        data = read(addr, size)
+    else:
+        p_buf = read(addr, 8)
+        if not p_buf:
+            return ""
+        data = read(struct.unpack_from("<Q", p_buf)[0], size)
+    if not data:
+        return ""
+    return data[:size].decode("utf-8", "replace")
+
+
+def _read_remote_bytes(h, read, addr: int) -> Optional[bytes]:
+    """跨进程读字节缓冲(std::string 布局: data@+0, size@+16, cap@+24)"""
+    sz_buf = read(addr + 16, 8)
+    if not sz_buf:
+        return None
+    size = struct.unpack_from("<Q", sz_buf)[0]
+    if size <= 0 or size > 0x400:
+        return None
+    cap_buf = read(addr + 24, 4)
+    cap = struct.unpack_from("<I", cap_buf)[0] if cap_buf else 0
+    if (cap | 0xF) == 0xF:
+        data = read(addr, size)          # SSO 内联
+    else:
+        p_buf = read(addr, 8)
+        if not p_buf:
+            return None
+        data = read(struct.unpack_from("<Q", p_buf)[0], size)
+    if not data or len(data) != size:
+        return None
+    return data[:size]
+
+
+def extract_master_key_from_cfg(pid: int) -> Optional[Tuple[str, int, str]]:
+    """从 Weixin.exe 进程提取 (主密钥hex, cfgDword, wxId)。
+
+    流程(ReadWeixinKey-rev 同源): 整块读 weixin.dll 映像 → 扫 global_config
+    SSO 地标 → 指针链 cfg → 读 cfg+0x2B8 密文与 cfg+0x40 cfgDword →
+    密文 XOR DLL movabs 材料得主密钥。锚点(CFG_PTR_BACK/CFG_OFFSET/特征码)
+    每版本重采; 提取失败返回 None。
+    """
+    base, mod_size, dll_path = _find_weixin_module(pid) or (0, 0, "")
+    if not base or not dll_path or mod_size <= 0 or mod_size >= 0x40000000:
+        return None
+    h = _k32.OpenProcess(0x0010 | 0x0400, False, pid)
+    if not h:
+        return None
+    try:
+        def read(addr: int, n: int):
+            buf = ctypes.create_string_buffer(n)
+            br = ctypes.c_size_t(0)
+            if _k32.ReadProcessMemory(h, ctypes.c_void_p(addr), buf, n, ctypes.byref(br)) and br.value:
+                return buf.raw[: br.value]
+            return None
+
+        image = read(base, mod_size)
+        if not image or len(image) != mod_size:
+            return None
+        # 扫 global_config SSO 地标(size==13@+16, cap==15@+24, 内容内联@+0)
+        pos = -1
+        for i in range(len(image) - 8, 0, -8):
+            if struct.unpack_from("<I", image, i)[0] == len(CFG_LANDMARK):
+                cap = struct.unpack_from("<I", image, i + 8)[0]
+                if cap and (cap | 0xF) == 0xF and i - 16 >= 0:
+                    if image[i - 16:i - 16 + len(CFG_LANDMARK)] == CFG_LANDMARK:
+                        pos = i
+                        break
+        if pos < 0:
+            return None
+        # 指针链: v18 = *(base + pos - CFG_PTR_BACK); cfg = *(v18 + CFG_OFFSET)
+        v18_buf = read(base + pos - CFG_PTR_BACK, 8)
+        if not v18_buf:
+            return None
+        v18 = struct.unpack_from("<Q", v18_buf)[0]
+        cfg_buf = read(v18 + CFG_OFFSET, 8)
+        if not cfg_buf:
+            return None
+        cfg = struct.unpack_from("<Q", cfg_buf)[0]
+        if not (0x10000 <= cfg < 0x800000000000):
+            return None
+        # cfgDword + wxId
+        dw_buf = read(cfg + CFG_DWORD_OFF, 4)
+        cfg_dword = struct.unpack_from("<I", dw_buf)[0] if dw_buf else 0
+        wxid = _read_remote_string(h, read, cfg + CFG_WXID_OFF)
+        # dbKey 密文
+        cipher = _read_remote_bytes(h, read, cfg + CFG_CIPHER_OFF)
+        if not cipher:
+            return None
+        material = _extract_movabs_xor_key(dll_path)
+        if not material or len(material) != len(cipher):
+            return None
+        master = bytes(a ^ b for a, b in zip(cipher, material))
+        return master.hex(), cfg_dword, wxid
+    finally:
+        _k32.CloseHandle(h)
 
 
 def _decrypt_page(enc_key: bytes, page: bytes, pgno: int) -> bytes:
@@ -221,6 +418,7 @@ class WeChatDB:
         keys_file: Optional[str] = None,
         workdir: Optional[str] = None,
         account: Optional[str] = None,
+        master_key: Optional[str] = None,
     ):
         self.db_dir = db_dir or auto_detect_db_dir()
         if not self.db_dir:
@@ -233,7 +431,9 @@ class WeChatDB:
         self.keys_file = keys_file or os.path.join(self.workdir, "keys.json")
         self._keys: Dict[str, bytes] = {}
         self._db_files = self._collect_db_files()
-        self._load_or_extract_keys()
+        self.master_key: Optional[str] = None
+        self.cfg_dword: Optional[int] = None
+        self._load_or_extract_keys(master_key=master_key)
 
     # ------------------------------------------------------------------
     # 账号与数据库文件
@@ -294,30 +494,57 @@ class WeChatDB:
     # ------------------------------------------------------------------
     # 密钥提取
     # ------------------------------------------------------------------
-    def _load_or_extract_keys(self) -> None:
-        if os.path.exists(self.keys_file):
-            try:
-                with open(self.keys_file, "r", encoding="utf-8") as f:
-                    saved = json.load(f)
-                for rel, hexkey in saved.items():
-                    try:
-                        self._keys[rel] = bytes.fromhex(hexkey)
-                    except ValueError:
-                        pass
-            except (json.JSONDecodeError, OSError):
-                pass
-        missing = [
-            rel for rel, path, _ in self._db_files
-            if rel not in self._keys or not self._key_works(rel)
-        ]
-        if missing:
-            extracted = self.extract_keys()
-            self._keys.update(extracted)
+    KDF_ITER = 256000  # 主密钥→库密钥 PBKDF2 迭代(微信魔改 WCDB, 实测确认)
+
+    def _load_or_extract_keys(self, master_key: Optional[str] = None) -> None:
+        """加载/提取密钥, 四层优先级:
+
+        1. 显式 master_key(构造参数) → 主密钥派生;
+        2. cfg 自动提取(进程内存, 免手动注入);
+        3. 本地缓存 keys.json;
+        4. Config.Cipher 内存扫描(最终回退)。
+
+        派生/扫描结果均经 SQLCipher4 页1 HMAC 强校验, 零误报。
+        """
+        if master_key:
+            self._keys.update(self.derive_keys_from_master(master_key))
+            self.master_key = master_key
+            self.cfg_dword = None
             self._save_keys()
+        else:
+            auto = self.extract_master_key()
+            if auto:
+                master, cfg_dword, _ = auto
+                self.master_key = master
+                self.cfg_dword = cfg_dword
+                self._keys.update(self.derive_keys_from_master(master))
+                self._save_keys()
+            else:
+                self.master_key = None
+                self.cfg_dword = None
+                if os.path.exists(self.keys_file):
+                    try:
+                        with open(self.keys_file, "r", encoding="utf-8") as f:
+                            saved = json.load(f)
+                        for rel, hexkey in saved.items():
+                            try:
+                                self._keys[rel] = bytes.fromhex(hexkey)
+                            except ValueError:
+                                pass
+                    except (json.JSONDecodeError, OSError):
+                        pass
+                missing = [
+                    rel for rel, path, _ in self._db_files
+                    if rel not in self._keys or not self._key_works(rel)
+                ]
+                if missing:
+                    extracted = self.extract_keys()
+                    self._keys.update(extracted)
+                    self._save_keys()
         still = [
             rel for rel, _, _ in self._db_files if not self._key_works(rel)
         ]
-        if still and missing:
+        if still:
             import sys as _sys
             print(
                 "[wechatauto] 警告: 以下库无可用密钥，无法解密: %s"
@@ -331,6 +558,45 @@ class WeChatDB:
                 file=_sys.stderr,
             )
         self.unkeyed = still
+
+    def derive_keys_from_master(self, master_hex: str) -> Dict[str, bytes]:
+        """主密钥派生逐库密钥: PBKDF2-HMAC-SHA512(主密钥, 库头salt, KDF_ITER)。
+
+        微信 4.x 为单一主密钥 + 每库随机 salt 派生独立库密钥(SQLCipher4
+        passphrase 语义)。仅返回通过页1 HMAC 校验的派生密钥。
+        """
+        try:
+            master = bytes.fromhex(master_hex)
+        except ValueError:
+            raise ValueError("主密钥必须为 64 位 hex 字符串")
+        if len(master) != 32:
+            raise ValueError("主密钥必须为 32 字节(64 位 hex)")
+        keys: Dict[str, bytes] = {}
+        for rel, path, _ in self._db_files:
+            try:
+                with open(path, "rb") as f:
+                    page1 = f.read(PAGE_SZ)
+            except OSError:
+                continue
+            if len(page1) < PAGE_SZ:
+                continue
+            derived = _pbkdf2(master, page1[:16], self.KDF_ITER)
+            if _verify_enc_key(derived, page1):
+                keys[rel] = derived
+        return keys
+
+    def extract_master_key(self) -> Optional[Tuple[str, int, str]]:
+        """从 Weixin.exe 进程 cfg 自动提取 (主密钥hex, cfgDword, wxId)。
+
+        遍历微信进程调 extract_master_key_from_cfg; 主密钥可离线派生全部库。
+        微信未运行或锚点漂移(版本变更)时返回 None, 由调用方回退。
+        """
+        pids = self._find_weixin_pids()
+        for pid in pids:
+            got = extract_master_key_from_cfg(pid)
+            if got:
+                return got
+        return None
 
     def _key_works(self, rel: str) -> bool:
         key = self._keys.get(rel)
