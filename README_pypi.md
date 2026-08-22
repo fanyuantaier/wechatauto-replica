@@ -1,3 +1,9 @@
+> [!NOTE]
+> **📢 维护状态 / Maintenance Notice**
+> 本人因今年升高一，明天（8月23日）报到。开学后几乎没有时间继续更新本项目（如果有时间，争取周日更新）。遇到问题请自行在 Issues 区讨论，或询问 AI 协助解决。感谢支持！
+>
+> I'm starting senior high school and will register tomorrow (Aug 23). After school starts I'll have almost no time to keep updating (Sundays if possible). Please discuss issues in the Issues section or ask an AI. Thanks for your support!
+
 # wechatauto-replica — 微信 4.x Windows 自动化 / WeChat 4.x Automation
 
 > **中文版** 在下方 · **English version below**
