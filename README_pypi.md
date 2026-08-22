@@ -18,7 +18,7 @@
 本项目复刻上游 wxauto 项目，目标是实现对当前微信 4.x Windows 客户端的自动化
 （读取消息、发送消息、媒体下载、朋友圈），非网页版，直接操作本机客户端。
 
-> 当前版本：1.1.6.3
+> 当前版本：1.1.7
 >
 > **兼容范围**：Windows 10/11 ｜ Python 3.9+（已在 3.12 验证）｜ 微信 **4.1.12+**
 > （数据库读取路线对微信版本不敏感；坐标+OCR 发送路线依赖 4.1.12+ 自绘渲染
@@ -39,10 +39,19 @@
 > 感谢 [maozhitao12450](https://github.com/maozhitao12450) 报告 WXAM (wxgf) 图片下载问题（v1.1.3 修复）。
 >
 > 感谢 [uiharukazari0105](https://github.com/uiharukazari0105) 发现语音数据分片存储（`media_1.db` 等）从未被搜索的问题（v1.1.4 修复）。
+Thanks to [NothingFumo](https://github.com/NothingFumo) for the master-key extraction design (cfg + PBKDF2-derived per-DB keys, v1.1.7).
+感谢 [NothingFumo](https://github.com/NothingFumo) 提出主密钥提取方案（cfg + PBKDF2 派生逐库密钥，v1.1.7）。
 
 ---
 
 ## 版本记录
+
+### v1.1.7（2026-08-22）
+
+- **基于主密钥的密钥提取（PR #10，感谢 [NothingFumo](https://github.com/NothingFumo)）**：不再依赖进程内存中逐个库的 `Config.Cipher` 字面量扫描（微信 4.1.12.26+ 已失效），改为从 `cfg` 结构提取**单一主密钥**（`cfg+0x2B8` 密文 ⊕ DLL 中 4×movabs 常量），再通过 `PBKDF2-HMAC-SHA512(主密钥, 库salt, 256000)` **离线派生各库独立密钥**——27/27 个 SQLCipher4 数据库实测验证通过。解决 4.1.12.26+ 密钥提取失效（issue #3 / #7）。
+- **图片密钥统一流程**：模板收集（`*_t.dat`，按 mtime 取前 16）→ 尾字节众数统计 XOR（替代原单文件探测误回退 `0x88` 的缺陷）→ 优先 `cfgDword` 派生（确定性、离线），注入/缓存/内存扫描 AES 兜底。3000/3000 真实密文探针验证通过。
+- **cfg 同步返回账号字段**：`WeChatDB` 现在随主密钥一起返回 `name` / `number` / `phone`，与主流密钥工具输出格式逐字段对齐。
+- 新参数 `master_key` / `cfg_dword` 全部可选、完全向后兼容——不传则走原路径。核心解密函数零改动。
 
 ### v1.1.6.3（2026-08-21）
 
@@ -657,7 +666,7 @@ quick_send_file(r'D:\资料\报告.pdf', '文件传输助手')
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.1.6.1 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
+> **Current version:** 1.1.7 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -782,6 +791,12 @@ for feed in moments.get_moments(limit=10):
 - Performance: parallel export / first-scan, incremental memory-scan cache
 
 ## 📝 Changelog
+
+### v1.1.7 (2026-08-22)
+- **Master-key based key extraction (PR #10, thanks [NothingFumo](https://github.com/NothingFumo))**: instead of scanning process memory for per-DB `Config.Cipher` literals (which fails on WeChat 4.1.12.26+), we now extract the **single master key** from the `cfg` structure (`cfg+0x2B8` cipher XORed with 4×movabs constants from the DLL) and **derive each DB key offline** via `PBKDF2-HMAC-SHA512(master_key, db_salt, 256000)` — 27/27 SQLCipher4 DBs verified. This fixes key extraction on 4.1.12.26+ (issues #3 / #7).
+- **Unified image-key pipeline**: template collection (`*_t.dat`, top 16 by mtime) → tail-byte majority XOR (replaces the old single-file probe that could wrongly fall back to `0x88`) → `cfgDword` derivation (deterministic, offline) preferred, with injected/cached/memory-scan AES fallbacks. Probe-verified on 3000/3000 real ciphertexts.
+- **Account fields from cfg**: `WeChatDB` now also returns `name` / `number` / `phone` alongside the master key, matching the output format of mainstream key tools.
+- New optional params `master_key` / `cfg_dword` are fully backward compatible — if not passed, the original path is used. Core decryption functions unchanged.
 
 ### v1.1.6.1 (2026-08-20)
 - **PyPI description fix**: v1.1.6 was uploaded without the synced `README_pypi.md` (description still showed 1.1.5.1); this patch restores the full v1.1.6 changelog and bumps the version marker.

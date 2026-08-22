@@ -10,7 +10,7 @@
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.1.6.3 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
+> **Current version:** 1.1.7 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -138,6 +138,12 @@ for feed in moments.get_moments(limit=10):
 
 ## 📝 Changelog
 
+### v1.1.7 (2026-08-22)
+- **Master-key based key extraction (PR #10, thanks [NothingFumo](https://github.com/NothingFumo))**: instead of scanning process memory for per-DB `Config.Cipher` literals (which fails on WeChat 4.1.12.26+), we now extract the **single master key** from the `cfg` structure (`cfg+0x2B8` cipher XORed with 4×movabs constants from the DLL) and **derive each DB key offline** via `PBKDF2-HMAC-SHA512(master_key, db_salt, 256000)` — 27/27 SQLCipher4 DBs verified. This fixes key extraction on 4.1.12.26+ (issues #3 / #7).
+- **Unified image-key pipeline**: template collection (`*_t.dat`, top 16 by mtime) → tail-byte majority XOR (replaces the old single-file probe that could wrongly fall back to `0x88`) → `cfgDword` derivation (deterministic, offline) preferred, with injected/cached/memory-scan AES fallbacks. Probe-verified on 3000/3000 real ciphertexts.
+- **Account fields from cfg**: `WeChatDB` now also returns `name` / `number` / `phone` alongside the master key, matching the output format of mainstream key tools.
+- New optional params `master_key` / `cfg_dword` are fully backward compatible — if not passed, the original path is used. Core decryption functions unchanged.
+
 ### v1.1.6.3 (2026-08-21)
 - **Fix import hang**: `import wechatauto` no longer blocks permanently on systems where `uiautomation` / COM initialization hangs (e.g. WeChat or other Qt apps occupying COM). The `uiautomation` and `comtypes` imports are now deferred — loaded lazily on first UIA access, not at `import wechatauto` time.
 - **Fix OCR hang**: `ScreenOCR.recognize` now wraps the WinRT async call in `asyncio.wait_for(..., 8s)` — a hung `Windows.Media.Ocr` async (e.g. Chinese-locale systems) previously blocked `quick_send` forever; it now times out and degrades to empty OCR results.
@@ -202,6 +208,7 @@ Thanks to [nanshanjack](https://github.com/nanshanjack) for finding the UI-lock 
 Thanks to [maozhitao12450](https://github.com/maozhitao12450) for reporting the WXAM (wxgf) image download issue (fixed in v1.1.3).
 
 Thanks to [uiharukazari0105](https://github.com/uiharukazari0105) for finding that voice data stored in `media_1.db` (and later) was never searched (fixed in v1.1.4).
+Thanks to [NothingFumo](https://github.com/NothingFumo) for the master-key extraction design (cfg + PBKDF2-derived per-DB keys, v1.1.7).
 
 ## 📄 License & Disclaimer
 
