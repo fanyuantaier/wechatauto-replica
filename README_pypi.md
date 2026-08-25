@@ -1,9 +1,3 @@
-> [!NOTE]
-> **📢 维护状态 / Maintenance Notice**
-> 本人因今年升高一，明天（8月23日）报到。开学后几乎没有时间继续更新本项目（如果有时间，争取周日更新）。遇到问题请自行在 Issues 区讨论，或询问 AI 协助解决。感谢支持！
->
-> I'm starting senior high school and will register tomorrow (Aug 23). After school starts I'll have almost no time to keep updating (Sundays if possible). Please discuss issues in the Issues section or ask an AI. Thanks for your support!
-
 # wechatauto-replica — 微信 4.x Windows 自动化 / WeChat 4.x Automation
 
 > **中文版** 在下方 · **English version below**
@@ -24,7 +18,7 @@
 本项目复刻上游 wxauto 项目，目标是实现对当前微信 4.x Windows 客户端的自动化
 （读取消息、发送消息、媒体下载、朋友圈），非网页版，直接操作本机客户端。
 
-> 当前版本：1.1.7
+> 当前版本：1.1.8
 >
 > **兼容范围**：Windows 10/11 ｜ Python 3.9+（已在 3.12 验证）｜ 微信 **4.1.12+**
 > （数据库读取路线对微信版本不敏感；坐标+OCR 发送路线依赖 4.1.12+ 自绘渲染
@@ -45,28 +39,16 @@
 > 感谢 [maozhitao12450](https://github.com/maozhitao12450) 报告 WXAM (wxgf) 图片下载问题（v1.1.3 修复）。
 >
 > 感谢 [uiharukazari0105](https://github.com/uiharukazari0105) 发现语音数据分片存储（`media_1.db` 等）从未被搜索的问题（v1.1.4 修复）。
-Thanks to [NothingFumo](https://github.com/NothingFumo) for the master-key extraction design (cfg + PBKDF2-derived per-DB keys, v1.1.7).
-感谢 [NothingFumo](https://github.com/NothingFumo) 提出主密钥提取方案（cfg + PBKDF2 派生逐库密钥，v1.1.7）。
 
 ---
 
 ## 版本记录
 
-### v1.1.7（2026-08-22）
+### v1.1.8（2026-08-25）
 
-- **基于主密钥的密钥提取（PR #10，感谢 [NothingFumo](https://github.com/NothingFumo)）**：不再依赖进程内存中逐个库的 `Config.Cipher` 字面量扫描（微信 4.1.12.26+ 已失效），改为从 `cfg` 结构提取**单一主密钥**（`cfg+0x2B8` 密文 ⊕ DLL 中 4×movabs 常量），再通过 `PBKDF2-HMAC-SHA512(主密钥, 库salt, 256000)` **离线派生各库独立密钥**——27/27 个 SQLCipher4 数据库实测验证通过。解决 4.1.12.26+ 密钥提取失效（issue #3 / #7）。
-- **图片密钥统一流程**：模板收集（`*_t.dat`，按 mtime 取前 16）→ 尾字节众数统计 XOR（替代原单文件探测误回退 `0x88` 的缺陷）→ 优先 `cfgDword` 派生（确定性、离线），注入/缓存/内存扫描 AES 兜底。3000/3000 真实密文探针验证通过。
-- **cfg 同步返回账号字段**：`WeChatDB` 现在随主密钥一起返回 `name` / `number` / `phone`，与主流密钥工具输出格式逐字段对齐。
-- 新参数 `master_key` / `cfg_dword` 全部可选、完全向后兼容——不传则走原路径。核心解密函数零改动。
-
-### v1.1.6.3（2026-08-21）
-
-- **修复导入卡死**：`import wechatauto` 不再在部分系统上永久阻塞（如微信或其他 Qt 应用占用 COM 导致 `uiautomation` / COM 初始化挂起）。`uiautomation` 和 `comtypes` 现在延迟导入——首次访问 UIA 功能时才加载，不在 `import wechatauto` 时触发。
-- **修复 OCR 挂起**：`ScreenOCR.recognize` 现在用 `asyncio.wait_for(..., 8s)` 包裹 WinRT 异步调用——在中文等部分系统上 `Windows.Media.Ocr` 异步可能永不完成，此前会导致 `quick_send` 永久阻塞；现在会超时并退化为返回空 OCR 结果。
-- **修复首次校准卡死**：`calibrate_layout` 的每个 OCR 检测步骤现在用守护线程 + 5 秒超时。此前首次运行（无布局配置文件）时 WinRT OCR 若挂起，整个 `WeChatGUI.__init__` 会永久阻塞；现在超时后回退使用默认布局比例。
-- **支持明文头（key+salt）库解密**：密钥提取现支持 SQLCipher 4「Raw Key with Explicit Salt」形式（`x'<96hex>'` = 32B key + 16B 显式 salt，配合 `cipher_plaintext_header_size`）。48 字节 key（32B key + 16B salt）按明文头布局验证/解密（第 1 页保留明文头）；32 字节 key 保持标准文件头 salt 路径。可解锁部分新版本微信（如 4.1.12.26 环境）下旧偏移指向类名表而非 Cipher 实例导致的解密失败。
-- **修复 `wxid_*` 硬编码**：账号发现不再假设目录以 `wxid_` 开头——只要 `db_dir` 下某子目录含 `db_storage/` 子目录即识别为账号，支持自定义微信号（用户自选的非 `wxid_` 前缀用户名）。
-- **全局消息监听**：`WeChat.AddListenAll(callback)` 现在一次监听所有会话（好友、群聊、文件传输助手等），支持自动发现新会话。`WeChat.RemoveListenAll()` 停止全局监听。回调签名为 `(Message, Chat)`，其中 `Chat.who` 为会话原始 username。
+- **修复 MediaDownloader 缺失 `_derive_xor_key` 方法**：v1.1.7 发布时意外遗漏了 `_derive_xor_key()` 方法，但代码路径（`_decrypt_v2`、`detect_image_key`）仍引用它，导致图片解密时出现 `AttributeError`。已恢复该方法，用于从缩略图 `_t.dat` / `_h.dat` 文件反推 XOR 密钥。
+- **修复群聊 `sender_id` → `sender_username` 映射**：`Listener` 回调现在会在消息字典中返回 `sender_username`（wxid 格式），通过 `message_resource.SenderName2Id` 映射表将数字 `sender_id` 转换为可直接用于 `search_contact()` 的用户名。
+- **感谢 [uiharukazari0105](https://github.com/uiharukazari0105)** 报告 v1.1.7 版本缺失 `_derive_xor_key` 方法的 bug。
 
 ### v1.1.6.1（2026-08-20）
 
@@ -672,7 +654,7 @@ quick_send_file(r'D:\资料\报告.pdf', '文件传输助手')
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.1.7 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
+> **Current version:** 1.1.8 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -798,11 +780,10 @@ for feed in moments.get_moments(limit=10):
 
 ## 📝 Changelog
 
-### v1.1.7 (2026-08-22)
-- **Master-key based key extraction (PR #10, thanks [NothingFumo](https://github.com/NothingFumo))**: instead of scanning process memory for per-DB `Config.Cipher` literals (which fails on WeChat 4.1.12.26+), we now extract the **single master key** from the `cfg` structure (`cfg+0x2B8` cipher XORed with 4×movabs constants from the DLL) and **derive each DB key offline** via `PBKDF2-HMAC-SHA512(master_key, db_salt, 256000)` — 27/27 SQLCipher4 DBs verified. This fixes key extraction on 4.1.12.26+ (issues #3 / #7).
-- **Unified image-key pipeline**: template collection (`*_t.dat`, top 16 by mtime) → tail-byte majority XOR (replaces the old single-file probe that could wrongly fall back to `0x88`) → `cfgDword` derivation (deterministic, offline) preferred, with injected/cached/memory-scan AES fallbacks. Probe-verified on 3000/3000 real ciphertexts.
-- **Account fields from cfg**: `WeChatDB` now also returns `name` / `number` / `phone` alongside the master key, matching the output format of mainstream key tools.
-- New optional params `master_key` / `cfg_dword` are fully backward compatible — if not passed, the original path is used. Core decryption functions unchanged.
+### v1.1.8 (2026-08-25)
+- **Fix missing `_derive_xor_key` method in MediaDownloader**: v1.1.7 release accidentally omitted the `_derive_xor_key()` method while code paths (`_decrypt_v2`, `detect_image_key`) still referenced it, causing `AttributeError` when decrypting images. Restored the method for XOR key derivation from thumbnail `_t.dat` / `_h.dat` files.
+- **Fix group-chat `sender_id` → `sender_username` resolution**: `Listener` callbacks now receive `sender_username` (wxid format) in the message dict, resolved from `message_resource.SenderName2Id` mapping. Previously, `sender_id` was a numeric ID that could not be used directly with `search_contact()`.
+- **Thanks [uiharukazari0105](https://github.com/uiharukazari0105)** for reporting the missing `_derive_xor_key` issue in v1.1.7.
 
 ### v1.1.6.1 (2026-08-20)
 - **PyPI description fix**: v1.1.6 was uploaded without the synced `README_pypi.md` (description still showed 1.1.5.1); this patch restores the full v1.1.6 changelog and bumps the version marker.

@@ -1105,11 +1105,17 @@ class WeChatDB:
             conn.close()
         if not row:
             return None
+        sender_id = row["real_sender_id"]
+        sender_username = ""
+        if sender_id and sender_id != 2:
+            sender_index = self._sender_id_index()
+            sender_username = sender_index.get(int(sender_id), str(sender_id))
         return {
             "local_id": row["local_id"],
             "local_type": row["local_type"],
             "server_id": row["server_id"],
-            "sender_id": row["real_sender_id"],
+            "sender_id": sender_id,
+            "sender_username": sender_username,
             "create_time": row["create_time"],
             "content": row["message_content"],
             "source": row["source"],
@@ -1155,16 +1161,21 @@ class WeChatDB:
             conn.close()
         return [self._msg_row_to_dict(r) for r in rows]
 
-    @staticmethod
-    def _msg_row_to_dict(r) -> dict:
+    def _msg_row_to_dict(self, r) -> dict:
         content = r["message_content"]
         mtype = WeChatDB._msg_type_name(r["local_type"])
         if isinstance(content, bytes):
             content = WeChatDB._friendly_content(content, mtype)
+        sender_id = r["real_sender_id"]
+        sender_username = ""
+        if sender_id and sender_id != 2:
+            sender_index = self._sender_id_index()
+            sender_username = sender_index.get(int(sender_id), str(sender_id))
         return {
             "local_id": r["local_id"],
             "type": mtype,
-            "sender_id": r["real_sender_id"],
+            "sender_id": sender_id,
+            "sender_username": sender_username,
             "create_time": r["create_time"],
             "content": content,
             "sort_seq": r["sort_seq"],
@@ -1298,6 +1309,8 @@ class WeChatDB:
 
     def _sender_id_index(self) -> Dict[int, str]:
         """消息表 real_sender_id(数字) → 用户名，来自 message_resource.SenderName2Id"""
+        if hasattr(self, '_sender_id_cache') and self._sender_id_cache is not None:
+            return self._sender_id_cache
         idx: Dict[int, str] = {}
         for rel, path, _ in self._db_files:
             if os.path.basename(path) != "message_resource.db":
@@ -1312,6 +1325,7 @@ class WeChatDB:
             finally:
                 conn.close()
             break
+        self._sender_id_cache = idx
         return idx
 
     def _resolve_sender(self, sender_id, sender_index, nicks, self_nick) -> str:

@@ -1,12 +1,5 @@
 [**English**](README.md) | [**中文**](README.zh-CN.md)
 
-> [!NOTE]
-> **📢 维护状态 / Maintenance Notice**
-> 本人因今年升高一，明天（8月23日）报到。开学后几乎没有时间继续更新本项目（如果有时间，争取周日更新）。遇到问题请自行在 Issues 区讨论，或询问 AI 协助解决。感谢支持！
->
-> I'm starting senior high school and will register tomorrow (Aug 23). After school starts I'll have almost no time to keep updating (Sundays if possible). Please discuss issues in the Issues section or ask an AI. Thanks for your support!
-
-
 # wechatauto —— 微信 4.x Windows 客户端自动化（wxauto 复刻版）
 
 ![PyPI version](https://img.shields.io/pypi/v/wechatauto-replica)
@@ -19,7 +12,7 @@
 本项目复刻上游 wxauto 项目，目标是实现对当前微信 4.x Windows 客户端的自动化
 （读取消息、发送消息、媒体下载、朋友圈），非网页版，直接操作本机客户端。
 
-> 当前版本：1.1.7
+> 当前版本：1.1.8
 >
 > **兼容范围**：Windows 10/11 ｜ Python 3.9+（已在 3.12 验证）｜ 微信 **4.1.12+**
 > （数据库读取路线对微信版本不敏感；坐标+OCR 发送路线依赖 4.1.12+ 自绘渲染
@@ -40,27 +33,14 @@
 > 感谢 [maozhitao12450](https://github.com/maozhitao12450) 报告 WXAM (wxgf) 图片下载问题（v1.1.3 修复）。
 >
 > 感谢 [uiharukazari0105](https://github.com/uiharukazari0105) 发现语音数据分片存储（`media_1.db` 等）从未被搜索的问题（v1.1.4 修复）。
-感谢 [NothingFumo](https://github.com/NothingFumo) 提出主密钥提取方案（cfg + PBKDF2 派生逐库密钥，v1.1.7）。
 
 ---
 
 ## 版本记录
 
-### v1.1.7（2026-08-22）
+### v1.1.8（2026-08-25）
 
-- **基于主密钥的密钥提取（PR #10，感谢 [NothingFumo](https://github.com/NothingFumo)）**：不再依赖进程内存中逐个库的 `Config.Cipher` 字面量扫描（微信 4.1.12.26+ 已失效），改为从 `cfg` 结构提取**单一主密钥**（`cfg+0x2B8` 密文 ⊕ DLL 中 4×movabs 常量），再通过 `PBKDF2-HMAC-SHA512(主密钥, 库salt, 256000)` **离线派生各库独立密钥**——27/27 个 SQLCipher4 数据库实测验证通过。解决 4.1.12.26+ 密钥提取失效（issue #3 / #7）。
-- **图片密钥统一流程**：模板收集（`*_t.dat`，按 mtime 取前 16）→ 尾字节众数统计 XOR（替代原单文件探测误回退 `0x88` 的缺陷）→ 优先 `cfgDword` 派生（确定性、离线），注入/缓存/内存扫描 AES 兜底。3000/3000 真实密文探针验证通过。
-- **cfg 同步返回账号字段**：`WeChatDB` 现在随主密钥一起返回 `name` / `number` / `phone`，与主流密钥工具输出格式逐字段对齐。
-- 新参数 `master_key` / `cfg_dword` 全部可选、完全向后兼容——不传则走原路径。核心解密函数零改动。
-
-### v1.1.6.3（2026-08-21）
-
-- **修复导入卡死**：`import wechatauto` 不再在部分系统上永久阻塞（如微信或其他 Qt 应用占用 COM 导致 `uiautomation` / COM 初始化挂起）。`uiautomation` 和 `comtypes` 现在延迟导入——首次访问 UIA 功能时才加载，不在 `import wechatauto` 时触发。
-- **修复 OCR 挂起**：`ScreenOCR.recognize` 的 WinRT 异步调用现在用 `asyncio.wait_for(..., 8s)` 包住——`Windows.Media.Ocr` 异步永不完成（如中文系统环境）时，此前会让 `quick_send` 永久挂起；现在 8 秒超时后降级为空 OCR 结果。
-- **修复首次校准卡死**：`calibrate_layout` 的每个 OCR 检测步骤现在用守护线程 + 5 秒超时。此前首次运行（无布局配置文件）时 WinRT OCR 若挂起，整个 `WeChatGUI.__init__` 会永久阻塞；现在超时后回退使用默认布局比例。
-- **支持明文头（key+salt）微信构建的库解密**：密钥提取现在接受 SQLCipher 4 的 "Raw Key with Explicit Salt" 形式（`x'<96hex>'` = 32 字节 key + 16 字节显式 salt，配合 `cipher_plaintext_header_size` 使用）。48 字节密钥（32B key + 16B salt）按明文头布局验证与解密（页 1 保留其明文头）；32 字节密钥保持标准文件头 salt 路径。这解除了部分构建上因旧偏移指向类名表而非 Cipher 实例（如 4.1.12.26 环境）而无法解密库的问题。
-- **修复 `wxid_*` 硬编码**：账号发现不再假设目录以 `wxid_` 开头——`db_dir` 下任何含 `db_storage/` 子目录的子目录都会被识别。这支持自定义微信号（如用户手动修改、不含 `wxid_` 前缀的账号）。
-- **全局消息监听**：`WeChat.AddListenAll(callback)` 现在一次监听所有会话（好友、群聊、文件传输助手等），支持自动发现新会话。`WeChat.RemoveListenAll()` 停止全局监听。回调签名为 `(Message, Chat)`，其中 `Chat.who` 为会话原始 username。
+- **修复 MediaDownloader 缺失 `_derive_xor_key` 方法**：v1.1.7 发布时意外遗漏了 `_derive_xor_key()` 方法，但代码路径（`_decrypt_v2`、`detect_image_key`）仍引用它，导致图片解密时出现 `AttributeError`。已恢复该方法，用于从缩略图 `_t.dat` / `_h.dat` 文件反推 XOR 密钥。
 
 ### v1.1.6.1（2026-08-20）
 
@@ -138,6 +118,7 @@
 
 - **open_chat 账号/微信号搜索修复**（`uia_driver.py`）：微信搜索框不认 wxid
   （系统账号），`open_chat` 传入 username 时自动通过本地 DB 映射为昵称/备注/
+- **感谢 [uiharukazari0105](https://github.com/uiharukazari0105)** 报告 v1.1.7 版本缺失 _derive_xor_key 方法的 bug。
   微信号再搜索（`_resolve_search_keyword`），并清空搜索框残留重试；
   实测 `open_chat('wxid_sb9or2x9zxj012')` 成功。
 - **UIA 表情包精确读取**（`msgs/mtype.py` + `uia_driver.py`）：热激活后消息

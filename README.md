@@ -1,12 +1,5 @@
 [**English**](README.md) | [**中文**](README.zh-CN.md)
 
-> [!NOTE]
-> **📢 维护状态 / Maintenance Notice**
-> 本人因今年升高一，明天（8月23日）报到。开学后几乎没有时间继续更新本项目（如果有时间，争取周日更新）。遇到问题请自行在 Issues 区讨论，或询问 AI 协助解决。感谢支持！
->
-> I'm starting senior high school and will register tomorrow (Aug 23). After school starts I'll have almost no time to keep updating (Sundays if possible). Please discuss issues in the Issues section or ask an AI. Thanks for your support!
-
-
 # wechatauto-replica — WeChat 4.x Windows Automation (wxauto-compatible)
 
 ![PyPI version](https://img.shields.io/pypi/v/wechatauto-replica)
@@ -17,7 +10,7 @@
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.1.7 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
+> **Current version:** 1.1.8 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -145,19 +138,10 @@ for feed in moments.get_moments(limit=10):
 
 ## 📝 Changelog
 
-### v1.1.7 (2026-08-22)
-- **Master-key based key extraction (PR #10, thanks [NothingFumo](https://github.com/NothingFumo))**: instead of scanning process memory for per-DB `Config.Cipher` literals (which fails on WeChat 4.1.12.26+), we now extract the **single master key** from the `cfg` structure (`cfg+0x2B8` cipher XORed with 4×movabs constants from the DLL) and **derive each DB key offline** via `PBKDF2-HMAC-SHA512(master_key, db_salt, 256000)` — 27/27 SQLCipher4 DBs verified. This fixes key extraction on 4.1.12.26+ (issues #3 / #7).
-- **Unified image-key pipeline**: template collection (`*_t.dat`, top 16 by mtime) → tail-byte majority XOR (replaces the old single-file probe that could wrongly fall back to `0x88`) → `cfgDword` derivation (deterministic, offline) preferred, with injected/cached/memory-scan AES fallbacks. Probe-verified on 3000/3000 real ciphertexts.
-- **Account fields from cfg**: `WeChatDB` now also returns `name` / `number` / `phone` alongside the master key, matching the output format of mainstream key tools.
-- New optional params `master_key` / `cfg_dword` are fully backward compatible — if not passed, the original path is used. Core decryption functions unchanged.
-
-### v1.1.6.3 (2026-08-21)
-- **Fix import hang**: `import wechatauto` no longer blocks permanently on systems where `uiautomation` / COM initialization hangs (e.g. WeChat or other Qt apps occupying COM). The `uiautomation` and `comtypes` imports are now deferred — loaded lazily on first UIA access, not at `import wechatauto` time.
-- **Fix OCR hang**: `ScreenOCR.recognize` now wraps the WinRT async call in `asyncio.wait_for(..., 8s)` — a hung `Windows.Media.Ocr` async (e.g. Chinese-locale systems) previously blocked `quick_send` forever; it now times out and degrades to empty OCR results.
-- **Fix first-run calibrate_layout hang**: `calibrate_layout` now runs each OCR detection step in a daemon thread with a 5-second timeout. Previously, if WinRT OCR hung on a first-run (no layout config), the entire `WeChatGUI.__init__` would block forever; now it times out and falls back to default layout ratios.
-- **Support WeChat builds with plaintext-header (key+salt) DBs**: key extraction now accepts SQLCipher 4 "Raw Key with Explicit Salt" form (`x'<96hex>'` = 32B key + 16B explicit salt, used with `cipher_plaintext_header_size`). A 48-byte key (32B key + 16B salt) is verified and decrypted in plaintext-header layout (page-1 keeps its plaintext header); a 32-byte key keeps the standard file-header-salt path. This unblocks DB decryption on builds where the old offsets point at the class-name table instead of the Cipher instance (e.g. a 4.1.12.26 environment).
-- **Fix `wxid_*` hardcoding**: account discovery no longer assumes directories start with `wxid_` — any subdirectory of `db_dir` containing `db_storage/` is recognized. This supports custom WeChat IDs (e.g. user-chosen usernames that don't use the `wxid_` prefix).
-- **Listen to all messages**: `WeChat.AddListenAll(callback)` now monitors ALL sessions (friends, groups, file transfer, etc.) with a single call, including auto-discovery of new sessions. `WeChat.RemoveListenAll()` stops it. The callback receives `(Message, Chat)` where `Chat.who` is the session username.
+### v1.1.8 (2026-08-25)
+- **Fix missing `_derive_xor_key` method in MediaDownloader**: v1.1.7 release accidentally omitted the `_derive_xor_key()` method while code paths (`_decrypt_v2`, `detect_image_key`) still referenced it, causing `AttributeError` when decrypting images. Restored the method for XOR key derivation from thumbnail `_t.dat` / `_h.dat` files.
+- **Fix group-chat `sender_id` → `sender_username` resolution**: `Listener` callbacks now receive `sender_username` (wxid format) in the message dict, resolved from `message_resource.SenderName2Id` mapping. Previously, `sender_id` was a numeric ID that could not be used directly with `search_contact()`.
+- **Thanks [uiharukazari0105](https://github.com/uiharukazari0105)** for reporting the missing _derive_xor_key issue in v1.1.7.
 
 ### v1.1.6.1 (2026-08-20)
 - **PyPI description fix**: v1.1.6 was uploaded without the synced `README_pypi.md` (description still showed 1.1.5.1); this patch restores the full v1.1.6 changelog and bumps the version marker.
@@ -215,7 +199,6 @@ Thanks to [nanshanjack](https://github.com/nanshanjack) for finding the UI-lock 
 Thanks to [maozhitao12450](https://github.com/maozhitao12450) for reporting the WXAM (wxgf) image download issue (fixed in v1.1.3).
 
 Thanks to [uiharukazari0105](https://github.com/uiharukazari0105) for finding that voice data stored in `media_1.db` (and later) was never searched (fixed in v1.1.4).
-Thanks to [NothingFumo](https://github.com/NothingFumo) for the master-key extraction design (cfg + PBKDF2-derived per-DB keys, v1.1.7).
 
 ## 📄 License & Disclaimer
 

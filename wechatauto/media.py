@@ -190,6 +190,29 @@ class MediaDownloader:
                 return key
         return None
 
+    def _derive_xor_key(self, dat_path: str) -> int:
+        """从同图缩略图 <md5>_t.dat 尾部 FF D9 反推单字节 XOR 密钥"""
+        for cand in (
+            dat_path[:-4] + "_t.dat",
+            dat_path[:-4] + "_h.dat",
+            dat_path,
+        ):
+            if not os.path.exists(cand):
+                continue
+            try:
+                with open(cand, "rb") as f:
+                    f.seek(-2, 2)
+                    tail = f.read(2)
+            except OSError:
+                continue
+
+            if len(tail) == 2:
+                key = tail[0] ^ 0xFF
+                if tail[1] ^ 0xD9 == key:
+                    return key
+
+        return 0x88
+
     def _scan_aes_key(self, monitor: bool = False,
                       monitor_timeout: float = 120.0) -> Optional[str]:
         """扫描 Weixin.exe 内存穷举候选密钥, AES-ECB 解密探针验证。
