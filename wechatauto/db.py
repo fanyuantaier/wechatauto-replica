@@ -497,12 +497,13 @@ class WeChatDB:
     KDF_ITER = 256000  # 主密钥→库密钥 PBKDF2 迭代(微信魔改 WCDB, 实测确认)
 
     def _load_or_extract_keys(self, master_key: Optional[str] = None) -> None:
-        """加载/提取密钥, 四层优先级:
+        """加载/提取密钥, 五层优先级:
 
         1. 显式 master_key(构造参数) → 主密钥派生;
-        2. cfg 自动提取(进程内存, 免手动注入);
-        3. 本地缓存 keys.json;
-        4. Config.Cipher 内存扫描(最终回退)。
+        2. 本地缓存 keys.json(已验证);
+        3. Config.Cipher 内存扫描(4.1+ 主路径);
+        4. cfg 自动提取(老版本回退);
+        5. 密钥提取(最终回退)。
 
         派生/扫描结果均经 SQLCipher4 页1 HMAC 强校验, 零误报。
         """
@@ -512,34 +513,46 @@ class WeChatDB:
             self.cfg_dword = None
             self._save_keys()
         else:
-            auto = self.extract_master_key()
-            if auto:
-                master, cfg_dword, _ = auto
-                self.master_key = master
-                self.cfg_dword = cfg_dword
-                self._keys.update(self.derive_keys_from_master(master))
+            self.master_key = None
+            self.cfg_dword = None
+            
+            # 优先级1: 尝试已保存的密钥
+            if os.path.exists(self.keys_file):
+                try:
+                    with open(self.keys_file, "r", encoding="utf-8") as f:
+                        saved = json.load(f)
+                    for rel, hexkey in saved.items():
+                        try:
+                            self._keys[rel] = bytes.fromhex(hexkey)
+                        except ValueError:
+                            pass
+                except (json.JSONDecodeError, OSError):
+                    pass
+            
+            missing = [
+                rel for rel, path, _ in self._db_files
+                if rel not in self._keys or not self._key_works(rel)
+            ]
+            
+            # 优先级2: Config.Cipher 内存扫描(4.1+ 主路径)
+            if missing:
+                extracted = self.extract_keys()
+                self._keys.update(extracted)
                 self._save_keys()
-            else:
-                self.master_key = None
-                self.cfg_dword = None
-                if os.path.exists(self.keys_file):
-                    try:
-                        with open(self.keys_file, "r", encoding="utf-8") as f:
-                            saved = json.load(f)
-                        for rel, hexkey in saved.items():
-                            try:
-                                self._keys[rel] = bytes.fromhex(hexkey)
-                            except ValueError:
-                                pass
-                    except (json.JSONDecodeError, OSError):
-                        pass
-                missing = [
-                    rel for rel, path, _ in self._db_files
-                    if rel not in self._keys or not self._key_works(rel)
-                ]
-                if missing:
-                    extracted = self.extract_keys()
-                    self._keys.update(extracted)
+            
+            missing = [
+                rel for rel, path, _ in self._db_files
+                if rel not in self._keys or not self._key_works(rel)
+            ]
+            
+            # 优先级3: cfg 自动提取(老版本回退)
+            if missing:
+                auto = self.extract_master_key()
+                if auto:
+                    master, cfg_dword, _ = auto
+                    self.master_key = master
+                    self.cfg_dword = cfg_dword
+                    self._keys.update(self.derive_keys_from_master(master))
                     self._save_keys()
         still = [
             rel for rel, _, _ in self._db_files if not self._key_works(rel)
@@ -1109,7 +1122,10 @@ class WeChatDB:
         sender_username = ""
         if sender_id and sender_id != 2:
             sender_index = self._sender_id_index()
-            sender_username = sender_index.get(int(sender_id), str(sender_id))
+            sender_username = sender_index.get(int(sender_id), "")
+            if not sender_username:
+                # fallback: 尝试从 contact.db 获取昵称
+                sender_username = self.get_nickname(str(sender_id))
         return {
             "local_id": row["local_id"],
             "local_type": row["local_type"],
@@ -1170,7 +1186,10 @@ class WeChatDB:
         sender_username = ""
         if sender_id and sender_id != 2:
             sender_index = self._sender_id_index()
-            sender_username = sender_index.get(int(sender_id), str(sender_id))
+            sender_username = sender_index.get(int(sender_id), "")
+            if not sender_username:
+                # fallback: 尝试从 contact.db 获取昵称
+                sender_username = self.get_nickname(str(sender_id))
         return {
             "local_id": r["local_id"],
             "type": mtype,
@@ -1195,7 +1214,15 @@ class WeChatDB:
                 if md5:
                     return "[图片 md5=%s]" % md5.group(1).decode()
             return "[%s]" % mtype
-        return text.strip() or "[%s]" % mtype
+        # 去除二进制填充
+        cleaned = text.strip()
+        if cleaned:
+            # 尝试提取文本（处理容器头+明文+填充的格式）
+            if b"\x01\x00" in content:
+                parts = cleaned.split("\x01")
+                cleaned = parts[0].strip()
+            return cleaned if cleaned else "[%s]" % mtype
+        return "[%s]" % mtype
 
     def get_sessions(self, limit: int = 100) -> List[dict]:
         """会话列表（来自 session.db）"""

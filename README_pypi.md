@@ -780,6 +780,9 @@ for feed in moments.get_moments(limit=10):
 
 ## 📝 Changelog
 
+### v1.1.9 (2026-08-27)
+- **Fix key extraction for WeChat 4.1.13+**: Prioritized `Config.Cipher` memory scan over `extract_master_key_from_cfg` for key extraction. The cfg-based extraction returns incorrect master keys on WeChat 4.1.13.12, while the Config.Cipher scan (which reads raw `enc_key` values from XOR-decoded blobs) works correctly. This fixes the "0/24 keys verified" issue reported on newer WeChat versions.
+
 ### v1.1.8 (2026-08-25)
 - **Fix missing `_derive_xor_key` method in MediaDownloader**: v1.1.7 release accidentally omitted the `_derive_xor_key()` method while code paths (`_decrypt_v2`, `detect_image_key`) still referenced it, causing `AttributeError` when decrypting images. Restored the method for XOR key derivation from thumbnail `_t.dat` / `_h.dat` files.
 - **Fix group-chat `sender_id` → `sender_username` resolution**: `Listener` callbacks now receive `sender_username` (wxid format) in the message dict, resolved from `message_resource.SenderName2Id` mapping. Previously, `sender_id` was a numeric ID that could not be used directly with `search_contact()`.
