@@ -49,7 +49,7 @@ from .msgs import (
     parse_msg,
 )
 
-__version__ = "1.1.10"
+__version__ = "1.1.10.1"
 
 __all__ = [
     "WeChat",

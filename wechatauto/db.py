@@ -1193,7 +1193,10 @@ class WeChatDB:
         # 如果内容是占位符且有 compress_content，尝试使用 compress_content
         placeholder = "[%s]" % mtype
         if content == placeholder:
-            cc = r.get("compress_content")
+            try:
+                cc = r["compress_content"]
+            except (KeyError, IndexError):
+                cc = None
             if isinstance(cc, bytes) and cc:
                 cc_text = WeChatDB._friendly_content(cc, mtype)
                 if cc_text != placeholder:
