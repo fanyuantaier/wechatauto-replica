@@ -18,7 +18,7 @@
 本项目复刻上游 wxauto 项目，目标是实现对当前微信 4.x Windows 客户端的自动化
 （读取消息、发送消息、媒体下载、朋友圈），非网页版，直接操作本机客户端。
 
-> 当前版本：1.1.10.1
+> 当前版本：1.1.10.2
 >
 > **兼容范围**：Windows 10/11 ｜ Python 3.9+（已在 3.12 验证）｜ 微信 **4.1.12+**
 > （数据库读取路线对微信版本不敏感；坐标+OCR 发送路线依赖 4.1.12+ 自绘渲染
@@ -43,6 +43,10 @@
 ---
 
 ## 版本记录
+
+### v1.1.10.2（2026-08-30）
+
+- **修复全新安装后长文本仍显示 `[文本]`：新增必需依赖 `zstandard`**。微信4.x 将长文本的 `message_content` 存为 zstd 压缩帧，由 `_friendly_content` 通过 `import zstandard` 解压。但 `zstandard` 此前不在必需依赖中，用户机器未安装时该 import 被静默吞掉，长文本退化为 `[文本]` 占位符（监听本身正常，故难定位）。现已将 `zstandard` 加入必需依赖；`_friendly_content` 同时新增惰性双包名导入（`zstandard`/`zstd`，见 `_get_zstd_module()` / `_zstd_decompress()`）。
 
 ### v1.1.10.1（2026-08-29）
 
@@ -667,7 +671,7 @@ quick_send_file(r'D:\资料\报告.pdf', '文件传输助手')
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.1.10.1 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
+> **Current version:** 1.1.10.2 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -792,6 +796,9 @@ for feed in moments.get_moments(limit=10):
 - Performance: parallel export / first-scan, incremental memory-scan cache
 
 ## 📝 Changelog
+
+### v1.1.10.2 (2026-08-30)
+- **Fix long text still showing `[文本]` on fresh installs: add required `zstandard` dependency**: WeChat 4.x stores long-text `message_content` as a zstd-compressed frame, decoded in `_friendly_content` via `import zstandard`. That import silently failed when `zstandard` was absent (it was **not** in `pyproject.toml` required deps), so long text degraded to the `[文本]` placeholder while listening worked normally. `zstandard` is now a required dependency; `_friendly_content` also gained lazy dual-package import (`zstandard`/`zstd`) via new `_get_zstd_module()` / `_zstd_decompress()` helpers.
 
 ### v1.1.10.1 (2026-08-29)
 - **Fix `AttributeError: 'sqlite3.Row' object has no attribute 'get'` in message reading**: `_msg_row_to_dict` called `.get("compress_content")` on a `sqlite3.Row`, which only supports `[]` access. Messages whose content stays a placeholder (e.g. emoji/special types) hit this branch and crashed the real-time `Listener` polling loop. Now uses `[]` access with a fallback, fixing `get_messages` / `get_new_messages` / `get_message_row`.

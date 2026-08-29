@@ -393,6 +393,45 @@ def _extract_text_from_blob(content: bytes) -> Optional[str]:
     return None
 
 
+_ZSTD_MODULE = None
+
+
+def _get_zstd_module():
+    """惰性加载 zstd 模块，兼容 `zstandard` / `zstd` 两种包名。
+
+    WeChat 4.x 长文本消息的 message_content 为 zstd 压缩帧；缺少该第三方
+    库时无法解压（会退化为 `[类型]` 占位符）。此函数做了延迟导入 + 双包名
+    兼容，缺失库时返回 None（由调用方决定如何兜底）。
+    """
+    global _ZSTD_MODULE
+    if _ZSTD_MODULE is not None:
+        return _ZSTD_MODULE
+    for mod_name in ("zstandard", "zstd"):
+        try:
+            _ZSTD_MODULE = __import__(mod_name)
+            return _ZSTD_MODULE
+        except Exception:
+            continue
+    _ZSTD_MODULE = False
+    return None
+
+
+def _zstd_decompress(zstd, content: bytes) -> Optional[str]:
+    """用 zstd 解压微信消息帧并解码 UTF-8，失败返回 None。"""
+    if not content:
+        return None
+    try:
+        dctx = zstd.ZstdDecompressor()
+        decompressed = dctx.decompress(content, max_output_size=200000)
+        if not decompressed:
+            return None
+        text = decompressed.decode("utf-8", "ignore").strip()
+        return text if text else None
+    except Exception:
+        return None
+
+
+
 def _find_account_dirs(db_dir: str) -> List[str]:
     """列出 db_dir 下所有含 db_storage 子目录的账号目录。
 
@@ -1226,16 +1265,12 @@ class WeChatDB:
         except UnicodeDecodeError:
             if content[:4] == b"\x28\xb5\x2f\xfd":
                 # zstd 压缩的文本消息
-                try:
-                    import zstandard as zstd
-                    dctx = zstd.ZstdDecompressor()
-                    decompressed = dctx.decompress(content, max_output_size=200000)
-                    text = decompressed.decode("utf-8", "ignore").strip()
+                zstd = _get_zstd_module()
+                if zstd is not None:
+                    text = _zstd_decompress(zstd, content)
                     if text:
                         return text
-                except Exception:
-                    pass
-                # 回退到 blob 提取
+                # 回退到 blob 提取（无法 zstd 解压时尝试直接剥离容器头）
                 text = _extract_text_from_blob(content)
                 if text:
                     return text
