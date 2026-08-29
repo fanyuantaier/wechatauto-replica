@@ -330,6 +330,9 @@ out = md.download_image("filehelper", 123)      # jpg/png/gif
 out = md.download_voice("filehelper", 123)      # .silk
 out = md.download_video("filehelper", 123)      # .mp4
 out = md.download_file("filehelper", 123)       # 原文件 / original file
+
+# 下载原图（通过UI点击触发微信下载）/ download original image (UI click triggers download)
+out = md.download_image_original("filehelper", 123, timeout=30)
 ```
 
 返回落盘路径，失败返回 `None`。 / Returns the saved path, or `None` on failure.
@@ -338,6 +341,10 @@ out = md.download_file("filehelper", 123)       # 原文件 / original file
 
 - 群聊图片原图**只有点开查看过才落盘**；否则只有缩略图 / originals only stored after being opened
 - `download_image` 会自动回退缩略图，文件名带 `_thumb` 标记 / auto-falls back to thumbnail (`_thumb`)
+- `download_image_original` 通过UI自动化点击图片消息触发微信下载原图 / `download_image_original` triggers download via UI click
+  - 会切到对应会话；图片需已在消息区可见（无需滚动） / switches to the chat; images must be visible in the message area (no scrolling)
+  - 点击坐标依赖 WeChat 4.x 的 `mmui::ChatBubbleReferItemView` 布局（DPI 感知进程下按物理像素定位），不同窗口宽度/DPI 用相对偏移自动适配 / click coords rely on the `mmui::*` layout (physical pixels under a DPI-aware process); relative offset adapts to window width/DPI
+  - 缩略图 UIA 控件是空壳、拿不到真实位置，因此对消息列表图片用坐标点击；预览窗口内的「图片原始大小」按钮是完整 UIA 控件，用 `Click()` 点击 / image thumbnails expose no UIA children, so they are clicked by coordinate; the preview-window button is a real UIA control and is clicked via `Click()`
 - 无 ffmpeg 时 wxgf 格式存为 `.wxgf` 原始数据兜底 / without ffmpeg, wxgf saved as `.wxgf`
 
 ### 6.4 批量下载全部图片 / Batch download all images
@@ -513,6 +520,7 @@ md.download_voice("群名", local_id)      # 自动搜索所有 media_*.db / sea
 |---|---|
 | `detect_image_key(monitor)` | 提取图片密钥 / extract image key |
 | `download_image(user, lid)` | 图片（含缩略图/wxgf 回退）/ image |
+| `download_image_original(user, lid, timeout)` | 原图（UI点击触发下载）/ original image |
 | `download_voice(user, lid)` | 语音 .silk / voice |
 | `download_video(user, lid)` | 视频 .mp4 / video |
 | `download_file(user, lid)` | 原文件 / original file |

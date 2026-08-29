@@ -10,7 +10,7 @@
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.1.9 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
+> **Current version:** 1.1.10 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -27,6 +27,7 @@ Automate the **WeChat 4.x Windows desktop client** (not the web version): read m
 | Emoji message capture | ✅ verified | Screen capture + direction-aware bubble auto-cropping |
 | Full history export | ✅ verified | JSON / SQLite |
 | Media download (image / voice / file) | ✅ verified | `MediaDownloader`: image v2 AES decryption, SILK voice, files |
+| Download original image (not thumbnail) | ✅ verified | `MediaDownloader.download_image_original()`: UI click triggers download |
 | Moments (朋友圈) read | ✅ verified | Direct `sns.db` reads (3382 feeds verified) |
 | Multi-account | ✅ verified | `list_accounts()` + `account=` |
 | Send text / file / image / reply / @member | ✅ verified | UIA-first, coordinate + OCR fallback |
@@ -127,7 +128,7 @@ for feed in moments.get_moments(limit=10):
 2. **Image AES key is transient** — only resident while viewing an image; persisted to `image_keys.json` once found, or inject via `image_key=`.
 3. **Sending is a GUI operation** — fails cleanly when the desktop is locked (`desktop_available()` returns False).
 4. **Videos** are downloadable only when the mp4 already exists on disk (`msg/video/`).
-5. **Group-chat image originals** are stored locally only after being opened (viewed) in WeChat; until then only the thumbnail (`_t.dat`) exists — `download_image` falls back to the thumbnail (marked `_thumb` in the filename).
+5. **Group-chat image originals** are stored locally only after being opened (viewed) in WeChat; until then only the thumbnail (`_t.dat`) exists — `download_image` falls back to the thumbnail (marked `_thumb` in the filename). Use `download_image_original()` to trigger WeChat to fetch the original via a UI click on the image message.
 6. **Moments posting is dropped** (4.x self-drawn UI, unreliable); reading/likes/comments are supported.
 
 ## 🗺️ Roadmap
@@ -137,6 +138,10 @@ for feed in moments.get_moments(limit=10):
 - Performance: parallel export / first-scan, incremental memory-scan cache
 
 ## 📝 Changelog
+
+### v1.1.10 (2026-08-27)
+- **Add original image download via UI automation**: New `MediaDownloader.download_image_original()` method triggers WeChat to download original images by simulating UI clicks on image messages. This solves the limitation where group chat images only have thumbnails available.
+- **Fix long text message content extraction**: Added zstd decompression support, `compress_content` fallback, and fixed newline character handling.
 
 ### v1.1.9 (2026-08-27)
 - **Fix key extraction for WeChat 4.1.13+**: Prioritized `Config.Cipher` memory scan over `extract_master_key_from_cfg` for key extraction. The cfg-based extraction returns incorrect master keys on WeChat 4.1.13.12, while the Config.Cipher scan (which reads raw `enc_key` values from XOR-decoded blobs) works correctly. This fixes the "0/24 keys verified" issue reported on newer WeChat versions.

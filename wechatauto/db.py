@@ -370,7 +370,8 @@ def _extract_text_from_blob(content: bytes) -> Optional[str]:
             t = chunk.decode("utf-8")
         except UnicodeDecodeError:
             return None
-        t = re.sub(r"[\x00-\x1f\x7f]+", "", t).strip()
+        # 保留换行符(\n和\r)，删除其他控制字符
+        t = re.sub(r"[\x00-\x09\x0b\x0c\x0e-\x1f\x7f]+", "", t).strip()
         if not t:
             return None
         if not re.search(r"[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]", t):
@@ -539,6 +540,13 @@ class WeChatDB:
                 extracted = self.extract_keys()
                 self._keys.update(extracted)
                 self._save_keys()
+            
+            # 尝试提取cfg_dword用于图片密钥派生
+            if self.cfg_dword is None:
+                auto = self.extract_master_key()
+                if auto:
+                    _, cfg_dword, _ = auto
+                    self.cfg_dword = cfg_dword
             
             missing = [
                 rel for rel, path, _ in self._db_files
@@ -1093,7 +1101,7 @@ class WeChatDB:
         try:
             rows = conn.execute(
                 "SELECT local_id, local_type, real_sender_id, create_time, "
-                "message_content, source, packed_info_data, sort_seq "
+                "message_content, source, packed_info_data, compress_content, sort_seq "
                 "FROM %s ORDER BY sort_seq DESC LIMIT ? OFFSET ?" % table,
                 (limit, offset),
             ).fetchall()
@@ -1169,7 +1177,7 @@ class WeChatDB:
         try:
             rows = conn.execute(
                 "SELECT local_id, local_type, real_sender_id, create_time, "
-                "message_content, source, packed_info_data, sort_seq "
+                "message_content, source, packed_info_data, compress_content, sort_seq "
                 "FROM %s WHERE sort_seq > ? ORDER BY sort_seq ASC LIMIT ?" % table,
                 (since_seq, limit),
             ).fetchall()
@@ -1182,6 +1190,14 @@ class WeChatDB:
         mtype = WeChatDB._msg_type_name(r["local_type"])
         if isinstance(content, bytes):
             content = WeChatDB._friendly_content(content, mtype)
+        # 如果内容是占位符且有 compress_content，尝试使用 compress_content
+        placeholder = "[%s]" % mtype
+        if content == placeholder:
+            cc = r.get("compress_content")
+            if isinstance(cc, bytes) and cc:
+                cc_text = WeChatDB._friendly_content(cc, mtype)
+                if cc_text != placeholder:
+                    content = cc_text
         sender_id = r["real_sender_id"]
         sender_username = ""
         if sender_id and sender_id != 2:
@@ -1206,6 +1222,17 @@ class WeChatDB:
             text = content.decode("utf-8")
         except UnicodeDecodeError:
             if content[:4] == b"\x28\xb5\x2f\xfd":
+                # zstd 压缩的文本消息
+                try:
+                    import zstandard as zstd
+                    dctx = zstd.ZstdDecompressor()
+                    decompressed = dctx.decompress(content, max_output_size=200000)
+                    text = decompressed.decode("utf-8", "ignore").strip()
+                    if text:
+                        return text
+                except Exception:
+                    pass
+                # 回退到 blob 提取
                 text = _extract_text_from_blob(content)
                 if text:
                     return text

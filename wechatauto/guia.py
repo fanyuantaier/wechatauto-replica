@@ -223,11 +223,8 @@ class WinInput:
 
     def __init__(self):
         user32 = ctypes.windll.user32
-        # 保持 DPI-UNAWARE：整条管线（GetWindowRect / 截图 / SetCursorPos 点击）
-        # 都使用系统虚拟化后的逻辑坐标，保证截图与点击坐标一致。
-        # （若设为 DPI-aware，屏幕仅 1536x960 物理像素，而截图仍按
-        #   GetWindowRect 返回的逻辑矩形（如 3018x1818）采集，会造成
-        #   截图与 SetCursorPos 物理坐标错位。）
+        # 进程已设为 DPI-aware（PER_MONITOR_AWARE_V2），
+        # GetSystemMetrics 返回物理像素，与 UIA BoundingRectangle 一致。
         self._user32 = user32
         self.screen_w = user32.GetSystemMetrics(0)
         self.screen_h = user32.GetSystemMetrics(1)
@@ -235,7 +232,12 @@ class WinInput:
 
     # -- 鼠标 ----------------------------------------------------------
     def real_click(self, x: int, y: int, right: bool = False):
-        """SetCursorPos + mouse_event 的「真实」点击，坐标为本机像素。"""
+        """SetCursorPos + mouse_event 的「真实」点击。
+
+        进程在模块加载时已设为 DPI-aware（PER_MONITOR_AWARE_V2），
+        UIA BoundingRectangle 返回物理像素坐标，SetCursorPos 也使用
+        物理像素，两者在同一坐标系，无需额外缩放。
+        """
         u = self._user32
         u.SetCursorPos(int(x), int(y))
         time.sleep(0.15)

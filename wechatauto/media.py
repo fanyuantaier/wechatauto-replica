@@ -373,9 +373,13 @@ class MediaDownloader:
         raise ValueError("无法识别的图片加密格式: %s" % dat_path)
 
     def _resolve_aes_key(self) -> Optional[str]:
-        """统一密钥解析：显式注入 → 本地缓存 → 内存扫描"""
+        """统一密钥解析：显式注入 → cfgDword派生 → 本地缓存 → 内存扫描"""
         if self._image_key and self._validate_key(self._image_key):
             return self._image_key
+        # 尝试cfgDword派生
+        derived = self._derive_cfg_key()
+        if derived:
+            return derived[0]
         cached = self._load_persisted_key()
         if cached:
             return cached
@@ -426,6 +430,16 @@ class MediaDownloader:
                   thumbnail: bool = False) -> Optional[str]:
         base = os.path.join(self.db.account_dir, "msg", "attach", self._chat_md5(user))
         target = md5 + ("_t.dat" if thumbnail else ".dat")
+        for root, _, files in os.walk(base):
+            for f in files:
+                if f == target:
+                    return os.path.join(root, f)
+        return None
+
+    def _find_h_dat(self, user: str, md5: str) -> Optional[str]:
+        """查找原图 _h.dat 文件（点击'图片原始大小'后微信下载的高分辨率版本）。"""
+        base = os.path.join(self.db.account_dir, "msg", "attach", self._chat_md5(user))
+        target = md5 + "_h.dat"
         for root, _, files in os.walk(base):
             for f in files:
                 if f == target:
@@ -643,6 +657,180 @@ class MediaDownloader:
                             w.write(r.read())
                     return out
         return None
+
+    @staticmethod
+    def _find_preview_button(ctrl, name, max_depth=8):
+        """在 PreviewWindow 中递归查找指定名称的按钮。"""
+        if max_depth <= 0:
+            return None
+        for kid in ctrl.GetChildren():
+            try:
+                if kid.Name == name:
+                    return kid
+                found = MediaDownloader._find_preview_button(kid, name, max_depth - 1)
+                if found:
+                    return found
+            except Exception:
+                pass
+        return None
+
+    def download_image_original(self, user: str, local_id: int, save_dir: Optional[str] = None,
+                              aes_key: Optional[str] = None, xor_key: Optional[int] = None,
+                              timeout: float = 30.0, chat_name: Optional[str] = None) -> Optional[str]:
+        """下载原图：通过UI自动化点击图片消息触发微信下载原图。
+
+        原理：群聊图片默认只下发缩略图（_t.dat），原图（.dat）只有在微信中
+        点击查看大图后才会下载到本地。本方法模拟用户点击图片消息，等待原图
+        下载完成后解密保存。
+
+        Args:
+            user: 会话用户名（wxid 或群聊 ID）
+            local_id: 消息 local_id
+            save_dir: 保存目录（默认 ~/Documents/wechatauto_media）
+            aes_key: 图片 AES 密钥（可选，自动检测）
+            xor_key: XOR 密钥（可选，自动检测）
+            timeout: 等待原图下载的超时时间（秒）
+            chat_name: 用于UI搜索的会话名称（微信名，默认使用 user）
+
+        Returns:
+            解密后的原图文件路径，失败返回 None
+        """
+        row = self.db.get_message_row(user, local_id)
+        if not row or row["local_type"] != 3:
+            return None
+        md5 = self._img_md5(row)
+        if not md5:
+            return None
+
+        from .uia_driver import WeChatUIA
+        import uiautomation as auto
+        from .guia import WinInput
+
+        _uia = WeChatUIA()
+        if not _uia.ensure_window():
+            return None
+        time.sleep(1.0)
+
+        for _retry in range(3):
+            try:
+                from .wx import WeChat
+                wx = WeChat()
+                wx.ChatWith(chat_name or user)
+                time.sleep(2.0)
+                break
+            except Exception as e:
+                print("[DBG] ChatWith retry", _retry, "err:", type(e).__name__, str(e)[:100])
+                time.sleep(1.0)
+
+        clicked = False
+        try:
+            time.sleep(1.0)
+            lst = _uia._message_list()
+            if lst is None:
+                print("[DBG] message_list is None")
+                return None
+            inp = WinInput()
+
+            lst_rect = lst.BoundingRectangle
+            print("[DBG] list rect:", lst_rect.left, lst_rect.top, lst_rect.right, lst_rect.bottom)
+            images = []
+            for ch in lst.GetChildren():
+                try:
+                    cn = ch.ClassName or ""
+                    nm = ch.Name or ""
+                    if cn == "mmui::ChatBubbleReferItemView" and nm == "图片":
+                        r = ch.BoundingRectangle
+                        cx = int((r.left + r.right) / 2)
+                        cy = int((r.top + r.bottom) / 2)
+                        in_lst = (lst_rect.left <= cx <= lst_rect.right and
+                                  lst_rect.top <= cy <= lst_rect.bottom)
+                        print("[DBG] img:", r.left, r.top, r.right, r.bottom, "in=", in_lst)
+                        if in_lst:
+                            images.append(ch)
+                except Exception as e:
+                    print("[DBG] img err:", e)
+                    continue
+            print("[DBG] images:", len(images))
+
+            for img_ch in images:
+                r = img_ch.BoundingRectangle
+                # UIA 矩形是全宽列表项；实际图片缩略图在左侧。
+                # 实测命中带约为 left+8.7%宽度 ~ left+15.8%宽度，中心≈12%。
+                # 用相对偏移（而非固定像素），窗口宽度/DPI 变化时可自适应。
+                cx = r.left + int((r.right - r.left) * 0.12)
+                cy = int((r.top + r.bottom) / 2)
+                print(f"[DBG] real_click image at ({cx},{cy})")
+
+                inp.real_click(cx, cy)
+                time.sleep(3.0)
+
+                preview_win = None
+                root = auto.GetRootControl()
+                candidates = [w for w in root.GetChildren()
+                              if "PreviewWindow" in (w.ClassName or "")]
+                print(f"[DBG] after click, preview windows found: {len(candidates)}")
+                # 优先选包含"图片原始大小"按钮的预览窗口
+                for w in candidates:
+                    if self._find_preview_button(w, "图片原始大小"):
+                        preview_win = w
+                        break
+                if preview_win is None and candidates:
+                    preview_win = max(candidates,
+                                      key=lambda w: (w.BoundingRectangle.right - w.BoundingRectangle.left) *
+                                                    (w.BoundingRectangle.bottom - w.BoundingRectangle.top))
+
+                if not preview_win:
+                    print("[DBG] NO preview window after click")
+                    continue
+
+                btn = self._find_preview_button(preview_win, "图片原始大小")
+                print(f"[DBG] 图片原始大小 btn found: {btn is not None}")
+                if btn:
+                    # 按钮是完整 UIA 控件，用 UIA 原生 Click（不依赖全局 SetCursorPos 坐标映射）
+                    try:
+                        btn.Click()
+                    except Exception:
+                        btn_r = btn.BoundingRectangle
+                        btn_cx = int((btn_r.left + btn_r.right) / 2)
+                        btn_cy = int((btn_r.top + btn_r.bottom) / 2)
+                        inp.real_click(btn_cx, btn_cy)
+                    time.sleep(3.0)
+
+                h_dat = self._find_h_dat(user, md5)
+                print(f"[DBG] h_dat after click: {h_dat} size={os.path.getsize(h_dat) if h_dat else None}")
+                if h_dat and os.path.getsize(h_dat) > 102400:
+                    clicked = True
+                    break
+        except Exception as e:
+            print("[DBG] outer err:", type(e).__name__, str(e)[:200])
+            pass
+
+        if not clicked:
+            return None
+
+        # 直接解密 _h.dat（原图）
+        h_dat = self._find_h_dat(user, md5)
+        if not h_dat:
+            return None
+        data = self.decrypt_image(h_dat, aes_key, xor_key)
+        if data[:3] == b"\xff\xd8\xff":
+            ext = "jpg"
+        elif data[:4] == b"\x89PNG":
+            ext = "png"
+        elif data[:4] == b"wxgf":
+            jpg = self._wxgf_to_jpg(data)
+            if jpg is not None:
+                out = self._out(save_dir, "%s_%s.jpg" % (user, local_id))
+                with open(out, "wb") as f:
+                    f.write(jpg)
+                return out
+            ext = "wxgf"
+        else:
+            ext = "img"
+        out = self._out(save_dir, "%s_%s.%s" % (user, local_id, ext))
+        with open(out, "wb") as f:
+            f.write(data)
+        return out
 
     def download_media(self, user: str, local_id: int, save_dir: Optional[str] = None) -> Optional[str]:
         """按消息类型自动分发：3 图片 / 34 语音 / 43 视频 / 49 文件"""
