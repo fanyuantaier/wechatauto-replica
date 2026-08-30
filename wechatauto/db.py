@@ -1361,6 +1361,170 @@ class WeChatDB:
         return user
 
     # ------------------------------------------------------------------
+    # 群成员（contact.db 读取，无需 UI）
+    # ------------------------------------------------------------------
+    def _contact_conn(self) -> Optional[sqlite3.Connection]:
+        """打开 contact.db（调用方负责 close）；失败返回 None。"""
+        for rel, path, _ in self._db_files:
+            if os.path.basename(path) != "contact.db":
+                continue
+            try:
+                return self._open(rel)
+            except Exception:
+                return None
+        return None
+
+    def get_groups(self) -> List[dict]:
+        """列出所有群聊。
+
+        Returns:
+            List[dict]，每条：username(群 wxid), name(群名), owner(群主 wxid),
+            member_count(成员数), members(List[dict] 成员详情，见 get_group_members)。
+        """
+        conn = self._contact_conn()
+        if not conn:
+            return []
+        try:
+            rooms = conn.execute(
+                "SELECT id, username, owner FROM chat_room"
+            ).fetchall()
+            room_by_id = {r["id"]: r for r in rooms}
+            if not room_by_id:
+                return []
+            placeholders = ",".join("?" * len(room_by_id))
+            members = conn.execute(
+                "SELECT room_id, member_id FROM chatroom_member "
+                "WHERE room_id IN (%s)" % placeholders,
+                tuple(room_by_id.keys()),
+            ).fetchall()
+            member_ids = sorted({m["member_id"] for m in members})
+            contact = {}
+            if member_ids:
+                mp = ",".join("?" * len(member_ids))
+                rows = conn.execute(
+                    "SELECT id, username, nick_name, remark FROM contact "
+                    "WHERE id IN (%s)" % mp, tuple(member_ids),
+                ).fetchall()
+                contact = {r["id"]: r for r in rows}
+            # 群 wxid -> 群名（contact 表里 @chatroom 行的 nick_name）
+            room_names = {}
+            for r in conn.execute(
+                    "SELECT username, nick_name FROM contact "
+                    "WHERE username LIKE '%@chatroom'").fetchall():
+                room_names[r["username"]] = r["nick_name"] or r["username"]
+        finally:
+            conn.close()
+        groups = []
+        for rid, room in room_by_id.items():
+            ms = []
+            for m in members:
+                if m["room_id"] != rid:
+                    continue
+                c = contact.get(m["member_id"])
+                if c is None:
+                    continue
+                ms.append({
+                    "username": c["username"],
+                    "nick_name": c["nick_name"],
+                    "remark": c["remark"],
+                    "is_owner": c["username"] == room["owner"],
+                })
+            groups.append({
+                "username": room["username"],
+                "name": room_names.get(room["username"], room["username"]),
+                "owner": room["owner"],
+                "member_count": len(ms),
+                "members": ms,
+            })
+        return groups
+
+    def group_name_to_id(self, name: str) -> Optional[str]:
+        """按群名查找群 wxid（形如 ``xxx@chatroom``）；找不到返回 None。
+
+        精确匹配优先，其次做「子串包含」的宽松匹配（可能返回多个，取第一个）。
+        """
+        conn = self._contact_conn()
+        if not conn:
+            return None
+        try:
+            rows = conn.execute(
+                "SELECT username, nick_name FROM contact "
+                "WHERE username LIKE '%@chatroom'").fetchall()
+        finally:
+            conn.close()
+        exact = None
+        fuzzy = []
+        for r in rows:
+            nm = r["nick_name"] or r["username"]
+            if nm == name:
+                exact = r["username"]
+            elif name and name in nm:
+                fuzzy.append(r["username"])
+            elif nm == r["username"] and name in nm:  # 无群名时按 username 兜底
+                fuzzy.append(r["username"])
+        return exact or (fuzzy[0] if fuzzy else None)
+
+    def group_id_to_name(self, chatroom_wxid: str) -> Optional[str]:
+        """按群 wxid 查群名；找不到返回 None。"""
+        conn = self._contact_conn()
+        if not conn:
+            return None
+        try:
+            r = conn.execute(
+                "SELECT nick_name, username FROM contact "
+                "WHERE username=? LIMIT 1", (chatroom_wxid,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if not r:
+            return None
+        return r["nick_name"] or r["username"]
+
+    def get_group_members(self, chatroom_wxid: str) -> List[dict]:
+        """枚举指定群聊的成员列表（静态读库，可轮询）。
+
+        Args:
+            chatroom_wxid: 群 wxid（形如 ``xxx@chatroom``）。
+
+        Returns:
+            List[dict]，每条：username(wxid/微信号), nick_name, remark,
+            is_owner(是否群主)。按 username 排序。
+        """
+        conn = self._contact_conn()
+        if not conn:
+            return []
+        try:
+            room = conn.execute(
+                "SELECT id, owner FROM chat_room WHERE username=? LIMIT 1",
+                (chatroom_wxid,),
+            ).fetchone()
+            if not room:
+                return []
+            rows = conn.execute(
+                "SELECT m.member_id, c.username, c.nick_name, c.remark "
+                "FROM chatroom_member m "
+                "LEFT JOIN contact c ON c.id = m.member_id "
+                "WHERE m.room_id=? AND c.username IS NOT NULL",
+                (room["id"],),
+            ).fetchall()
+        finally:
+            conn.close()
+        members = []
+        for r in rows:
+            members.append({
+                "username": r["username"],
+                "nick_name": r["nick_name"],
+                "remark": r["remark"],
+                "is_owner": r["username"] == room["owner"],
+            })
+        members.sort(key=lambda x: x["username"])
+        return members
+
+    def get_group_member_watcher(self, chatroom_wxid: str) -> "GroupMemberWatcher":
+        """为指定群创建成员变动监测器（见 GroupMemberWatcher）。"""
+        return GroupMemberWatcher(self, chatroom_wxid)
+
+    # ------------------------------------------------------------------
     # 历史消息全量导出
     # ------------------------------------------------------------------
     def _build_md5_index(self) -> Dict[str, str]:
@@ -1671,6 +1835,56 @@ def list_accounts(db_dir: Optional[str] = None) -> List[dict]:
         })
     out.sort(key=lambda x: -x["last_activity"])
     return out
+
+
+class GroupMemberWatcher:
+    """群成员变动监测器（只读，基于 contact.db 的 chatroom_member 关联）。
+
+    记录一次成员快照，之后每次调用 ``poll()`` 对比当前成员，输出
+    「新增 / 离群」差异。适合轮询监听群成员变动。
+
+    用法::
+
+        w = db.get_group_member_watcher("xxx@chatroom")
+        snapshot = w.capture()          # 保存基线快照
+        ...
+        diff = w.poll()                 # 返回 {"joined": [...], "left": [...]}
+        # diff 均空 => 无变动；否则可据此处理，并用 w.capture() 更新基线
+    """
+
+    def __init__(self, db: "WeChatDB", chatroom_wxid: str):
+        self.db = db
+        self.chatroom_wxid = chatroom_wxid
+        self._baseline = None  # username set
+
+    def _current(self) -> set:
+        return {m["username"] for m in self.db.get_group_members(self.chatroom_wxid)}
+
+    def capture(self) -> set:
+        """读取当前成员并保存为基线快照；返回成员 username 集合。"""
+        self._baseline = self._current()
+        return set(self._baseline)
+
+    @property
+    def members(self) -> List[dict]:
+        """当前成员列表（含昵称/备注/是否群主）。"""
+        return self.db.get_group_members(self.chatroom_wxid)
+
+    def poll(self) -> dict:
+        """对比上次基线返回成员变动。
+
+        Returns:
+            dict: {"joined": [...], "left": [...]}，元素为成员 username。
+        - 首次调用（无基线）时先建立基线并返回空差异。
+        - 返回后不自动改基线；如需推进，显式调用 ``capture()``。
+        """
+        cur = self._current()
+        if self._baseline is None:
+            self._baseline = cur
+            return {"joined": [], "left": []}
+        joined = sorted(cur - self._baseline)
+        left = sorted(self._baseline - cur)
+        return {"joined": joined, "left": left}
 
 
 _LISTENER_STOP = object()

@@ -10,7 +10,7 @@ from .wx import WeChat, Chat, Listener
 from .param import WxParam, WxResponse, PROJECT_NAME
 from .logger import wxlog
 from .moment import Moment, MomentDB
-from .db import WeChatDB, auto_detect_db_dir, list_accounts
+from .db import WeChatDB, GroupMemberWatcher, auto_detect_db_dir, list_accounts
 from .media import MediaDownloader
 from .guia import (
     WeChatGUI,
@@ -49,13 +49,14 @@ from .msgs import (
     parse_msg,
 )
 
-__version__ = "1.1.10.2"
+__version__ = "1.2.0"
 
 __all__ = [
     "WeChat",
     "Chat",
     "Listener",
     "WeChatDB",
+    "GroupMemberWatcher",
     "auto_detect_db_dir",
     "list_accounts",
     "MediaDownloader",

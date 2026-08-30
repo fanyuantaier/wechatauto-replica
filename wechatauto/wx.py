@@ -43,6 +43,30 @@ if TYPE_CHECKING:
     from wechatauto.msgs.base import Message
 
 
+def _find_descendant(control, predicate, max_depth: int = 12):
+    """在 UIA 控件子树中递归查找第一个满足 ``predicate`` 的后代。
+
+    用树遍历（``GetChildren``）替代 ``uiautomation`` 的名称模式匹配，
+    避免兼容层对 Name 的模糊匹配在“朋友圈”等中文按钮上失配。
+    """
+    try:
+        if predicate(control):
+            return control
+    except Exception:
+        return None
+    if max_depth <= 0:
+        return None
+    try:
+        children = control.GetChildren()
+    except Exception:
+        return None
+    for child in children:
+        found = _find_descendant(child, predicate, max_depth - 1)
+        if found is not None:
+            return found
+    return None
+
+
 # ---------------------------------------------------------------------------
 # 兼容占位：UIA 时代的监听器抽象基类（保留导出，不再使用）
 # ---------------------------------------------------------------------------
@@ -499,12 +523,88 @@ class WeChat(Chat, Listener):
         self._current_chat: Optional['Chat'] = None
         self._listen_all_active = False
         self._listen_all_callback: Optional[Callable] = None
+        self._moment_api: Optional[object] = None
+        self._moment: Optional[object] = None
 
         if start_listener:
             self._listener_start()
         if debug:
             wxlog.set_debug(True)
             wxlog.debug('Debug mode is on')
+
+    # -- 朋友圈（UIA 控件路线）--------------------------------------------
+
+    @property
+    def _api(self):
+        """朋友圈 UIA 根控件（懒构建，需热激活 UIA 树后才有值）。"""
+        return self._ensure_moment_api()
+
+    def _ensure_moment_api(self):
+        """确保 UIA 树被热激活并返回主窗口封装，失败返回 None。"""
+        from wechatauto.logger import wxlog as _wxlog
+        if self._moment_api is not None:
+            return self._moment_api
+        try:
+            uia_eng = self._gui._get_uia()
+            if uia_eng is None:
+                _wxlog.info('UIA 树不可用，无法进入朋友圈（无 UI 节点）')
+                return None
+        except Exception as e:
+            _wxlog.debug('初始化 UIA 引擎失败：%s', e)
+            return None
+        try:
+            from wechatauto.ui.main import WeChatMainWnd
+            self._moment_api = WeChatMainWnd()
+        except Exception as e:
+            _wxlog.debug('获取微信主窗口 UIA 封装失败：%s', e)
+            self._moment_api = None
+        return self._moment_api
+
+    def SwitchToMoments(self) -> bool:
+        """切换到朋友圈页面（UIA 控件点击导航栏“朋友圈”按钮）。
+
+        需要微信主窗口已登录且 UIA 树被热激活。优先用 :class:`NavigationBox`
+        的预订按钮；失败时退化为主窗口控件树的递归扫描（按 ClassName
+        ``mmui::MainTabBar`` 定位左侧导航栏，再匹配 Name 含“朋友圈”的按钮）。
+        成功返回 True，树不可用或找不到按钮时返回 False。
+        """
+        api = self._api
+        if api is None:
+            return False
+
+        # 路线 1：直接递归扫描主窗口控件树，命中“朋友圈”导航按钮（快且稳）
+        try:
+            root = api.control
+            tabbar = _find_descendant(root, lambda c: getattr(c, 'ClassName', '') == 'mmui::MainTabBar')
+            if tabbar is not None:
+                btn = _find_descendant(
+                    tabbar,
+                    lambda c: getattr(c, 'ControlTypeName', '') == 'ButtonControl'
+                              and (getattr(c, 'Name', '') or '').strip() == '朋友圈',
+                )
+                if btn is not None:
+                    btn.Click()
+                    return True
+        except Exception:
+            pass
+
+        # 路线 2：复用 NavigationBox（老接口）
+        nav = getattr(api, '_navigation_api', None)
+        if nav is not None:
+            try:
+                nav.switch_to_moments_page()
+                return True
+            except Exception:
+                pass
+        return False
+
+    @property
+    def Moment(self):
+        """朋友圈 UIA 控件接口（点赞/评论/读取）。UIA 树不可用时为 None。"""
+        if self._moment is None:
+            from wechatauto.moment import Moment
+            self._moment = Moment(self)
+        return self._moment
 
     # -- 监听（基于 db.Listener）------------------------------------------
 

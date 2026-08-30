@@ -12,7 +12,7 @@
 本项目复刻上游 wxauto 项目，目标是实现对当前微信 4.x Windows 客户端的自动化
 （读取消息、发送消息、媒体下载、朋友圈），非网页版，直接操作本机客户端。
 
-> 当前版本：1.1.10.2
+> 当前版本：1.2.0
 >
 > **兼容范围**：Windows 10/11 ｜ Python 3.9+（已在 3.12 验证）｜ 微信 **4.1.12+**
 > （数据库读取路线对微信版本不敏感；坐标+OCR 发送路线依赖 4.1.12+ 自绘渲染
@@ -37,6 +37,20 @@
 ---
 
 ## 版本记录
+
+### v1.2.0（2026-08-30）
+
+> 注：本版本合并了 1.1.10.2 之后、此前尚未发布的全部改动（1.1.10.3 → 1.1.10.7 的内容）。
+
+- **朋友圈智能定位与自动点赞**：`Moment.find_moment(publisher, keyword, ...)` 采用 **数据库路线计算目标偏移 + UIA 路线滚动定位** 的混合方案——先用本地 `sns.db` 标尺算出目标动态相对当前可见条目的索引偏移，再按偏移方向动态滚动（自适应步长），最终定位到指定作者/关键词的朋友圈，摆脱了“盲目往下翻”和“过早判定未找到”的问题。
+- **“…”浮层识别**：`Moment._locate_more_click` / `_find_more_button` 通过模板匹配（深浅两套模板，随包打包进 `assets/`）定位朋友圈右下角“…”按钮并点击，未识别到时自动微调滚动重试，弹出点赞/评论浮层。
+- **一键点赞**：`Moment.LikeMoment(publisher, keyword, ...)` 一键完成“定位 → 点…→ 浮层内点赞”；浮层内“赞/评论”按钮通过从 UIA 根节点向下做全局深度遍历按名称匹配后按其中心坐标点击。
+- **朋友圈点赞/评论（UIA 控件路线）**：`WeChat` 现暴露 `Moment` 属性与 `SwitchToMoments()`，通过热激活 `mmui` UIA 树并点击导航栏“朋友圈”。`Moment.Like(item, cancel=False)` 与 `Moment.Comment(item, content, reply_to=None)` 基于 UIA 控件对动态条目操作——点赞/评论属服务端行为，只能走界面（数据库路线保持只读）。UIA 树不可用时 `WeChat.Moment` 为 `None`。示例 `wechatauto/demo_moments_interact.py`。
+- **朋友圈图片/视频下载**：新增 `MomentDB.download_media(media, save_dir, kind)`——优先从本地缓存原样复制（离线、秒级），缓存缺失时回退到 CDN url 下载；`MomentDB.download_moment_media(feed, save_dir, ...)` 批量把一条动态的图片/视频落地到目录。`find_local_media(md5, kind, size)` 按 md5 定位缓存文件，对视频按 `totalSize` 跨整个 `Sns/Video` 树按大小近似匹配（视频缓存文件名是内容哈希、与朋友圈记录里的 md5 无关，故用大小找回真实 MP4）。`parse_feed` 现通过 `videomd5` / `videoDuration` / `type` 区分图片与视频，并记录每条媒体的 `size`。示例 `wechatauto/demo_moments_download.py`。
+- **朋友圈读取 API（数据库路线）**：`MomentDB.get_moments()` 新增 `since` / `until`（Unix 秒时间过滤）与 `keyword`（正文过滤），并支持 `limit=0` 全量返回。新增增量同步 `latest_tid()` / `get_moments_since()`，便于轮询检测「有新朋友圈」。新增互动通知 `get_interactions()` / `interactions_unread_count()`，读取「他人对我朋友圈的赞/评论」表（`SnsMessage_tmp3`）。新增 `comment_tree()` / `comment_reply_to()`，按 `comment_id` / `ref_comment_id` 将评论组织成回复树。
+- **新增群名 ↔ 群ID 互查**：`get_groups()` 现在返回每个群的真实 `name`（来自 contact 表，无群名时回退 wxid）。新增 `group_name_to_id(name)`（先精确匹配，再子串/模糊匹配）与 `group_id_to_name(chatroom_wxid)`，可按群显示名反查群 wxid（及反向），便于与 `get_group_members()`、`at_member()` 配合使用。
+- **新增群成员枚举与变动监测（只读，无需 UI）**：新增 `WeChatDB.get_groups()` / `get_group_members(chatroom_wxid)`，读取 `contact.db` 的 `chat_room` + `chatroom_member` + `contact` 三表关联，返回每个群的成员。新增 `GroupMemberWatcher`（经 `get_group_member_watcher` 创建）：先 `capture()` 存基线快照，之后 `poll()` 对比当前成员输出 `joined` / `left` 差异，实现轮询式群成员变动监测。可与现有 UI 自动化的 `at_member()` 配合使用。
+- 新增可运行示例 `wechatauto/demo_moment_find.py`、`demo_moment_more.py`、`demo_moment_like.py`；新增依赖 `pyautogui`、`opencv-python`。
 
 ### v1.1.10.2（2026-08-30）
 

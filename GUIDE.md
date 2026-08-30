@@ -378,9 +378,34 @@ for feed in moments.get_moments(limit=10):
     print("  images:", [i["md5"] for i in feed["images"]])
     print("  likes:", [l["nickname"] for l in feed["likes"]])
     print("  comments:", [(c["nickname"], c["content"]) for c in feed["comments"]])
+    # 下载本条动态的图片/视频（优先本地缓存，其次 CDN url）/ download media
+    saved = moments.download_moment_media(feed, save_dir=r"D:\moments")
+    print("  saved:", saved)
 ```
 
-GUI 交互版（点赞/评论读取）使用 `Moment` 对象，见 `demo` 脚本。
+朋友圈图片/视频下载的完整命令行示例见 `wechatauto/demo_moments_download.py`
+（`python -m wechatauto.demo_moments_download [N] --out 目录`）。
+
+**点赞 / 评论（UIA 控件路线）**：点赞/评论属服务端行为，需走界面（数据库路线只读）。
+`WeChat` 会热激活 `mmui` UIA 树并点击导航栏“朋友圈”后，基于 UIA 控件操作：
+
+```python
+from wechatauto import WeChat
+
+wx = WeChat()
+moments = wx.Moment                 # UIA 树不可用时为 None
+if moments is None:
+    raise SystemExit("UIA 树不可用，无法点赞/评论")
+wx.SwitchToMoments()                # 点击导航栏“朋友圈”
+items = moments.GetMoments()
+moments.Like(items[0])                            # 点赞
+moments.Like(items[0], cancel=True)               # 取消赞
+moments.Comment(items[0], "不错！")                # 评论
+moments.Comment(items[0], "谢谢！", reply_to="张三")   # 回复某人评论
+```
+
+命令行示例：`python -m wechatauto.demo_moments_interact [--like N | --unlike N | --comment N 文字]`
+（直接运行则只列出最新动态，不操作界面）。
 
 ---
 

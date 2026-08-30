@@ -1,4 +1,4 @@
-# wechatauto-replica — 微信 4.x Windows 自动化 / WeChat 4.x Automation
+﻿# wechatauto-replica — 微信 4.x Windows 自动化 / WeChat 4.x Automation
 
 > **中文版** 在下方 · **English version below**
 
@@ -18,7 +18,7 @@
 本项目复刻上游 wxauto 项目，目标是实现对当前微信 4.x Windows 客户端的自动化
 （读取消息、发送消息、媒体下载、朋友圈），非网页版，直接操作本机客户端。
 
-> 当前版本：1.1.10.2
+> 当前版本：1.2.0
 >
 > **兼容范围**：Windows 10/11 ｜ Python 3.9+（已在 3.12 验证）｜ 微信 **4.1.12+**
 > （数据库读取路线对微信版本不敏感；坐标+OCR 发送路线依赖 4.1.12+ 自绘渲染
@@ -43,6 +43,20 @@
 ---
 
 ## 版本记录
+
+### v1.2.0（2026-08-30）
+
+> 注：本版本合并了 1.1.10.2 之后、此前尚未发布的全部改动（1.1.10.3 → 1.1.10.7 的内容）。
+
+- **朋友圈智能定位与自动点赞**：`Moment.find_moment(publisher, keyword, ...)` 采用 **数据库路线计算目标偏移 + UIA 路线滚动定位** 的混合方案——先用本地 `sns.db` 标尺算出目标动态相对当前可见条目的索引偏移，再按偏移方向动态滚动（自适应步长），最终定位到指定作者/关键词的朋友圈，摆脱了“盲目往下翻”和“过早判定未找到”的问题。
+- **“…”浮层识别**：`Moment._locate_more_click` / `_find_more_button` 通过模板匹配（深浅两套模板，随包打包进 `assets/`）定位朋友圈右下角“…”按钮并点击，未识别到时自动微调滚动重试，弹出点赞/评论浮层。
+- **一键点赞**：`Moment.LikeMoment(publisher, keyword, ...)` 一键完成“定位 → 点…→ 浮层内点赞”；浮层内“赞/评论”按钮通过从 UIA 根节点向下做全局深度遍历按名称匹配后按其中心坐标点击。
+- **朋友圈点赞/评论（UIA 控件路线）**：`WeChat` 现暴露 `Moment` 属性与 `SwitchToMoments()`，通过热激活 `mmui` UIA 树并点击导航栏“朋友圈”。`Moment.Like(item, cancel=False)` 与 `Moment.Comment(item, content, reply_to=None)` 基于 UIA 控件对动态条目操作——点赞/评论属服务端行为，只能走界面（数据库路线保持只读）。UIA 树不可用时 `WeChat.Moment` 为 `None`。示例 `wechatauto/demo_moments_interact.py`。
+- **朋友圈图片/视频下载**：新增 `MomentDB.download_media(media, save_dir, kind)`——优先从本地缓存原样复制（离线、秒级），缓存缺失时回退到 CDN url 下载；`MomentDB.download_moment_media(feed, save_dir, ...)` 批量把一条动态的图片/视频落地到目录。`find_local_media(md5, kind, size)` 按 md5 定位缓存文件，对视频按 `totalSize` 跨整个 `Sns/Video` 树按大小近似匹配（视频缓存文件名是内容哈希、与朋友圈记录里的 md5 无关，故用大小找回真实 MP4）。`parse_feed` 现通过 `videomd5` / `videoDuration` / `type` 区分图片与视频，并记录每条媒体的 `size`。示例 `wechatauto/demo_moments_download.py`。
+- **朋友圈读取 API（数据库路线）**：`MomentDB.get_moments()` 新增 `since` / `until`（Unix 秒时间过滤）与 `keyword`（正文过滤），并支持 `limit=0` 全量返回。新增增量同步 `latest_tid()` / `get_moments_since()`，便于轮询检测「有新朋友圈」。新增互动通知 `get_interactions()` / `interactions_unread_count()`，读取「他人对我朋友圈的赞/评论」表（`SnsMessage_tmp3`）。新增 `comment_tree()` / `comment_reply_to()`，按 `comment_id` / `ref_comment_id` 将评论组织成回复树。
+- **新增群名 ↔ 群ID 互查**：`get_groups()` 现在返回每个群的真实 `name`（来自 contact 表，无群名时回退 wxid）。新增 `group_name_to_id(name)`（先精确匹配，再子串/模糊匹配）与 `group_id_to_name(chatroom_wxid)`，可按群显示名反查群 wxid（及反向），便于与 `get_group_members()`、`at_member()` 配合使用。
+- **新增群成员枚举与变动监测（只读，无需 UI）**：新增 `WeChatDB.get_groups()` / `get_group_members(chatroom_wxid)`，读取 `contact.db` 的 `chat_room` + `chatroom_member` + `contact` 三表关联，返回每个群的成员。新增 `GroupMemberWatcher`（经 `get_group_member_watcher` 创建）：先 `capture()` 存基线快照，之后 `poll()` 对比当前成员输出 `joined` / `left` 差异，实现轮询式群成员变动监测。可与现有 UI 自动化的 `at_member()` 配合使用。
+- 新增可运行示例 `wechatauto/demo_moment_find.py`、`demo_moment_more.py`、`demo_moment_like.py`；新增依赖 `pyautogui`、`opencv-python`。
 
 ### v1.1.10.2（2026-08-30）
 
@@ -671,7 +685,7 @@ quick_send_file(r'D:\资料\报告.pdf', '文件传输助手')
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.1.10.2 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
+> **Current version:** 1.2.0 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -762,7 +776,35 @@ for feed in moments.get_moments(limit=10):
     print("  images:", [i["md5"] for i in feed["images"]])
     print("  likes:", [l["nickname"] for l in feed["likes"]])
     print("  comments:", [(c["nickname"], c["content"]) for c in feed["comments"]])
+    # download this feed's pictures & videos (local cache first, then CDN url)
+    saved = moments.download_moment_media(feed, save_dir=r"D:\moments")
+    print("  saved:", saved)
 ```
+
+See `wechatauto/demo_moments_download.py` for a runnable download demo
+(`python -m wechatauto.demo_moments_download [N] --out 目录`).
+
+**Like & comment** are server-side actions done through the client UI, so they
+use the UIA-tree route (not the local DB) — `WeChat` hot-activates the `mmui`
+UIA tree, clicks 朋友圈, then acts on UIA feed items:
+
+```python
+from wechatauto import WeChat
+
+wx = WeChat()
+moments = wx.Moment                 # None if the UIA tree is unavailable
+if moments is None:
+    raise SystemExit("UIA tree unavailable")
+wx.SwitchToMoments()
+items = moments.GetMoments()
+moments.Like(items[0])                            # thumb up
+moments.Like(items[0], cancel=True)               # undo
+moments.Comment(items[0], "Nice!")                # comment
+moments.Comment(items[0], "Thanks!", reply_to="张三")  # reply
+```
+
+Runnable demo: `python -m wechatauto.demo_moments_interact [--like N | --unlike N | --comment N 文字]`
+(plain run lists the latest feeds without touching the UI).
 
 ## 🧠 How It Works
 
@@ -796,6 +838,19 @@ for feed in moments.get_moments(limit=10):
 - Performance: parallel export / first-scan, incremental memory-scan cache
 
 ## 📝 Changelog
+
+### v1.2.0 (2026-08-30)
+> Note: this release merges all changes made after 1.1.10.2 that were not yet published (1.1.10.3 → 1.1.10.7).
+
+- **Smart Moments positioning + auto like**: `Moment.find_moment(publisher, keyword, ...)` uses a hybrid of the **DB route (computing the target offset)** + **UIA route (scrolling by offset)** — it derives how many feeds the target is from the current view using the local `sns.db` ruler, then scrolls adaptively in the correct direction to land on the moment by author/keyword, eliminating blind downward scrolling and false "not found" results.
+- **"…" overlay recognition**: `Moment._locate_more_click` / `_find_more_button` locate the "…" button (bottom-right of a feed) via template matching (light/dark templates shipped in `assets/`) and click it; if not found it keeps nudging the scroll and retrying to pop up the like/comment overlay.
+- **One-shot Like**: `Moment.LikeMoment(publisher, keyword, ...)` does "locate → tap "…" → like in the overlay"; the "赞/Comment" buttons in the overlay are found by a global deep traversal from the UIA root (matching by name) and clicked at their center.
+- **Moments like/comment via UIA controls**: `WeChat` now exposes a `Moment` property and `SwitchToMoments()` that hot-activate the `mmui` UIA tree and click the 朋友圈 nav button. `Moment.Like(item, cancel=False)` and `Moment.Comment(item, content, reply_to=None)` operate on UIA feed items — likes/comments are server-side actions, so they need the UI (the DB route stays read-only). `WeChat.Moment` is `None` when the UIA tree is unavailable. Demo `wechatauto/demo_moments_interact.py`.
+- **Moments media download**: new `MomentDB.download_media(media, save_dir, kind)` copies a single picture/video from the local cache first (byte-for-byte, offline) and falls back to the CDN url; `MomentDB.download_moment_media(feed, save_dir, ...)` fetches all pictures/videos of one feed into a folder. `find_local_media(md5, kind, size)` locates the cache file by md5 and, for videos, by `totalSize` across the whole `Sns/Video` tree (the video cache name is a content-hash unrelated to the feed md5, so size matching recovers real MP4s). `parse_feed` now distinguishes pictures vs videos via `videomd5`/`videoDuration`/`type` and records each media's `size`. Demo `wechatauto/demo_moments_download.py`.
+- **Moments read API (DB route)**: `MomentDB.get_moments()` now supports `since` / `until` (Unix-seconds time filter) and `keyword` (text filter), plus `limit=0` to return every row. New incremental-sync helpers `latest_tid()` / `get_moments_since()` make it easy to poll for new moments. New interaction notifier `get_interactions()` / `interactions_unread_count()` read the "likes/comments on my moments" table (`SnsMessage_tmp3`). New `comment_tree()` / `comment_reply_to()` organize a feed's comments into reply chains (built from `comment_id`/`ref_comment_id`).
+- **Add group name ↔ ID lookup**: `get_groups()` now returns each group's real `name` (from `contact` table, falling back to its wxid). New `group_name_to_id(name)` (exact match first, then substring/fuzzy) and `group_id_to_name(chatroom_wxid)` let you resolve a group's wxid from its display name and vice versa — handy for combining with `get_group_members()` and `at_member()`.
+- **Add group member enumeration & change watch (read-only, no UI)**: New `WeChatDB.get_groups()` / `get_group_members(chatroom_wxid)` read `chat_room` + `chatroom_member` + `contact` from `contact.db` to return each group's members (username / nick_name / remark / is_owner). New `GroupMemberWatcher` (via `get_group_member_watcher`) snapshots membership and `poll()` diffs against the baseline to report `joined` / `left` members, enabling polling-based membership-change monitoring. Useful together with the existing UI-automation `at_member()`.
+- New runnable demos `wechatauto/demo_moment_find.py`, `demo_moment_more.py`, `demo_moment_like.py`; new deps `pyautogui`, `opencv-python`.
 
 ### v1.1.10.2 (2026-08-30)
 - **Fix long text still showing `[文本]` on fresh installs: add required `zstandard` dependency**: WeChat 4.x stores long-text `message_content` as a zstd-compressed frame, decoded in `_friendly_content` via `import zstandard`. That import silently failed when `zstandard` was absent (it was **not** in `pyproject.toml` required deps), so long text degraded to the `[文本]` placeholder while listening worked normally. `zstandard` is now a required dependency; `_friendly_content` also gained lazy dual-package import (`zstandard`/`zstd`) via new `_get_zstd_module()` / `_zstd_decompress()` helpers.
