@@ -14,6 +14,20 @@
 ![License](https://img.shields.io/github/license/fanyuantaier/wechatauto-replica)
 ![GitHub stars](https://img.shields.io/github/stars/fanyuantaier/wechatauto-replica)
 
+> [!NOTE]
+> **📢 维护状态 / Maintenance Notice**
+> 本人因今年升高一，开学后几乎没有时间继续更新本项目（如果有时间，争取周日更新）。遇到问题请自行在 Issues 区讨论，或询问 AI 协助解决。感谢支持！
+>
+> I'm starting senior high school and will register tomorrow (Aug 23). After school starts I'll have almost no time to keep updating (Sundays if possible). Please discuss issues in the Issues section or ask an AI. Thanks for your support!
+
+
+> [!NOTE]
+> **📢 维护状态 / Maintenance Notice**
+> 本人因今年升高一，开学后几乎没有时间继续更新本项目（如果有时间，争取周日更新）。遇到问题请自行在 Issues 区讨论，或询问 AI 协助解决。感谢支持！
+>
+> I'm starting senior high school and will register tomorrow (Aug 23). After school starts I'll have almost no time to keep updating (Sundays if possible). Please discuss issues in the Issues section or ask an AI. Thanks for your support!
+
+
 
 本项目复刻上游 wxauto 项目，目标是实现对当前微信 4.x Windows 客户端的自动化
 （读取消息、发送消息、媒体下载、朋友圈），非网页版，直接操作本机客户端。
