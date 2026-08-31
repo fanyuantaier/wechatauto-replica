@@ -18,7 +18,7 @@
 本项目复刻上游 wxauto 项目，目标是实现对当前微信 4.x Windows 客户端的自动化
 （读取消息、发送消息、媒体下载、朋友圈），非网页版，直接操作本机客户端。
 
-> 当前版本：1.2.0.2
+> 当前版本：1.2.0.3
 >
 > **兼容范围**：Windows 10/11 ｜ Python 3.9+（已在 3.12 验证）｜ 微信 **4.1.12+**
 > （数据库读取路线对微信版本不敏感；坐标+OCR 发送路线依赖 4.1.12+ 自绘渲染
@@ -44,7 +44,7 @@
 
 ## 版本记录
 
-### v1.2.0.2（2026-08-31）
+### v1.2.0.3（2026-08-31）
 
 - **修复 WAL 合并后数据库解密缓存损坏导致死循环**：`_check_merged` 之前用 `SELECT count(*) FROM sqlite_master` 只查 schema 树，数据页损坏仍能通过校验，缓存 stamp 标记为"最新"后每秒轮询复用坏缓存，反复抛 `database disk image is malformed` 形成死循环。改用 `PRAGMA quick_check` 全库校验（含数据页/索引页）；新增 `_invalidate_cache()` 清空解密 `.db`/`.stamp` 缓存；查询统一入口 `_run_msg_query`：命中 malformed 时清缓存→重建→自动重试一次；`_msg_conn` 及时关闭分片库连接避免 Windows 文件占用。
 
@@ -692,7 +692,7 @@ quick_send_file(r'D:\资料\报告.pdf', '文件传输助手')
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.2.0.2 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
+> **Current version:** 1.2.0.3 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -852,7 +852,7 @@ Runnable demo: `python -m wechatauto.demo_moments_interact [--like N | --unlike 
 
 ## 📝 Changelog
 
-### v1.2.0.2 (2026-08-31)
+### v1.2.0.3 (2026-08-31)
 
 - **Fix WAL-merged database cache corruption causing infinite loop**: `_check_merged` previously used `SELECT count(*) FROM sqlite_master` which only checks the schema tree — corrupted data pages still passed validation, causing the cache stamp to mark the bad cache as "up-to-date" and every subsequent poll to reuse it, throwing `database disk image is malformed` on a dead loop. Now uses `PRAGMA quick_check` for full database validation (data + index pages). New `_invalidate_cache()` clears all decrypted `.db`/`.stamp` files. New `_run_msg_query()` unified entry point auto-retries once on `malformed` (clear cache → rebuild → retry). `_msg_conn` now closes shard connections immediately to avoid Windows file-lock issues during cache cleanup.
 
