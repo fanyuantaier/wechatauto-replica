@@ -10,7 +10,7 @@
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 2.2.0.1 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
+> **Current version:** 1.2.0.1 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -174,6 +174,10 @@ Runnable demo: `python -m wechatauto.demo_moments_interact [--like N | --unlike 
 - Performance: parallel export / first-scan, incremental memory-scan cache
 
 ## 📝 Changelog
+
+### v1.2.0.1 (2026-08-31)
+
+- **Fix WAL-merged database cache corruption causing infinite loop**: `_check_merged` previously used `SELECT count(*) FROM sqlite_master` which only checks the schema tree — corrupted data pages still passed validation, causing the cache stamp to mark the bad cache as "up-to-date" and every subsequent poll to reuse it, throwing `database disk image is malformed` on a dead loop. Now uses `PRAGMA quick_check` for full database validation (data + index pages). New `_invalidate_cache()` clears all decrypted `.db`/`.stamp` files. New `_run_msg_query()` unified entry point auto-retries once on `malformed` (clear cache → rebuild → retry). `_msg_conn` now closes shard connections immediately to avoid Windows file-lock issues during cache cleanup.
 
 ### v1.2.0 (2026-08-30)
 > Note: this release merges all changes made after 1.1.10.2 that were not yet published (1.1.10.3 → 1.1.10.7).
