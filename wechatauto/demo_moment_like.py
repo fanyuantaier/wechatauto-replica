@@ -28,7 +28,7 @@ from wechatauto.logger import wxlog
 
 def main():
     ap = argparse.ArgumentParser(description='一键点赞指定朋友圈')
-    ap.add_argument('--author', default=None, help='发布者昵称')
+    ap.add_argument('--author', default="兔仔仔", help='发布者昵称')
     ap.add_argument('--keyword', default=None, help='正文关键词')
     ap.add_argument('--max-screens', type=int, default=300)
     ap.add_argument('--debug', action='store_true')

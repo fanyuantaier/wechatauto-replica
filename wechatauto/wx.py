@@ -547,6 +547,11 @@ class WeChat(Chat, Listener):
         try:
             uia_eng = self._gui._get_uia()
             if uia_eng is None:
+                # 首次拿不到 → 强制重新热激活 accessibility gate（微信重启
+                # /重登后 gate byte 会失效），再取一次，避免“昨天能用今天不能”。
+                _wxlog.info('UIA 引擎初始不可用，强制重新热激活后重试')
+                uia_eng = self._gui._get_uia(refresh=True)
+            if uia_eng is None:
                 _wxlog.info('UIA 树不可用，无法进入朋友圈（无 UI 节点）')
                 return None
         except Exception as e:

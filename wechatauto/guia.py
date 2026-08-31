@@ -1160,25 +1160,31 @@ class WeChatGUI:
         except Exception:
             return False
 
-    def _get_uia(self):
+    def _get_uia(self, refresh: bool = False):
         """惰性创建并复用 UIA 引擎；不可用时返回 None（由调用方降级 OCR）。
 
         混合驱动：UIA 树需热激活（写 Weixin.dll 的 Qt accessibility byte）。
         首次尝试失败则本次会话内不再重试（避免每条消息都等超时）。
+
+        Args:
+            refresh: True 时跳过缓存**强制重新热激活**（写 accessibility gate
+                byte）并重建引擎。微信重启/重登后 gate byte 会失效、导致
+                “昨天能用今天不能”，此时传 True 可恢复 UIA 树。
         """
-        if self._uia_tried:
-            return self._uia
-        self._uia_tried = True
-        try:
-            from wechatauto.uia_driver import WeChatUIA
-            eng = WeChatUIA()
-            if eng.ensure_window():
-                self._uia = eng
-                wxlog.info('已启用 UIA 驱动（混合路径：UIA 优先，OCR 兜底）')
-            else:
-                wxlog.info('UIA 树不可用，本次会话使用 OCR 驱动')
-        except Exception as e:
-            wxlog.debug('初始化 UIA 引擎失败：%s', e)
+        if refresh or not self._uia_tried:
+            self._uia_tried = True
+            try:
+                from wechatauto.uia_driver import WeChatUIA
+                eng = WeChatUIA()
+                if eng.ensure_window():
+                    self._uia = eng
+                    wxlog.info('已启用 UIA 驱动（混合路径：UIA 优先，OCR 兜底）')
+                else:
+                    self._uia = None
+                    wxlog.info('UIA 树不可用，本次会话使用 OCR 驱动')
+            except Exception as e:
+                self._uia = None
+                wxlog.debug('初始化 UIA 引擎失败：%s', e)
         return self._uia
 
     def open_chat(self, name: str, exact: bool = False) -> bool:

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wechatauto-replica"
-version = "1.2.0"
+version = "1.2.0.1"
 description = "微信 4.x Windows 客户端自动化库（wxauto 复刻版）：SQLCipher 数据库解密读取 + UIA/坐标-OCR 混合发送，支持消息监听、媒体下载、朋友圈读取"
 readme = "README_pypi.md"
 requires-python = ">=3.9"

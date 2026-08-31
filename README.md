@@ -10,7 +10,7 @@
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.2.0 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
+> **Current version:** 2.2.0.1 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -135,6 +135,12 @@ moments.Comment(first, "Thanks!", reply_to="张三")  # reply to a comment
 
 Runnable demo: `python -m wechatauto.demo_moments_interact [--like N | --unlike N | --comment N 文字]`
 (plain run lists the latest feeds without touching the UI).
+
+> **⚠️ Comment/reply automation is experimental — testing only.** The
+> reply-to-a-comment feature (`ReplyComment`) locates the comment row on screen
+> via OCR (WeChat's comment area is self-drawn) and then drives the UI to
+> click / paste / send. Layout varies across versions and it is not
+> production-grade — use it only on a test account to validate the pipeline.
 
 ## 🧠 How It Works
 

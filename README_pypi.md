@@ -18,7 +18,7 @@
 本项目复刻上游 wxauto 项目，目标是实现对当前微信 4.x Windows 客户端的自动化
 （读取消息、发送消息、媒体下载、朋友圈），非网页版，直接操作本机客户端。
 
-> 当前版本：1.2.0
+> 当前版本：2.2.0.1
 >
 > **兼容范围**：Windows 10/11 ｜ Python 3.9+（已在 3.12 验证）｜ 微信 **4.1.12+**
 > （数据库读取路线对微信版本不敏感；坐标+OCR 发送路线依赖 4.1.12+ 自绘渲染
@@ -591,6 +591,9 @@ def on_msg(msg, listener):
    返回，否则返回 None；
 5. **发朋友圈功能已舍弃**：4.x 的发表为自绘界面操作，不可靠自动化；
    本库仅保留朋友圈读取/点赞/评论能力。
+6. **评论/回复功能仅供测试**：`回复某条评论`（`ReplyComment`）通过截图
+   OCR 定位评论区评论行，再驱动界面点击/粘贴/发送；朋友圈评论区为自绘、
+   布局多变，稳定性无法保证，仅建议在测试账号中验证流程，勿用于生产。
 
 ---
 
@@ -685,7 +688,7 @@ quick_send_file(r'D:\资料\报告.pdf', '文件传输助手')
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.2.0 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
+> **Current version:** 2.2.0.1 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -804,6 +807,12 @@ moments.Comment(items[0], "Thanks!", reply_to="张三")  # reply
 ```
 
 Runnable demo: `python -m wechatauto.demo_moments_interact [--like N | --unlike N | --comment N 文字]`
+
+> **⚠️ Comment/reply automation is experimental — testing only.** The
+> reply-to-a-comment feature (`ReplyComment`) locates the comment row on screen
+> via OCR (WeChat's comment area is self-drawn) and then drives the UI to
+> click / paste / send. Layout varies across versions and it is not
+> production-grade — use it only on a test account to validate the pipeline.
 (plain run lists the latest feeds without touching the UI).
 
 ## 🧠 How It Works

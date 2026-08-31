@@ -122,6 +122,11 @@ def _md5_hex(data: bytes) -> str:
     return hashlib.md5(data).hexdigest()
 
 
+def _is_malformed(exc) -> bool:
+    """是否 SQLite "database disk image is malformed" 类库损坏（数据页损坏）。"""
+    return isinstance(exc, sqlite3.DatabaseError) and "malformed" in str(exc).lower()
+
+
 def _pbkdf2(passwd: bytes, salt: bytes, iters: int) -> bytes:
     return hashlib.pbkdf2_hmac("sha512", passwd, salt, iters, dklen=32)
 
@@ -967,14 +972,21 @@ class WeChatDB:
 
     @staticmethod
     def _check_merged(dst: str) -> bool:
+        """校验解密/合并结果可完整读取。
+
+        只兜底 sqlite_master 无法发现数据页损坏：WAL 若带入过期/错位页，
+        schema 树可能仍正常，但表数据页已损坏，直到 SELECT 才抛
+        "database disk image is malformed"。这里用 PRAGMA quick_check
+        全库校验（含数据页与索引页），损坏时返回 False，触发全量重建重试。
+        """
         try:
             conn = sqlite3.connect(f"file:{dst}?mode=ro", uri=True)
             try:
-                conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+                rows = conn.execute("PRAGMA quick_check").fetchall()
             finally:
                 conn.close()
-            return True
-        except sqlite3.DatabaseError:
+            return bool(rows) and all(str(r[0]) == "ok" for r in rows)
+        except sqlite3.Error:
             return False
 
     def _wal_path(self, rel: str) -> Optional[str]:
@@ -1116,11 +1128,40 @@ class WeChatDB:
                 return conn, target
         return None
 
-    def _msg_conn(self, user: str) -> Optional[Tuple[sqlite3.Connection, str]]:
-        """打开消息库并定位用户消息表（调用方负责 close 连接）"""
-        conns = [self._open(rel) for rel in self._message_dbs()]
+    def _invalidate_cache(self) -> None:
+        """删除 workdir 中全部解密缓存(.db/.stamp)，key 缓存除外。
+
+        下一次 _open 会对每份库全量解密重建。media 图片等副产物不受影响。
+        """
         try:
+            names = os.listdir(self.workdir)
+        except OSError:
+            return
+        removed = 0
+        for n in names:
+            if n.endswith(".db") or n.endswith(".stamp"):
+                try:
+                    os.remove(os.path.join(self.workdir, n))
+                    removed += 1
+                except OSError:
+                    pass
+        if removed:
+            sys.stderr.write("[wechatauto] 已清 %d 个缓存文件等待重建\n" % removed)
+
+    def _msg_conn(self, user: str, _retry: bool = True) -> Optional[Tuple[sqlite3.Connection, str]]:
+        """打开消息库并定位用户消息表（调用方负责 close 连接）"""
+        conns = []
+        try:
+            conns = [self._open(rel) for rel in self._message_dbs()]
             found = self._find_msg_table(user, conns)
+        except sqlite3.DatabaseError as exc:
+            for c in conns:
+                c.close()
+            if _retry and _is_malformed(exc):
+                sys.stderr.write("[wechatauto] 消息库损坏(%s)，清缓存重建并重试\n" % exc)
+                self._invalidate_cache()
+                return self._msg_conn(user, _retry=False)
+            raise
         except Exception:
             for c in conns:
                 c.close()
@@ -1129,40 +1170,64 @@ class WeChatDB:
             for c in conns:
                 c.close()
             return None
+        # 只保留命中的连接，其余分片库立即关闭，避免 Windows 下删除缓存被占用
+        target = found[0]
+        for c in conns:
+            if c is not target:
+                c.close()
         return found
+
+    def _run_msg_query(self, user: str, build):
+        """对消息库执行只读查询；查询到库损坏时清缓存重建并重试一次。
+
+        build(conn, table) -> rows（同 _msg_conn 的 found 连接/表名）。
+        _msg_conn 已处理 schema 损坏重建，本方法兜底数据页损坏。
+        重试后仍失败则抛原始异常（Listener 捕获后跳过本轮，不阻断运行）。
+        找不到该会话返回 None。
+        """
+        for attempt in (0, 1):
+            found = self._msg_conn(user)
+            if found is None:
+                return None
+            conn, table = found
+            try:
+                return build(conn, table)
+            except sqlite3.DatabaseError as exc:
+                if attempt or not _is_malformed(exc):
+                    raise
+                sys.stderr.write(
+                    "[wechatauto] 查询到库损坏(%s)，清缓存重建并重试\n" % exc
+                )
+                self._invalidate_cache()
+            finally:
+                conn.close()
+        return None
 
     def get_messages(self, user: str, limit: int = 20, offset: int = 0) -> List[dict]:
         """读取指定会话（微信号/群号）的最近消息"""
-        found = self._msg_conn(user)
-        if not found:
-            return []
-        conn, table = found
-        try:
-            rows = conn.execute(
-                "SELECT local_id, local_type, real_sender_id, create_time, "
-                "message_content, source, packed_info_data, compress_content, sort_seq "
-                "FROM %s ORDER BY sort_seq DESC LIMIT ? OFFSET ?" % table,
-                (limit, offset),
-            ).fetchall()
-        finally:
-            conn.close()
-        return [self._msg_row_to_dict(r) for r in rows]
+        return self._run_msg_query(
+            user,
+            lambda conn, table: [
+                self._msg_row_to_dict(r) for r in conn.execute(
+                    "SELECT local_id, local_type, real_sender_id, create_time, "
+                    "message_content, source, packed_info_data, compress_content, sort_seq "
+                    "FROM %s ORDER BY sort_seq DESC LIMIT ? OFFSET ?" % table,
+                    (limit, offset),
+                ).fetchall()
+            ],
+        ) or []
 
     def get_message_row(self, user: str, local_id: int) -> Optional[dict]:
         """按 local_id 读取一条消息的完整原始字段（媒体下载用，含 server_id/packed_info）"""
-        found = self._msg_conn(user)
-        if not found:
-            return None
-        conn, table = found
-        try:
-            row = conn.execute(
+        row = self._run_msg_query(
+            user,
+            lambda conn, table: conn.execute(
                 "SELECT local_id, local_type, server_id, real_sender_id, create_time, "
                 "message_content, source, packed_info_data, compress_content, sort_seq "
                 "FROM %s WHERE local_id=? LIMIT 1" % table,
                 (local_id,),
-            ).fetchone()
-        finally:
-            conn.close()
+            ).fetchone(),
+        )
         if not row:
             return None
         sender_id = row["real_sender_id"]
@@ -1192,37 +1257,29 @@ class WeChatDB:
 
         供批量下载场景使用（如一次性拉取某群全部图片）。
         """
-        found = self._msg_conn(user)
-        if not found:
-            return []
-        conn, table = found
-        try:
-            placeholders = ",".join("?" * len(types))
-            rows = conn.execute(
+        placeholders = ",".join("?" * len(types))
+        rows = self._run_msg_query(
+            user,
+            lambda conn, table: conn.execute(
                 "SELECT local_id FROM %s WHERE local_type IN (%s) "
                 "ORDER BY sort_seq DESC" % (table, placeholders),
                 tuple(sorted(types)),
-            ).fetchall()
-        finally:
-            conn.close()
-        return [r["local_id"] for r in rows]
+            ).fetchall(),
+        )
+        return [r["local_id"] for r in rows] if rows else []
 
     def get_new_messages(self, user: str, since_seq: int = 0, limit: int = 200) -> List[dict]:
         """返回 sort_seq > since_seq 的新消息（升序），供轮询监听使用"""
-        found = self._msg_conn(user)
-        if not found:
-            return []
-        conn, table = found
-        try:
-            rows = conn.execute(
+        rows = self._run_msg_query(
+            user,
+            lambda conn, table: conn.execute(
                 "SELECT local_id, local_type, real_sender_id, create_time, "
                 "message_content, source, packed_info_data, compress_content, sort_seq "
                 "FROM %s WHERE sort_seq > ? ORDER BY sort_seq ASC LIMIT ?" % table,
                 (since_seq, limit),
-            ).fetchall()
-        finally:
-            conn.close()
-        return [self._msg_row_to_dict(r) for r in rows]
+            ).fetchall(),
+        )
+        return [self._msg_row_to_dict(r) for r in rows] if rows else []
 
     def _msg_row_to_dict(self, r) -> dict:
         content = r["message_content"]
@@ -1359,6 +1416,32 @@ class WeChatDB:
                 return row["remark"] or row["nick_name"] or user
             break
         return user
+
+    def username_by_nickname(self, nickname: str) -> Optional[str]:
+        """通过昵称/备注反查微信号（contact.db）。
+
+        返回第一个 remark 或 nick_name 与给定昵称**精确相等**的 contact
+        username；找不到返回 None。
+        """
+        nickname = (nickname or '').strip()
+        if not nickname:
+            return None
+        conn = self._contact_conn()
+        if not conn:
+            return None
+        try:
+            rows = conn.execute(
+                "SELECT username, nick_name, remark FROM contact "
+                "WHERE remark=? OR nick_name=?",
+                (nickname, nickname),
+            ).fetchall()
+        finally:
+            conn.close()
+        for row in rows:
+            disp = row["remark"] or row["nick_name"]
+            if disp == nickname:
+                return row["username"]
+        return None
 
     # ------------------------------------------------------------------
     # 群成员（contact.db 读取，无需 UI）

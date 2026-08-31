@@ -50,7 +50,9 @@ def _asset_path(name: str) -> Optional[str]:
         import importlib.resources
         pkg = importlib.resources.files('wechatauto.assets')
         if pkg is not None:
-            return str(pkg.joinpath(name))
+            target = pkg.joinpath(name)
+            if target.is_file():
+                return str(target)
     except Exception:
         pass
     return None
@@ -503,6 +505,44 @@ class Moment:
             return []
         return lst.get_items(refresh=refresh)
 
+    def _scroll_item_fully_visible(self, publisher: Optional[str] = None,
+                                   keyword: Optional[str] = None,
+                                   max_retry: int = 10) -> Optional[MomentItem]:
+        """把目标朋友圈整个滚入时间线视野内，返回刷新后的完整 cell。
+
+        find_moment 命中即返回，但该条可能只露出一部分，评论文本不全。
+        这里依据 cell 与时间线矩形的位置关系，把超出屏幕的部分滚进来，
+        直到 cell 完全位于视野内（top>=视图顶 且 bottom<=视图底）。
+
+        Returns:
+            刷新后完整可见的目标 :class:`MomentItem`；失败返回 None。
+        """
+        rect = self._time_line_rect()
+        if not rect:
+            return None
+        vleft, vtop, vright, vbottom = rect
+        for _ in range(max_retry):
+            item = None
+            for it in self._read_visible_items(refresh=True):
+                if self._matches(it, publisher, keyword):
+                    item = it
+                    break
+            if item is None:
+                return None
+            try:
+                br = item.control.BoundingRectangle
+                top, bottom = br.top, br.bottom
+            except Exception:
+                return item
+            if top >= vtop and bottom <= vbottom:
+                return item
+            if top < vtop:
+                self._scroll(delta=-120, times=1)   # 顶部被裁，向下滚
+            else:
+                self._scroll(delta=120, times=1)    # 底部被裁，向上滚
+            time.sleep(0.4)
+        return None
+
 
     def _db_posts(self, db) -> List[dict]:
         """取数据库朋友圈有序列表（最新在前），供标尺对齐。"""
@@ -882,6 +922,383 @@ class Moment:
         return WxResponse.failure('未能在浮层中找到点赞按钮')
 
 
+    def _comment_open(self) -> bool:
+        """在 “…” 浮层已弹出的前提下，点击浮层里的「评论」。
+
+        点击后微信会在该动态下方/底部弹出评论输入框。
+        """
+        return self._click_float_button('评论', timeout=2.5)
+
+    def _comment_input_focus(self) -> bool:
+        """聚焦评论输入框（尽力而为，失败不致命）。
+
+        新版本评论输入框为自绘控件，可能没有 UIA EditControl；此时假定
+        点击「评论」后输入框已自动聚焦，直接进入输入阶段即可。
+        """
+        try:
+            root = uia.GetRootControl()
+            hit = self._find_edit_control(root, max_depth=30)
+            if hit is None:
+                return False
+            r = hit.BoundingRectangle
+            cx, cy = int((r.left + r.right) // 2), int((r.top + r.bottom) // 2)
+            import pyautogui
+            pyautogui.click(cx, cy)
+            time.sleep(0.3)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _find_edit_control(ctrl, target_text: str = '评论', max_depth: int = 30, depth: int = 0):
+        """深度优先搜索可见的评论输入框（EditControl，Name 含“评论”或为空）。"""
+        if depth > max_depth:
+            return None
+        try:
+            if ctrl.ControlTypeName == 'EditControl':
+                name = ctrl.Name or ''
+                if target_text in name or name == '':
+                    try:
+                        if ctrl.IsVisible:
+                            return ctrl
+                    except Exception:
+                        return ctrl
+        except Exception:
+            pass
+        try:
+            kids = ctrl.GetChildren()
+        except Exception:
+            kids = []
+        for kid in kids:
+            r = Moment._find_edit_control(kid, target_text, max_depth, depth + 1)
+            if r is not None:
+                return r
+        return None
+
+    def _type_comment(self, content: str) -> bool:
+        """把评论内容输入到评论框（剪贴板粘贴）。"""
+        if not content:
+            return False
+        try:
+            SetClipboardText(content)
+            uia.SendKeys('{Ctrl}v')
+            time.sleep(0.4)
+            return True
+        except Exception as e:
+            wxlog.debug(f'输入评论内容失败：{e}')
+            return False
+
+    def _send_template(self, theme: str) -> Optional[str]:
+        """返回「发送」按钮模板资源路径。
+
+        发送按钮明暗两套主题颜色一致，始终使用 `moments_send.png`
+        （必用 ASCII 文件名，OpenCV 在 Windows 上无法读中文路径）。
+        """
+        return _asset_path('moments_send.png')
+
+    def _click_comment_send(self) -> WxResponse:
+        """点击评论输入框的「发送」按钮（pyautogui 模板匹配）。
+
+        新版「发送」按钮为自绘控件，没有 UIA 控件，只能靠模板匹配坐标点击。
+        """
+        try:
+            import pyautogui
+        except Exception as e:
+            return WxResponse.failure(f'pyautogui 不可用：{e}')
+
+        try:
+            theme = self._comment_box_theme()
+        except Exception:
+            theme = 'light'
+        tpl = self._send_template(theme)
+        if not tpl:
+            return WxResponse.failure('缺少「发送」按钮模板资源（assets/moments_send.png）')
+
+        region = None
+        rect = self._time_line_rect()
+        if rect:
+            left, top, right, bottom = rect
+            rh = bottom - top
+            region = (left, max(0, int(top + rh * 0.6)),
+                      right - left, int(rh * 0.4) + 30)
+        try:
+            found = pyautogui.locateOnScreen(tpl, confidence=0.8, region=region)
+        except Exception as e:
+            wxlog.debug(f'识别「发送」按钮失败：{e}')
+            return WxResponse.failure(f'识别「发送」按钮失败：{e}')
+        if found is None:
+            wxlog.debug('屏幕中未识别到「发送」按钮')
+            return WxResponse.failure('屏幕中未识别到「发送」按钮')
+        x = int(found.left + found.width / 2)
+        y = int(found.top + found.height / 2)
+        try:
+            old = pyautogui.FAILSAFE
+            pyautogui.FAILSAFE = False
+            try:
+                pyautogui.click(x, y)
+            finally:
+                pyautogui.FAILSAFE = old
+            time.sleep(0.5)
+            return WxResponse.success('评论成功')
+        except Exception as e:
+            wxlog.debug(f'点击「发送」失败：{e}')
+            return WxResponse.failure(f'点击「发送」失败：{e}')
+
+    def _comment_box_theme(self) -> str:
+        """采样评论输入框所在区域（时间线底部）判断深浅主题（像素）。"""
+        try:
+            import pyautogui
+        except Exception:
+            return 'light'
+        rect = self._time_line_rect()
+        if not rect:
+            return 'light'
+        left, top, right, bottom = rect
+        x = int((left + right) // 2)
+        y = int(top + (bottom - top) * 0.95)
+        try:
+            r, g, b = pyautogui.pixel(x, y)
+        except Exception:
+            return 'light'
+        lum = 0.299 * r + 0.587 * g + 0.114 * b
+        return 'dark' if lum < 128 else 'light'
+
+    def CommentMoment(self, publisher: Optional[str] = None,
+                      keyword: Optional[str] = None, content: str = '',
+                      db=None, max_screens: int = 300,
+                      max_retry: int = 8) -> WxResponse:
+        """一键：定位指定朋友圈 -> 点击 “…” -> 点「评论」 -> 输入内容 -> 发送。
+
+        Args:
+            publisher: 发布者昵称。
+            keyword: 正文关键词。
+            content: 评论内容。
+            db / max_screens / max_retry: 定位参数。
+        """
+        if not publisher and not keyword:
+            return WxResponse.failure('CommentMoment 缺少定位条件')
+        if not content:
+            return WxResponse.failure('评论内容不能为空')
+        item = self.find_moment(publisher=publisher, keyword=keyword,
+                                db=db, max_screens=max_screens)
+        if item is None:
+            return WxResponse.failure('未能定位到目标朋友圈')
+        if not self._locate_more_click(item, max_retry=max_retry):
+            return WxResponse.failure('未能打开 “…” 浮层')
+        if not self._comment_open():
+            return WxResponse.failure('未能在浮层中找到“评论”按钮')
+        self._comment_input_focus()
+        if not self._type_comment(content):
+            return WxResponse.failure('输入评论内容失败')
+        return self._click_comment_send()
+
+    def ReplyCommentMoment(self, publisher: Optional[str] = None,
+                           keyword: Optional[str] = None,
+                           reply_to: Optional[str] = None,
+                           content: str = '',
+                           target_text: Optional[str] = None,
+                           db=None, max_screens: int = 300,
+                           max_retry: int = 8) -> WxResponse:
+        """一键：定位指定朋友圈 -> 回复其某条评论（截图 OCR 定位 -> 点击 -> 输入 -> 发送）。
+
+        Args:
+            publisher: 发布者昵称。
+            keyword: 正文关键词。
+            reply_to: 被回复评论的作者昵称（OCR 匹配评论行前缀）。
+            content: 回复内容。
+            target_text: 可选，被回复评论正文（同作者多条时消歧）。
+            db / max_screens / max_retry: 定位参数。
+        """
+        if not publisher and not keyword:
+            return WxResponse.failure('ReplyCommentMoment 缺少定位条件')
+        if not reply_to:
+            return WxResponse.failure('ReplyCommentMoment 缺少被回复评论的作者')
+        if not content:
+            return WxResponse.failure('回复内容不能为空')
+        item = self.find_moment(publisher=publisher, keyword=keyword,
+                                db=db, max_screens=max_screens)
+        if item is None:
+            return WxResponse.failure('未能定位到目标朋友圈')
+        full = self._scroll_item_fully_visible(
+            publisher=publisher, keyword=keyword, max_retry=max_retry)
+        if full is not None:
+            item = full
+        return self.ReplyComment(item, reply_to=reply_to, content=content,
+                                 target_text=target_text)
+
+
+    def GetComments(self, publisher: Optional[str] = None,
+                    keyword: Optional[str] = None, db=None,
+                    max_screens: int = 300, max_retry: int = 8,
+                    as_tree: bool = False) -> WxResponse:
+        """定位指定朋友圈并读取其全部可见评论（含回复）。
+
+        评论直接取目标可见 cell 的 UIA 文本解析；单条评论若带“回复”，
+        解析结果中 ``reply_to`` 记录被回复者昵称。
+
+        Args:
+            publisher: 发布者昵称。
+            keyword: 正文关键词。
+            db / max_screens / max_retry: 定位参数（沿用 find_moment）。
+            as_tree: True 时额外返回按“回复上级”堆成的嵌套树（启发式）。
+
+        Returns:
+            WxResponse；成功时 ``data`` 含：
+              publisher/content/time/likes/comment_count/comments（每条为
+              {author, content, reply_to, raw}），as_tree=True 时另有 tree。
+        """
+        if not publisher and not keyword:
+            return WxResponse.failure('GetComments 缺少定位条件')
+
+        # ---- 优先：本地 DB 路线（最可靠，含完整回复关系，无 UIA 依赖）----
+        if db is not None:
+            resp = self._get_comments_db(publisher, keyword, db, as_tree)
+            if resp is not None:
+                return resp
+
+        # ---- 降级：UIA 可见文本路线 ----
+        item = self.find_moment(publisher=publisher, keyword=keyword,
+                                db=db, max_screens=max_screens)
+        if item is None:
+            return WxResponse.failure('未能定位到目标朋友圈')
+        full = self._scroll_item_fully_visible(
+            publisher=publisher, keyword=keyword, max_retry=10)
+        if full is not None:
+            item = full
+        try:
+            item._ensure_parsed()
+            comments = [
+                {
+                    'author': c.author,
+                    'content': c.content,
+                    'reply_to': c.reply_to,
+                    'raw': c.raw,
+                }
+                for c in item.comments
+            ]
+        except Exception as e:
+            return WxResponse.failure(f'解析评论失败：{e}')
+        data = {
+            'source': 'uia',
+            'publisher': item.publisher,
+            'content': item.text,
+            'time': item.timestamp,
+            'likes': list(item.likes),
+            'comment_count': len(comments),
+            'comments': comments,
+        }
+        if as_tree:
+            data['tree'] = self._comments_tree(comments)
+        if not comments:
+            return WxResponse.failure('该朋友圈当前可见区无评论（可能被折叠）')
+        return WxResponse.success(message=f'获取到 {len(comments)} 条评论', data=data)
+
+    def _get_comments_db(self, publisher: Optional[str],
+                         keyword: Optional[str], db,
+                         as_tree: bool) -> Optional[WxResponse]:
+        """从本地 DB 读取匹配朋友圈的完整评论；无匹配返回 None（交由上层降级）。"""
+        feed = None
+        # 快速路径：能反查到 wxid / keyword 都能下推到 SQL，避免全量解析数千条。
+        if publisher:
+            wxid = None
+            try:
+                base = getattr(db, 'db', None)
+                wxid = base.username_by_nickname(publisher) if base else None
+            except Exception:
+                wxid = None
+            if wxid is None and str(publisher).startswith('wxid_'):
+                wxid = publisher
+            if wxid:
+                try:
+                    feeds = list(db.get_moments(username=wxid, limit=1))
+                    if feeds:
+                        feed = feeds[0]
+                except Exception as e:
+                    wxlog.debug(f'DB 按 username 读取失败：{e}')
+            if feed is None and not wxid:
+                try:
+                    feeds = db.get_moments(limit=0)
+                    feed = next((f for f in feeds
+                                 if f.get('nickname') == publisher), None)
+                except Exception:
+                    feed = None
+        elif keyword:
+            try:
+                feeds = db.get_moments(keyword=keyword, limit=1)
+                if feeds:
+                    feed = feeds[0]
+            except Exception as e:
+                wxlog.debug(f'DB 按 keyword 读取失败：{e}')
+        if feed is None:
+            return None
+
+        def resolve_reply(comment: dict) -> Optional[str]:
+            try:
+                target = db.comment_reply_to(feed, comment)
+            except Exception:
+                target = None
+            return target.get('nickname') if target else None
+
+        comments = []
+        for c in (feed.get('comments') or []):
+            comments.append({
+                'author': c.get('nickname') or c.get('username', ''),
+                'username': c.get('username', ''),
+                'content': c.get('content', ''),
+                'reply_to': resolve_reply(c),
+                'create_time': c.get('create_time', 0),
+                'comment_id': c.get('comment_id', ''),
+                'ref_comment_id': c.get('ref_comment_id', ''),
+            })
+
+        likes = [u.get('nickname') or u.get('username', '')
+                 for u in (feed.get('likes') or [])]
+        data = {
+            'source': 'db',
+            'publisher': feed.get('nickname', ''),
+            'username': feed.get('username', ''),
+            'content': feed.get('text', ''),
+            'time': feed.get('create_time', 0),
+            'likes': likes,
+            'comment_count': len(comments),
+            'comments': comments,
+        }
+        if as_tree:
+            data['tree'] = db.comment_tree(feed)
+        return WxResponse.success(message=f'获取到 {len(comments)} 条评论', data=data)
+
+    @staticmethod
+    def _comments_tree(comments: List[dict]) -> List[dict]:
+        """把扁平评论列表按“回复上级”堆成树（启发式）。
+
+        仅当某条评论的 reply_to 等于前面某条评论的 author 时才视为子回复；
+        其余均作为顶层评论。返回嵌套结构：
+        [{author, content, reply_to, replies:[...]}, ...]
+        """
+        root: List[dict] = []
+        by_author: Dict[str, dict] = {}
+        nodes = []
+        for c in comments:
+            node = {
+                'author': c.get('author', ''),
+                'content': c.get('content', ''),
+                'reply_to': c.get('reply_to'),
+                'replies': [],
+            }
+            nodes.append(node)
+            if node['author']:
+                by_author.setdefault(node['author'], node)
+        for c, node in zip(comments, nodes):
+            parent = None
+            if c.get('reply_to'):
+                parent = by_author.get(c['reply_to'])
+            if parent is not None:
+                parent['replies'].append(node)
+            else:
+                root.append(node)
+        return root
+
+
     # ------------------------------------------------------------------------------------------
     # 对外接口
     # ------------------------------------------------------------------------------------------
@@ -970,6 +1387,456 @@ class Moment:
         if not dialog.exists(0.5):
             return WxResponse.failure('未弹出评论窗口')
         return dialog.send(content)
+
+    # ----------------------------------------------------------------------------------------------
+    # 回复指定评论（截图 OCR 定位评论行 → 点击 → 输入 → 发送）
+    # ----------------------------------------------------------------------------------------------
+
+    def ReplyComment(self, item: MomentItem, reply_to: Optional[str] = None,
+                     content: Optional[str] = None,
+                     target_text: Optional[str] = None,
+                     expand: bool = True,
+                     scan_screens: int = 8) -> WxResponse:
+        """回复朋友圈某条评论（``reply_to`` 为被回复评论的作者昵称）。
+
+        WeChat 4.1.13.12 评论区评论行为**纯自绘**、不在 UIA 树内，故本方法采用
+        验证过的「截图 + 内置 OCR」定位：先定位目标朋友圈对应的「评论区」
+        cell（ClassName 为 ``mmui::TimelineCommentCell``），截图后 OCR 出各评论行，
+        按作者名匹配目标评论，点击其中心打开回复框，粘贴内容并点击「发送」。
+
+        Args:
+            item: 目标朋友圈（由 ``find_moment`` 返回的 :class:`MomentItem`）。
+            reply_to: 被回复评论的作者昵称（精确匹配 OCR 行前缀）。
+            content: 回复内容。
+            target_text: 可选，被回复评论的正文（用于同作者多条评论时消歧）。
+            expand: True 时若评论区折叠则先展开。
+
+        Returns:
+            :class:`WxResponse`；成功时 message 为“回复成功”。
+        """
+        if not content:
+            return WxResponse.failure('ReplyComment 缺少回复内容')
+        if not reply_to:
+            return WxResponse.failure('ReplyComment 缺少被回复评论的作者')
+
+        cell_box = self._locate_comment_cell(item)
+        if cell_box is None:
+            return WxResponse.failure('未能定位评论区控件')
+
+        # 定位到朋友圈后先向下多滚一轮，让评论区尽早进入视野，
+        # 减少 OCR 循环内的滚动次数。
+        self._scroll_comments_down(item, cell_box, max_tries=2)
+        time.sleep(0.3)
+        cell_box = self._locate_comment_cell(item) or cell_box
+
+        # 迭代：先向下滚动直到「下一条朋友圈」出现在评论区下方（滚动到位），
+        # 确认到位后再截图 OCR 匹配目标评论。评论行为纯自绘、仅在完整展示时
+        # 才能 OCR 读到，故必须先滚到「下一条朋友圈」出现、目标评论区完整露出，
+        # 再识别；未命中再继续滚动，避免“没滚到位就提前 OCR”导致一直找不到。
+        click_pos = None
+        last_box = cell_box
+        for screen in range(scan_screens):
+            cell_box = self._locate_comment_cell(item) or last_box
+            last_box = cell_box
+            left, top, right, bottom = cell_box
+            try:
+                item._ensure_parsed()
+                _nick = item.nickname or ''
+            except Exception:
+                _nick = ''
+            _vp = self._parent_list_box(item)
+            wxlog.debug(
+                f'[scan {screen}] 昵称={_nick!r} box={cell_box} 视口={_vp} '
+                f'下一条出现={self._has_next_moment_below(item, bottom)}')
+            if (right - left) < 10 or (bottom - top) < 10:
+                wxlog.debug(f'[scan {screen}] 评论区 box 异常，跳过：{cell_box}')
+                time.sleep(0.3)
+                continue
+            # 1) 滚动直到「下一条（不同发布者）朋友圈」出现在评论区下方
+            #    （= 评论区完整显示）；**不到位就绝不 OCR**，否则连评论区都
+            #    没翻到就识别。
+            if not self._has_next_moment_below(item, bottom):
+                arrived = self._scroll_comments_down(item, cell_box, max_tries=6)
+                wxlog.debug(f'[scan {screen}] 滚动到出现下一条朋友圈...={arrived}')
+                time.sleep(0.4)
+                cell_box = self._locate_comment_cell(item) or last_box
+                left, top, right, bottom = cell_box
+                last_box = cell_box
+                if (right - left) < 10 or (bottom - top) < 10:
+                    wxlog.debug(f'[scan {screen}] 滚动后评论区 box 异常，跳过：{cell_box}')
+                    continue
+                # 仍没凑齐「下一条」→ 本轮到此为止不 OCR，下轮继续滚动
+                if not self._has_next_moment_below(item, bottom):
+                    wxlog.debug(f'[scan {screen}] 评论区尚未完整显示，本轮不 OCR，继续滚动')
+                    continue
+            # 2) 已到位，截图 OCR 匹配目标评论
+            try:
+                from PIL import ImageGrab
+                img = ImageGrab.grab(bbox=(left, top, right, bottom))
+            except Exception as e:
+                return WxResponse.failure(f'截图失败：{e}')
+            from wechatauto.guia import ScreenOCR
+            lines = ScreenOCR.recognize(img)
+            wxlog.debug(f'[scan {screen}] box={cell_box} OCR共{len(lines)}行')
+            for t, x, y, w, h in lines:
+                wxlog.debug(f'    OCR: ({x},{y},{w},{h}) {t[:40]!r}')
+            target = self._match_comment_line(lines, reply_to, target_text)
+            if target is not None:
+                # 点「评论内容」而非作者名：OCR 的 box 宽 w 常严重偏小（如 8 字的
+                # `送你挖银子：测试` 只报 28px），据此点 x+w*0.9 会命中作者名。
+                # 故用 _match_comment_line 返回的内容起点 c_left 与内容长度 rest_n，
+                # 按「单字宽×字数」定位到内容**中点**。
+                t_x, t_y, t_w, t_h, c_left, rest_n = target
+                char_w = max(t_h, 12)
+                cx0 = left + c_left + int(rest_n * char_w * 0.5)
+                cy0 = top + t_y + t_h // 2
+                click_pos = (cx0, cy0)
+                wxlog.debug(f'[scan {screen}] 命中目标评论，落点(内容中点)={click_pos}')
+                break
+            # 未命中：继续向下滚动，让评论区/后续内容进入视野后下轮再 OCR
+            arrived = self._scroll_comments_down(item, cell_box, max_tries=3)
+            wxlog.debug(f'[scan {screen}] 未命中，继续滚动以露出评论区={arrived}')
+            time.sleep(0.4)
+
+        if click_pos is None:
+            return WxResponse.failure(
+                f'滚动评论区后仍未匹配到评论（作者={reply_to}）')
+
+        cx, cy = click_pos
+        try:
+            import pyautogui
+            old = pyautogui.FAILSAFE
+            pyautogui.FAILSAFE = False
+            try:
+                pyautogui.click(cx, cy)
+            finally:
+                pyautogui.FAILSAFE = old
+        except Exception as e:
+            return WxResponse.failure(f'点击评论行失败：{e}')
+        time.sleep(0.6)
+
+        if not self._type_comment(content):
+            return WxResponse.failure('输入回复内容失败')
+
+        return self._click_comment_send()
+
+    def _sns_windows(self) -> List[uia.Control]:
+        """返回朋友圈 SNSWindow 根控件列表（用于递归定位评论 cell）。"""
+        wins: List[uia.Control] = []
+        try:
+            wins += list(find_all_windows_from_root(uiaclsname='mmui::SNSWindow'))
+        except Exception as e:
+            wxlog.debug(f'SNSWindow 查找失败：{e}')
+        if not wins:
+            try:
+                wins += list(find_all_windows_from_root())
+            except Exception as e:
+                wxlog.debug(f'顶层窗口兜底查找失败：{e}')
+        return wins
+
+    @staticmethod
+    def _walk_comment_cells(root: uia.Control, out: List[uia.Control]) -> None:
+        """DFS 收集所有 ClassName == ``mmui::TimelineCommentCell`` 的控件。"""
+        try:
+            if getattr(root, 'ClassName', '') == 'mmui::TimelineCommentCell':
+                out.append(root)
+        except Exception:
+            pass
+        try:
+            kids = root.GetChildren()
+        except Exception:
+            kids = []
+        for k in kids:
+            Moment._walk_comment_cells(k, out)
+
+    def _locate_comment_cell(self, item: MomentItem) -> Optional[tuple]:
+        """定位 ``item`` 对应的「评论区」cell，返回 (left, top, right, bottom)。
+
+        以目标朋友圈 ListItem 的底边为基准，取“顶边最近且 ≥ 底边”的评论 cell。
+        """
+        try:
+            item_box = item.control.BoundingRectangle
+            target_bottom = item_box.bottom
+        except Exception as e:
+            wxlog.debug(f'读取目标朋友圈控件矩形失败：{e}')
+            return None
+
+        cells: List[uia.Control] = []
+        for root in self._sns_windows():
+            Moment._walk_comment_cells(root, cells)
+
+        best: Optional[tuple] = None
+        best_d = None
+        for cell in cells:
+            try:
+                br = cell.BoundingRectangle
+            except Exception:
+                continue
+            if br.right <= 0 or br.bottom <= 0:
+                continue
+            d = br.top - target_bottom
+            if d < -5:
+                continue
+            if best is None or d < best_d:
+                best = (br.left, br.top, br.right, br.bottom)
+                best_d = d
+        return best
+
+    def _expand_comment_cell(self, item: MomentItem) -> bool:
+        """对目标朋友圈的「评论区」cell 执行一次 Click 以展开（若可点击）。"""
+        cells: List[uia.Control] = []
+        for root in self._sns_windows():
+            Moment._walk_comment_cells(root, cells)
+        try:
+            item_box = item.control.BoundingRectangle
+            target_bottom = item_box.bottom
+        except Exception:
+            return False
+        best: Optional[uia.Control] = None
+        best_d = None
+        for cell in cells:
+            try:
+                br = cell.BoundingRectangle
+            except Exception:
+                continue
+            if br.right <= 0 or br.top <= 0:
+                continue
+            d = br.top - target_bottom
+            if d < -5:
+                continue
+            if best is None or d < best_d:
+                best, best_d = cell, d
+        if best is None:
+            return False
+        try:
+            best.Click()
+            return True
+        except Exception as e:
+            wxlog.debug(f'展开评论区失败：{e}')
+            return False
+
+    _MOMENT_CELL_EXCLUDE = re.compile(r'^\s*余下\s*\d*\s*条\s*$')
+
+    @staticmethod
+    def _is_moment_cell_name(name: str) -> bool:
+        """判断一个 ListItem 名是否为**朋友圈 cell**（排除评论区/余下N条）。
+
+        朋友圈 cell 以作者昵称开头、通常含正文/时间/图片数；「评论区」与
+        「余下N条」是固定名，需排除，避免被误判为“新出现的下一条朋友圈”。
+        """
+        if not name:
+            return False
+        n = name.strip()
+        if not n or n == '评论区':
+            return False
+        if '评论' in n or Moment._MOMENT_CELL_EXCLUDE.match(n):
+            return False
+        return True
+
+    def _has_next_moment_below(self, item: MomentItem, below_top: int) -> bool:
+        """判断**下一条朋友圈是否已经出现（滚动到位）**。
+
+        判据：父 List 下是否存在 BoundingRectangle.top >= below_top 的
+        **朋友圈 cell**（非评论区/余下N条）。以「目标评论区底部」为界，
+        位于其下的朋友圈 cell 即目标动态之后的**下一条朋友圈**。
+
+        注意：朋友圈列表整屏复用 ListItem，滚动后 Name 集合未必变化，
+        故**不用 Name 新增**判据，改用它是否**真实出现在评论区下方**。
+
+        Args:
+            item: 目标朋友圈。
+            below_top: 目标评论区 box 的 bottom（界线）。
+
+        Returns:
+            评论区下方是否已出现（可见）下一条朋友圈。
+        """
+        parent = None
+        try:
+            parent = item.control.GetParentControl()
+        except Exception:
+            parent = None
+        if parent is None:
+            try:
+                parent = item.control.GetParent()
+            except Exception:
+                parent = None
+        if parent is None:
+            return False
+        vp = self._parent_list_box(item)
+        vp_bottom = vp[3] if vp is not None else None
+        try:
+            sibs = parent.GetChildren()
+        except Exception:
+            return False
+        # 目标朋友圈自己的发布者昵称：下方“下一条”必须是**不同发布者**的朋友圈，
+        # 否则（自身尾部 cell）会造成误判——即时贴里“下方出现的是目标朋友圈”。
+        target_pub = ''
+        try:
+            item._ensure_parsed()
+            target_pub = (item.nickname or '').strip()
+        except Exception:
+            target_pub = ''
+        # 取评论区下方**最近**、且**发布者不同于目标**的“朋友圈” cell 作为候选
+        # 下一条，再要求它**真正可见**（top 落在列表可视区内），屏外的不算“出现”。
+        best_top = None
+        best_name = None
+        best_br = None
+        for sib in sibs:
+            try:
+                ctype = sib.ControlTypeName or ''
+            except Exception:
+                ctype = ''
+            if 'List' in ctype and 'Item' in ctype:
+                cell_name = sib.Name or ''
+                if not Moment._is_moment_cell_name(cell_name):
+                    continue
+                try:
+                    br = sib.BoundingRectangle
+                except Exception:
+                    continue
+                if br.top < below_top - 5:
+                    continue
+                if target_pub and cell_name.strip().startswith(target_pub):
+                    continue  # 目标朋友圈自身，非“下一条”
+                if best_top is None or br.top < best_top:
+                    best_top = br.top
+                    best_name = cell_name
+                    best_br = (br.left, br.top, br.right, br.bottom)
+        if best_top is None:
+            return False
+        if vp_bottom is not None and best_top > vp_bottom + 8:
+            # 最近的下一条仍完全在视口下缘之下（屏外未显示），不算“出现”
+            wxlog.debug(
+                f'下一条朋友圈候选仍在视口外（top={best_top} > 视口底={vp_bottom}）：'
+                f'{best_name!r} {best_br}')
+            return False
+        wxlog.debug(f'评论区下方已出现下一条（不同发布者）朋友圈：{best_name!r} {best_br}')
+        return True
+
+    def _parent_list_box(self, item: MomentItem):
+        """返回父 List（朋友圈时间线列表）的 BoundingRectangle（可视区）。
+
+        用它判定评论区是否完整显示在视口内，以及作为可靠的滚动落点。
+        """
+        parent = None
+        try:
+            parent = item.control.GetParentControl()
+        except Exception:
+            parent = None
+        if parent is None:
+            try:
+                parent = item.control.GetParent()
+            except Exception:
+                parent = None
+        if parent is None:
+            return None
+        try:
+            br = parent.BoundingRectangle
+            return (br.left, br.top, br.right, br.bottom)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _comment_fully_visible(cell_box: tuple, vp: tuple) -> bool:
+        """目标评论区 cell 是否**完整显示在列表可视区**内。
+
+        cell_box=(left,top,right,bottom)，vp=(left,top,right,bottom)。
+        顶部未被视口上缘裁切、底部未超出视口下缘，即滚到位可 OCR。
+        """
+        t, b = cell_box[1], cell_box[3]
+        return (t >= vp[1] - 8) and (b <= vp[3] + 8)
+
+    def _scroll_comments_down(self, item: MomentItem, box: tuple,
+                              amount: int = -64, repeats: int = 1,
+                              max_tries: int = 12) -> bool:
+        """向下滚动**整个朋友圈窗口**，直到「下一条朋友圈」出现在评论区下方。
+
+        判据（用户确认正确）：**评论区下方出现下一条朋友圈 = 评论区完整显示**
+        ——能看见评论区下方的下一条朋友圈，就说明评论区已完整露出可 OCR。
+        故滚动目标是让 `_has_next_moment_below` 为 True（已加视口过滤，屏外的
+        不算出现）。滚动落点放在**列表可视区中心**，避免评论区未显示时 moveTo
+        到屏外坐标导致滚动失效。
+
+        Args:
+            item: 目标朋友圈。
+            box: 评论区 cell 矩形 (left, top, right, bottom)，取其 bottom 为界。
+            amount: 每次滚轮格数（负值=向下滚动）。
+            repeats: 每次滚动重复滚轮次数。
+            max_tries: 最大滚动次数（避免无限滚动越过目标）。
+
+        Returns:
+            下一条朋友圈是否已出现在评论区下方（= 评论区已完整显示）。
+        """
+        vp = self._parent_list_box(item)
+        try:
+            import pyautogui
+        except Exception as e:
+            wxlog.debug(f'pyautogui 不可用：{e}')
+            return False
+        for _ in range(max_tries):
+            cb = self._locate_comment_cell(item) or box
+            if self._has_next_moment_below(item, cb[3]):
+                wxlog.debug(f'评论区下方已出现下一条朋友圈，滚动到位')
+                return True
+            # 滚动落点：优先用列表可视区中心（始终在屏内可见）
+            if vp is not None:
+                cx = (vp[0] + vp[2]) // 2
+                cy = max(80, (vp[1] + vp[3]) // 2)
+            else:
+                cx = (cb[0] + cb[2]) // 2
+                cy = max(60, (cb[1] + cb[3]) // 2)
+            try:
+                pyautogui.moveTo(cx, cy)
+                time.sleep(0.06)
+                old = pyautogui.FAILSAFE
+                pyautogui.FAILSAFE = False
+                try:
+                    for _r in range(repeats):
+                        pyautogui.scroll(amount, x=cx, y=cy)
+                        time.sleep(0.06)
+                finally:
+                    pyautogui.FAILSAFE = old
+            except Exception as e:
+                wxlog.debug(f'滚动朋友圈窗口失败：{e}')
+                return False
+            time.sleep(0.22)
+        return False
+
+    @staticmethod
+    def _match_comment_line(lines, reply_to: str,
+                            target_text: Optional[str] = None) -> Optional[tuple]:
+        """在 OCR 行列表中匹配目标评论行。
+
+        返回 ``(x, y, w, h, content_left, rest_n)``：
+        ``(x,y,w,h)`` 为原 OCR box；``content_left`` 为按**文字长度估算**的
+        内容区左端（作者名宽 × 单字高 h）；``rest_n`` 为内容字符数。
+
+        注意：OCR 的 box 宽 ``w`` 常严重偏小（对 `送你挖银子：测试` 只报 28px），
+        据此点 ``x+w`` 会命中作者名。故落点改由文字长度推算，不依赖错误 w。
+        """
+        target_author = (reply_to or '').replace(' ', '')
+        target_content = (target_text or '').replace(' ', '')
+        for text, x, y, w, h in lines:
+            t = (text or '').replace(' ', '')
+            if not t:
+                continue
+            if t in ('发送', '回复', '赞', '点赞', '取消'):
+                continue
+            if t.startswith('回复') or len(t) < 4:
+                continue
+            author, sep, rest = t.partition('：')
+            if not sep:
+                author, sep, rest = t.partition(':')
+            if not sep or not rest:
+                continue
+            if author != target_author:
+                continue
+            if target_content and target_content not in rest:
+                continue
+            char_w = max(h, 12)  # 单字宽≈字号（h），中文近方形
+            content_left = x + (len(author) + 1) * char_w  # 作者名 + 冒号
+            return (x, y, w, h, content_left, len(rest))
+        return None
 
 
 class MomentActionMenu(BaseUISubWnd):
