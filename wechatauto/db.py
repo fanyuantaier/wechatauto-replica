@@ -1007,22 +1007,31 @@ class WeChatDB:
             return 0
         out = open(dst, "r+b")
         try:
-            db_pages = (os.path.getsize(dst) + 4095) // PAGE_SZ
-            max_pgno = 0
-            last = from_frame
             with open(wal_path, "rb") as wal:
                 wal_hdr = wal.read(self.WAL_HEADER_SZ)
                 wal_salt = wal_hdr[16:24]
                 wal_size = os.path.getsize(wal_path)
                 n = (wal_size - self.WAL_HEADER_SZ) // self.WAL_FRAME_SZ
-                for i in range(from_frame, n):
+                last_commit = -1
+                logical_pages = None
+                for i in range(n):
+                    wal.seek(self.WAL_HEADER_SZ + i * self.WAL_FRAME_SZ)
+                    hdr = wal.read(24)
+                    if len(hdr) < 24 or hdr[8:16] != wal_salt:
+                        continue
+                    commit_pages = struct.unpack(">I", hdr[4:8])[0]
+                    if commit_pages:
+                        last_commit = i
+                        logical_pages = commit_pages
+                if last_commit < from_frame:
+                    return from_frame
+                for i in range(from_frame, last_commit + 1):
                     wal.seek(self.WAL_HEADER_SZ + i * self.WAL_FRAME_SZ)
                     hdr = wal.read(24)
                     page = wal.read(PAGE_SZ)
                     if len(page) < PAGE_SZ:
                         break
                     pgno = struct.unpack(">I", hdr[:4])[0]
-                    last = i + 1
                     if hdr[8:16] != wal_salt:
                         continue
                     pt = _decrypt_page(key, page, pgno)
@@ -1038,33 +1047,40 @@ class WeChatDB:
                         continue
                     out.seek((pgno - 1) * PAGE_SZ)
                     out.write(pt)
-                    max_pgno = max(max_pgno, pgno)
             out.flush()
-            db_pages = (os.path.getsize(dst) + 4095) // PAGE_SZ
+            if logical_pages is None:
+                return from_frame
+            out.truncate(logical_pages * PAGE_SZ)
             out.seek(0)
             page1 = out.read(PAGE_SZ)
-            hdr_pages = struct.unpack(">I", page1[28:32])[0]
-            new_pages = max(hdr_pages, max_pgno, db_pages)
-            if new_pages != hdr_pages:
-                page1 = page1[:28] + struct.pack(">I", new_pages) + page1[32:]
+            if len(page1) == PAGE_SZ:
+                page1 = page1[:28] + struct.pack(">I", logical_pages) + page1[32:]
                 out.seek(0)
                 out.write(page1)
             out.flush()
         finally:
             out.close()
-        return last
+        return last_commit + 1
 
     def _decrypt_file(self, src: str, dst: str, key: bytes) -> None:
         size = os.path.getsize(src)
-        pages = size // PAGE_SZ + (1 if size % PAGE_SZ else 0)
+        physical_pages = size // PAGE_SZ + (1 if size % PAGE_SZ else 0)
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         with open(src, "rb") as fin, open(dst, "wb") as fout:
-            for pgno in range(1, pages + 1):
+            page = fin.read(PAGE_SZ)
+            if len(page) < PAGE_SZ:
+                raise RuntimeError("加密数据库首页不完整: %s" % src)
+            first_page = _decrypt_page(key, page, 1)
+            logical_pages = struct.unpack(">I", first_page[28:32])[0]
+            if not 1 <= logical_pages <= physical_pages:
+                raise RuntimeError(
+                    "数据库逻辑页数无效: %d/%d" % (logical_pages, physical_pages)
+                )
+            fout.write(first_page)
+            for pgno in range(2, logical_pages + 1):
                 page = fin.read(PAGE_SZ)
-                if not page:
-                    break
                 if len(page) < PAGE_SZ:
-                    page = page + b"\x00" * (PAGE_SZ - len(page))
+                    raise RuntimeError("加密数据库页面不完整: %s" % src)
                 fout.write(_decrypt_page(key, page, pgno))
 
     def _message_dbs(self) -> List[str]:
