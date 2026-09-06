@@ -32,7 +32,7 @@
 本项目复刻上游 wxauto 项目，目标是实现对当前微信 4.x Windows 客户端的自动化
 （读取消息、发送消息、媒体下载、朋友圈），非网页版，直接操作本机客户端。
 
-> 当前版本：1.2.0.3
+> 当前版本：1.2.1
 >
 > **兼容范围**：Windows 10/11 ｜ Python 3.9+（已在 3.12 验证）｜ 微信 **4.1.12+**
 > （数据库读取路线对微信版本不敏感；坐标+OCR 发送路线依赖 4.1.12+ 自绘渲染
@@ -57,6 +57,12 @@
 ---
 
 ## 版本记录
+
+### v1.2.1（2026-09-06）
+
+- **新增「引用消息并发送」（测试版）**：`WeChatGUI.quote_msg(text, who, target_text=None, verify=False)` 右键定位消息 → 弹出菜单选择「引用」→ 输入内容并发送；`target_text` 省略时引用最近一条。`quick_quote()` 提供一行式入口，示例脚本 `wechatauto/demo_quote.py`。
+  - **测试版说明**：引用功能走「坐标 + OCR + SendInput」模拟点击路线，依赖微信 4.1.x 自绘渲染布局；随窗口尺寸/DPI/会话内容不同可能存在定位偏差。右键采用 `SendInput` 注入（微信渲染窗口对 `mouse_event` 右键不响应），光标先 `SetCursorPos` 移至目标再注入，避免“只移动不点击 / 只点击不移动”的错位。使用中发现定位不准时请调整会话内消息布局后重试。
+- **移除 `desktop_available()` 桌面白屏判定**：控件定位已全面走 UIA，不再依赖整窗截图白色占比采样——该判定在微信窗口正常时曾误报「窗口不可见」。`ensure_visible()` 现以窗口句柄存活判定可见性，保留「最小化遮挡窗口 + 置顶微信」的前置动作。
 
 ### v1.2.0.3（2026-08-31）
 
@@ -603,8 +609,8 @@ def on_msg(msg, listener):
    （提取后本地缓存）；重新登录后密钥变化需重新提取（自动校验失败重扫）；
 2. **图片 AES 密钥瞬态**：仅在微信查看图片时驻留内存；`MediaDownloader`
    扫描命中后会持久化（`image_keys.json`），也可用 `image_key=` 显式传入；
-3. **发送为 GUI 操作**：锁屏/会话断开时 `desktop_available()` 返回 False，
-   发送接口返回明确失败；文件/图片/回复/艾特代码已完成但需桌面解锁后实测；
+3. **发送为 GUI 操作**：锁屏/会话断开时窗口不响应，发送接口返回明确失败；
+   文件/图片/回复/艾特代码已完成但需桌面解锁后实测；
 4. **视频文件未落盘时不可下载**：视频 mp4 仅在本地存在（`msg/video`）时
    返回，否则返回 None；
 5. **发朋友圈功能已舍弃**：4.x 的发表为自绘界面操作，不可靠自动化；
@@ -612,6 +618,9 @@ def on_msg(msg, listener):
 6. **评论/回复功能仅供测试**：`回复某条评论`（`ReplyComment`）通过截图
    OCR 定位评论区评论行，再驱动界面点击/粘贴/发送；朋友圈评论区为自绘、
    布局多变，稳定性无法保证，仅建议在测试账号中验证流程，勿用于生产。
+7. **引用消息功能（BETA）仅供测试**：`quote_msg` 通过坐标 + OCR + SendInput
+   模拟右键菜单选择「引用」，依赖微信 4.1.x 自绘渲染布局，随窗口尺寸/DPI/
+   会话内容不同可能存在定位偏差，仅建议在测试账号中验证流程。
 
 ---
 
@@ -706,7 +715,7 @@ quick_send_file(r'D:\资料\报告.pdf', '文件传输助手')
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.2.0.3 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
+> **Current version:** 1.2.1 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -853,10 +862,11 @@ Runnable demo: `python -m wechatauto.demo_moments_interact [--like N | --unlike 
 
 1. **WeChat must be logged in** — DB keys live in process memory; cached after first extraction, re-extracted automatically after re-login.
 2. **Image AES key is transient** — only resident while viewing an image; persisted to `image_keys.json` once found, or inject via `image_key=`.
-3. **Sending is a GUI operation** — fails cleanly when the desktop is locked (`desktop_available()` returns False).
+3. **Sending is a GUI operation** — fails cleanly when the window is locked/unresponsive (operations return a clear failure).
 4. **Videos** are downloadable only when the mp4 already exists on disk (`msg/video/`).
 5. **Group-chat image originals** are stored locally only after being opened (viewed) in WeChat; until then only the thumbnail (`_t.dat`) exists — `download_image` falls back to the thumbnail (marked `_thumb` in the filename).
 6. **Moments posting is dropped** (4.x self-drawn UI, unreliable); reading/likes/comments are supported.
+7. **Quote-message sending (BETA)** goes through a coordinate + OCR + `SendInput` pipeline that depends on WeChat 4.1.x self-drawn layout; positioning may drift with window size / DPI / chat content — test flow on a throwaway account only.
 
 ## 🗺️ Roadmap
 
@@ -865,6 +875,12 @@ Runnable demo: `python -m wechatauto.demo_moments_interact [--like N | --unlike 
 - Performance: parallel export / first-scan, incremental memory-scan cache
 
 ## 📝 Changelog
+
+### v1.2.1 (2026-09-06)
+
+- **New "quote & send" message feature (BETA)**: `WeChatGUI.quote_msg(text, who, target_text=None, verify=False)` right-clicks the target message → picks「引用」from the popup menu → types the content → sends; omitting `target_text` quotes the most recent message. `quick_quote()` is a one-liner entry point, demo script `wechatauto/demo_quote.py`.
+  - **BETA disclaimer**: the feature uses a coordinate + OCR + `SendInput` pipeline that depends on WeChat 4.1.x self-drawn layout; positioning may drift with window size / DPI / chat content. The right-click uses `SendInput` injection (the render window ignores `mouse_event` right-clicks), and the cursor is first moved with `SetCursorPos` before injecting the click to avoid "moves but doesn't click / clicks but doesn't move" drift.
+- **Removed the `desktop_available()` white-pixel screen check**: control targeting is fully UIA-based now, so the full-window screenshot white-ratio sampling was dropped — it could falsely report "window not visible" while WeChat was fine. `ensure_visible()` now treats a live window handle as visible and keeps its "minimize blockers + bring-to-front" actions.
 
 ### v1.2.0.3 (2026-08-31)
 

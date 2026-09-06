@@ -492,7 +492,7 @@ md.download_voice("群名", local_id)      # 自动搜索所有 media_*.db / sea
 ### Q4: 发送失败 / sending fails
 
 - 微信窗口需可见（不能锁屏/最小化到托盘）/ window must be visible
-- `desktop_available()` 为 False 时发送会安全失败
+- 锁屏或窗口不可响应时发送会安全失败
 - 换用 `verify=True` 获得回读确认
 
 ### Q5: 语音下载不到 / voice not downloading

@@ -247,13 +247,22 @@ class WinInput:
         u.mouse_event(up, 0, 0, 0, 0)
         time.sleep(0.3)
 
-    def send_input_click(self, x: int, y: int):
-        """SendInput 绝对坐标点击（按真实屏幕尺寸缩放）。"""
+    def send_input_click(self, x: int, y: int, right: bool = False):
+        """SendInput 绝对坐标点击（按真实屏幕尺寸缩放）。
+
+        先 SetCursorPos 移动可见光标（方便观察/确保悬停状态），
+        再用 SendInput 注入点击。右键走 SendInput：微信 4.x 渲染
+        子窗口对 mouse_event 模拟的右键不响应（原图打开预览那次
+        同因改用 SendInput），SendInput 可直接命中弹出右键菜单。
+        """
         u = self._user32
+        u.SetCursorPos(int(x), int(y))
+        time.sleep(0.15)
         n = int(x * 65535 // self.screen_w)
         m = int(y * 65535 // self.screen_h)
-        for flags in (MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_LEFTDOWN,
-                      MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_LEFTUP):
+        down = MOUSEEVENTF_ABSOLUTE | (MOUSEEVENTF_RIGHTDOWN if right else MOUSEEVENTF_LEFTDOWN)
+        up = MOUSEEVENTF_ABSOLUTE | (MOUSEEVENTF_RIGHTUP if right else MOUSEEVENTF_LEFTUP)
+        for flags in (down, up):
             inp = MOUSE_INPUT()
             inp.type = 0
             inp.u.mi.dx = n
@@ -863,7 +872,7 @@ class WeChatGUI:
         return len(targets)
 
     def ensure_visible(self) -> bool:
-        """自动最小化遮挡窗口并把微信置于前台，返回桌面是否可用。
+        """自动最小化遮挡窗口并把微信置于前台。
 
         发送类操作前调用，替代「手动最小化 Chrome 再置顶微信」的步骤。
         遮挡窗口最小化后微信仍保持置顶，便于连续多次发送。
@@ -871,6 +880,9 @@ class WeChatGUI:
         批量发送（三件套等）会逐条调用本方法，为避免每条都重复
         枚举窗口 / 置顶（上轮实测每次开销 20s+），15 秒内已成功
         前置过且窗口仍存活则直接复用，不再重复扫描。
+
+        可见性仅以主窗口句柄存活判定（不依赖截图白屏采样），
+        控件定位走 UIA，不依赖桌面截图。
         """
         if (getattr(self, '_last_visible_ok', False)
                 and getattr(self, '_last_visible_ts', 0) > time.time() - 15
@@ -881,7 +893,7 @@ class WeChatGUI:
         self.bring_to_front(keep_topmost=True)
         time.sleep(0.5)
         self._update_render_rect()
-        ok = self.desktop_available()
+        ok = self.is_alive()
         self._last_visible_ok = ok
         self._last_visible_ts = time.time()
         return ok
@@ -930,25 +942,6 @@ class WeChatGUI:
             if old_ex & WS_EX_TRANSPARENT:
                 u.SetWindowLongW(self.render_hwnd, GWL_EXSTYLE, old_ex)
                 time.sleep(0.05)
-
-    def desktop_available(self) -> bool:
-        """检查微信窗口是否真的可见（锁屏/会话断开时返回 False）。"""
-        if not self.is_alive():
-            return False
-        try:
-            img = self._grab_screen(self.render_rect)
-        except Exception:
-            return False
-        px = img.load()
-        w, h = img.size
-        white = total = 0
-        for y in range(0, h, 16):
-            for x in range(0, w, 16):
-                r, g, b = px[x, y]
-                total += 1
-                if r > 230 and g > 230 and b > 230:
-                    white += 1
-        return white / max(total, 1) > 0.05
 
     # ------------------------------------------------------------------
     # 截图与 OCR
@@ -2001,6 +1994,83 @@ class WeChatGUI:
                     if ok else WxResponse.failure('回复已操作发送，但数据库未确认', data={'content': text}))
         return WxResponse.success(f'回复已发送：{text}', data={'content': text})
 
+    def _locate_last_message_pt(self, y: int) -> Optional[Tuple[int, int]]:
+        """OCR 实测最近一条消息的文本中心（横坐标实测而不是估算中心）。
+
+        参照 previous 修复（原图下载/打开原图）：控件实际位置不能按
+        消息区几何中心估算，必须用识别到的文本真实位置，否则自己消息
+        气泡偏右时点击坐标会横向偏移。
+        """
+        band = (self.right_pane_left, max(80, y - 40),
+                self.render_w, min(self.render_h, y + 40))
+        items = self.ocr(band)
+        best = None
+        best_d = 1 << 30
+        for t, x, yy, w, h in items:
+            tt = (t or '').strip()
+            if not tt:
+                continue
+            cy = yy + h // 2
+            d = abs(cy - y)
+            if d < best_d:
+                best_d = d
+                best = (x + w // 2, cy)
+        return best
+
+    def quote_msg(self, text: str, who: Optional[str] = None,
+                  target_text: Optional[str] = None, verify: bool = False) -> WxResponse:
+        """引用指定/最近一条消息（右键 → 菜单「引用」→ 输入 → 发送）。
+
+        target_text 用于 OCR 定位要引用的消息文案（可选）；省略时引用最近一条。
+        """
+        if not self.ensure_visible():
+            return WxResponse.failure('微信窗口不可见（可能锁屏/会话断开）')
+        if who:
+            self.open_chat(who)
+            time.sleep(0.8)
+        box = self.get_input_box()
+        msg_bottom = box[1] if box else int(self.render_h * 0.8)
+        if target_text:
+            items = self.ocr((self.right_pane_left, 100, self.render_w, msg_bottom))
+            pt = None
+            for t, x, yy, w, h in items:
+                if target_text in t:
+                    pt = (x + w // 2, yy + h // 2)
+                    break
+            if not pt:
+                return WxResponse.failure(f'未找到要引用的消息：{target_text}')
+        else:
+            y = self._last_message_y()
+            if y is None:
+                return WxResponse.failure('未检测到消息区域')
+            hit = self._locate_last_message_pt(y)
+            if hit is None:
+                return WxResponse.failure('未定位到最近一条消息')
+            pt = hit
+        # 右键点击目标消息，弹出操作菜单
+        # 用 SendInput（而非 mouse_event）：微信渲染窗口对 mouse_event 的
+        # 右键不响应，SendInput 可直接命中弹出菜单（原图那次的同类修复）。
+        self._input.send_input_click(self.origin_x + pt[0], self.origin_y + pt[1], right=True)
+        time.sleep(0.7)
+        menu = self.ocr((self.right_pane_left, max(80, pt[1] - 200), self.render_w, self.render_h))
+        click_pt = None
+        for t, x, yy, w, h in menu:
+            if '引用' in t:
+                click_pt = (x + w // 2, yy + h // 2)
+                break
+        if not click_pt:
+            return WxResponse.failure('未找到「引用」菜单项')
+        self.wx_click(self.origin_x + click_pt[0], self.origin_y + click_pt[1])
+        time.sleep(0.8)
+        if not self.input_text(text):
+            return WxResponse.failure('输入引用内容失败')
+        self.click_send()
+        if verify:
+            ok = self._verify_sent(text, who)
+            return (WxResponse.success(f'引用已发送并确认：{text}', data={'content': text})
+                    if ok else WxResponse.failure('引用已操作发送，但数据库未确认', data={'content': text}))
+        return WxResponse.success(f'引用已发送：{text}', data={'content': text})
+
     # ------------------------------------------------------------------
     # 艾特成员（群聊）
     # ------------------------------------------------------------------
@@ -2072,3 +2142,14 @@ def quick_reply(text: str, who: str = None, verify: bool = False) -> WxResponse:
     """一行式回复最近一条消息。"""
     wx = WeChatGUI()
     return wx.reply_msg(text, who, verify=verify)
+
+
+def quick_quote(text: str, who: str = None, target_text: str = None,
+                verify: bool = False) -> WxResponse:
+    """一行式引用消息并发送。
+
+    >>> from wechatauto.guia import quick_quote
+    >>> quick_quote('收到', '文件传输助手', target_text='要引用的原文')
+    """
+    wx = WeChatGUI()
+    return wx.quote_msg(text, who, target_text=target_text, verify=verify)

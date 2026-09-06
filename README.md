@@ -17,7 +17,7 @@
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.2.0.3 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
+> **Current version:** 1.2.1 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -169,10 +169,11 @@ Runnable demo: `python -m wechatauto.demo_moments_interact [--like N | --unlike 
 
 1. **WeChat must be logged in** — DB keys live in process memory; cached after first extraction, re-extracted automatically after re-login.
 2. **Image AES key is transient** — only resident while viewing an image; persisted to `image_keys.json` once found, or inject via `image_key=`.
-3. **Sending is a GUI operation** — fails cleanly when the desktop is locked (`desktop_available()` returns False).
+3. **Sending is a GUI operation** — fails cleanly when the window is locked/unresponsive (operations return a clear failure).
 4. **Videos** are downloadable only when the mp4 already exists on disk (`msg/video/`).
 5. **Group-chat image originals** are stored locally only after being opened (viewed) in WeChat; until then only the thumbnail (`_t.dat`) exists — `download_image` falls back to the thumbnail (marked `_thumb` in the filename). Use `download_image_original()` to trigger WeChat to fetch the original via a UI click on the image message.
 6. **Moments likes/comments** go through the UI (server-side actions) and need the hot-activated `mmui` UIA tree plus an unlocked desktop; they fail cleanly when the tree is unavailable. **Moments posting stays dropped** (4.x self-drawn UI, unreliable).
+7. **Quote-message sending (BETA)** goes through a coordinate + OCR + `SendInput` pipeline that depends on WeChat 4.1.x self-drawn layout; positioning may drift with window size / DPI / chat content — test flow on a throwaway account only.
 
 ## 🗺️ Roadmap
 
@@ -181,6 +182,12 @@ Runnable demo: `python -m wechatauto.demo_moments_interact [--like N | --unlike 
 - Performance: parallel export / first-scan, incremental memory-scan cache
 
 ## 📝 Changelog
+
+### v1.2.1 (2026-09-06)
+
+- **New "quote & send" message feature (BETA)**: `WeChatGUI.quote_msg(text, who, target_text=None, verify=False)` right-clicks the target message → picks「引用」from the popup menu → types the content → sends; omitting `target_text` quotes the most recent message. `quick_quote()` is a one-liner entry point, demo script `wechatauto/demo_quote.py`.
+  - **BETA disclaimer**: the feature uses a coordinate + OCR + `SendInput` pipeline that depends on WeChat 4.1.x self-drawn layout; positioning may drift with window size / DPI / chat content. The right-click uses `SendInput` injection (the render window ignores `mouse_event` right-clicks), and the cursor is first moved with `SetCursorPos` before injecting the click to avoid "moves but doesn't click / clicks but doesn't move" drift.
+- **Removed the `desktop_available()` white-pixel screen check**: control targeting is fully UIA-based now, so the full-window screenshot white-ratio sampling was dropped — it could falsely report "window not visible" while WeChat was fine. `ensure_visible()` now treats a live window handle as visible and keeps its "minimize blockers + bring-to-front" actions.
 
 ### v1.2.0.1 (2026-08-31)
 

@@ -37,10 +37,6 @@ def main():
     print("=" * 60)
 
     wx = WeChatGUI()
-    if not wx.desktop_available():
-        print("\n[错误] 微信窗口不可见（可能处于锁屏/断开的会话），"
-              "请先解锁桌面后重试。")
-        sys.exit(1)
 
     wx.bring_to_front()
     print(f"已连接到微信主窗口（hwnd={wx.main_hwnd}）")

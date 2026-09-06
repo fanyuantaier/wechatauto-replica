@@ -155,11 +155,8 @@ def main():
         target_username = resolve_target(db, who)
         print(f"目标：{who} -> {target_username}")
 
-    # 2. 初始化 GUI 并检查桌面可用
+    # 2. 初始化 GUI
     wx = WeChatGUI()
-    if not wx.desktop_available():
-        print("\n[错误] 微信窗口不可见（可能锁屏/会话断开），请解锁桌面后重试。")
-        sys.exit(1)
     wx.bring_to_front()
     print(f"已连接微信主窗口（hwnd={wx.main_hwnd}）")
 

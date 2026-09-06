@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""reply_msg / at_member 实测脚本（对应 README §7 待实测功能）"""
+"""quote_msg / quick_quote 实测脚本：右键 → 菜单「引用」→ 输入 → 发送。"""
 from __future__ import annotations
 
 import os
@@ -37,37 +37,26 @@ def db_latest(who, n=5):
 def main():
     wx = WeChatGUI()
 
-    # ========== 1. reply_msg：回复最近一条消息 ==========
     who = "文件传输助手"
+    target = None                 # ← 引用最近一条消息（可改成目标消息里的文字）
+    text = "这条是引用回复测试 [quote]"
+
     print("=" * 60)
-    print(f"[1] reply_msg 回复最近一条消息（会话：{who}）")
+    print(f"[quote_msg] 引用后发送（会话：{who}，目标文案：{target or '最近一条'}）")
     print("=" * 60)
     print("数据库当前最近 3 条：")
     for line in db_latest(who, 3):
         print("   ", line)
 
-    r = wx.reply_msg("这是自动回复测试 [reply]", who=who, verify=True)
-    print(f"\nreply_msg 结果：\n  ok={r.is_success}\n  消息={r['message']}\n  数据={r['data']}")
+    r = wx.quote_msg(text, who=who, target_text=target or None, verify=True)
+    print(f"\nquote_msg 结果：\n  ok={r.is_success}\n  消息={r['message']}\n  数据={r['data']}")
 
     print("\n发送后数据库最近 5 条：")
     for line in db_latest(who, 5):
         print("   ", line)
 
-    # ========== 2. at_member：群聊 @ 成员（改你实际的群名和成员） ==========
-    group = "STABLE一1一161008"          # ← 改成你的群名
-    member = "文件传输助手"              # ← 改成群内的成员名
-    print("\n" + "=" * 60)
-    print(f"[2] at_member 群聊 @ 成员（群：{group}，成员：{member}）")
-    print("=" * 60)
-
-    r2 = wx.at_member(member, "大家看下这条 @ 测试", who=group, verify=True)
-    print(f"at_member 结果：\n  ok={r2.is_success}\n  消息={r2['message']}\n  数据={r2['data']}")
-
-    print("\n发送后数据库最近 5 条：")
-    for line in db_latest(group, 5):
-        print("   ", line)
-
     print("\n完成。若 ok=False，请把打印的失败信息贴出来。")
+
 
 if __name__ == "__main__":
     main()
