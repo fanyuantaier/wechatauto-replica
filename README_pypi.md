@@ -32,7 +32,7 @@
 本项目复刻上游 wxauto 项目，目标是实现对当前微信 4.x Windows 客户端的自动化
 （读取消息、发送消息、媒体下载、朋友圈），非网页版，直接操作本机客户端。
 
-> 当前版本：1.2.2
+> 当前版本：1.2.2.1
 >
 > **兼容范围**：Windows 10/11 ｜ Python 3.9+（已在 3.12 验证）｜ 微信 **4.1.12+**
 > （数据库读取路线对微信版本不敏感；坐标+OCR 发送路线依赖 4.1.12+ 自绘渲染
@@ -57,6 +57,14 @@
 ---
 
 ## 版本记录
+
+### v1.2.2.1（2026-09-12）
+
+- **兼容微信新版界面（4.1.13.65 实测）**：新版把 `AutomationId` 从短名改成了**点分路径**（旧 `session_list` / `chat_input_field` → 新 `MainView.main_tabbar`、`MainView….main_window_sub_splitter_view…`），原来按短名精确等值匹配会失配。现在 AID 一律按「精确 / 点分段相等 / 结尾匹配」判定（`_aid_hit()`），旧版短名与新版路径都能命中。
+- **窗口标题匹配放宽**：新版主窗口标题为 `Weixin`、带未读数时变成 `微信(3)`；`_title_is_main()` 改为包含匹配，`WeChat` 等其它窗口不会误匹配。
+- **锚点候选 + 结构兜底**：主窗口 / 登录窗 / 搜索框改为候选元组匹配（单值常量保留，兼容外部引用）；搜索框、聊天输入框、搜索结果列表各自增加结构兜底（Name 含「搜索」的 EditControl / 聊天区 EditControl / 根节点属性搜索），日后新版改类名或 AID 时不至于整体失效。
+- **新增布局自检 `WeChatUIA.describe_layout()`**：一次调用返回主类名、标题、布局类型（`merged` 合并布局 / `legacy` 独立朋友圈窗 / `chat`）与各锚点解析结果（main_window / search_box / session_list / chat_input / main_tabbar / sns_list）。微信再改界面时先跑它，即可定位是哪个锚点失配。
+- 说明：朋友圈相关锚点本身已是双布局分支（独立 `mmui::SNSWindow` / 合并 `mmui::SNSContentView`），4.1.13.65 实测类名未变，无需调整。
 
 ### v1.2.2（2026-09-12）
 
@@ -728,7 +736,7 @@ quick_send_file(r'D:\资料\报告.pdf', '文件传输助手')
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.2.2 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
+> **Current version:** 1.2.2.1 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -888,6 +896,14 @@ Runnable demo: `python -m wechatauto.demo_moments_interact [--like N | --unlike 
 - Performance: parallel export / first-scan, incremental memory-scan cache
 
 ## 📝 Changelog
+
+### v1.2.2.1 (2026-09-12)
+
+- **Compatibility with the new WeChat UI (verified on 4.1.13.65)**: the new build changed `AutomationId` from short names into **dotted paths** (old `session_list` / `chat_input_field` → new `MainView.main_tabbar`, `MainView….main_window_sub_splitter_view…`), which broke exact-equality matching. AutomationIds are now matched as exact / dotted-segment / suffix (`_aid_hit()`), so both the old short names and the new paths resolve.
+- **Relaxed window-title matching**: the new main window title is `Weixin`, and becomes `微信(3)` when there are unread counts; `_title_is_main()` now matches by containment and still rejects unrelated titles such as `WeChat`.
+- **Anchor candidate lists + structural fallbacks**: the main window / login window / search box now match against candidate tuples (single-value constants kept for backward compatibility); the search box, chat input and search-result list each gained a structural fallback (an EditControl whose Name contains 搜索, an EditControl inside the chat area, attribute-based search from the root), so a renamed class or AID in a future build no longer breaks the whole path.
+- **New layout self-check `WeChatUIA.describe_layout()`**: one call returns the main class name, window title, layout kind (`merged` / `legacy` / `chat`) and the resolution result of every anchor (main_window, search_box, session_list, chat_input, main_tabbar, sns_list). Run it first when a new WeChat build changes the UI.
+- Note: the Moments anchors were already dual-layout (standalone `mmui::SNSWindow` / merged `mmui::SNSContentView`); 4.1.13.65 keeps those class names, so no change was needed there.
 
 ### v1.2.2 (2026-09-12)
 
