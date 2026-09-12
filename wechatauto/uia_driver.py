@@ -63,6 +63,73 @@ SESSION_LIST_AID = "session_list"
 SEARCH_LIST_AID = "search_list"
 RESULT_AID_PREFIX = "search_item_"                 # 真实可打开结果的 aid 前缀
 CHAT_INPUT_AID = "chat_input_field"                # 输入框；其 .Name == 当前聊天对象
+
+# ---------------------------------------------------------------------------
+# 新旧版本兼容候选
+# 实测（4.1.13.65）：类名仍是上面这些，但 **AutomationId 变成了点分路径**
+# （例如 MainView.main_tabbar、MainView….main_window_sub_splitter_view），
+# 按短名精确等值匹配会失配。因此：单值锚点保留（兼容外部引用），
+# 新增候选元组 + 容错匹配（精确 / 点分段相等 / 结尾匹配）+ 结构兜底。
+# ---------------------------------------------------------------------------
+MAIN_CLASSES = ("mmui::MainWindow",)
+LOGIN_CLASSES = ("mmui::LoginWindow",)
+MAIN_NAME_HINTS = ("微信", "Weixin")               # 标题按“包含”匹配（新版可能带未读数）
+SEARCH_EDIT_CLASSES = ("mmui::XValidatorTextEdit",)
+SESSION_LIST_AIDS = ("session_list",)
+SEARCH_LIST_AIDS = ("search_list",)
+CHAT_INPUT_AIDS = ("chat_input_field",)
+SNS_LIST_CLASSES = ("mmui::TimeLineListView",)
+SNS_LIST_AIDS = ("sns_list",)
+
+
+def _title_is_main(title: str) -> bool:
+    """主窗口标题判定：兼容“微信/Weixin”及带后缀（未读数等）的新版标题。"""
+    if not title:
+        return False
+    if title in MAIN_NAMES:
+        return True
+    return any(hint in title for hint in MAIN_NAME_HINTS)
+
+
+def _aid_hit(aid: str, candidates) -> bool:
+    """AutomationId 容错匹配（新旧版通用）。
+
+    旧版 aid 是短名（session_list）；新版是点分路径
+    （MainView.main_tabbar…）。故：精确 / 点分段完全相等 / 结尾匹配 均算命中。
+    """
+    a = (aid or "").strip().lower()
+    if not a:
+        return False
+    segs = a.split(".")
+    for c in candidates:
+        cl = (c or "").lower()
+        if not cl:
+            continue
+        if a == cl or a.endswith("." + cl) or cl in segs:
+            return True
+    return False
+
+
+def _find_by(root, pred, max_depth: int = 40):
+    """子树里找第一个满足 pred 的控件（新旧版结构差异的兜底定位手段）。"""
+    if root is None:
+        return None
+    stack = [(root, 0)]
+    while stack:
+        el, d = stack.pop()
+        if d > max_depth:
+            continue
+        try:
+            if pred(el):
+                return el
+        except Exception:
+            pass
+        try:
+            for k in el.GetChildren():
+                stack.append((k, d + 1))
+        except Exception:
+            pass
+    return None
 DEFAULT_EXE = r"C:\Program Files\Tencent\Weixin\Weixin.exe"
 
 # 搜索结果分区标题（aid 为空且名字命中此集合的才算分区头，其余空 aid 视为建议项）
@@ -537,7 +604,8 @@ class WeChatUIA:
 
         def cb(h, _):
             try:
-                if win32gui.IsWindowVisible(h) and win32gui.GetWindowText(h) in MAIN_NAMES:
+                title = win32gui.GetWindowText(h)
+                if win32gui.IsWindowVisible(h) and _title_is_main(title):
                     # 只保留加载了 Weixin.dll 的主进程窗口，过滤掉无 DLL 的
                     # 辅助进程窗口（其热激活必然失败，只会产生噪音警告）
                     pid = self._pid_from_hwnd(h)
@@ -563,14 +631,14 @@ class WeChatUIA:
     def _find_main(self):
         for h in self._wechat_hwnds():
             c = self._anchor(h)
-            if c is not None and (c.ClassName or "") == MAIN_CLASS:
+            if c is not None and (c.ClassName or "") in MAIN_CLASSES:
                 return c
         return None
 
     def _login_window(self):
         for h in self._wechat_hwnds():
             c = self._anchor(h)
-            if c is not None and (c.ClassName or "") == LOGIN_CLASS:
+            if c is not None and (c.ClassName or "") in LOGIN_CLASSES:
                 return c
         return None
 
@@ -654,6 +722,54 @@ class WeChatUIA:
     def is_materialized(self) -> bool:
         """当前是否已物化出 mmui 树（即能扫到子控件）。"""
         return self._find_main() is not None
+
+    def describe_layout(self) -> dict:
+        """诊断自检：报告当前微信布局与关键锚点解析情况（新旧版兼容排查）。
+
+        返回 dict：main_class / title / layout(merged|legacy|chat) /
+        anchors{main_window,search_box,session_list,chat_input,main_tabbar,sns_list}。
+        某个锚点为 None 即表示它在新版里失配——据此定位要适配的控件。
+        """
+        rep = {"main_class": None, "title": None, "layout": "unknown",
+               "anchors": {}, "wechat_hwnds": self._wechat_hwnds()}
+        w = self._find_main()
+        if w is None:
+            rep["layout"] = "not-materialized-or-not-running"
+            return rep
+        rep["main_class"] = w.ClassName
+        try:
+            rep["title"] = w.Name
+        except Exception:
+            pass
+        merged = _find_by(w, lambda c: (c.ClassName or "") in ("mmui::SNSContentView",
+                                                              "mmui::TimeLineListView"),
+                          max_depth=30)
+        legacy = _find_by(w, lambda c: (c.ClassName or "") == "mmui::SNSWindow",
+                          max_depth=10)
+        rep["layout"] = ("merged" if merged is not None
+                         else "legacy" if legacy is not None else "chat")
+
+        def _desc(el):
+            if el is None:
+                return None
+            return "%s|%s" % (getattr(el, "ClassName", "") or "",
+                              getattr(el, "AutomationId", "") or "")
+
+        checks = {
+            "main_window": lambda c: (c.ClassName or "") in MAIN_CLASSES,
+            "search_box": lambda c: (c.ControlTypeName == "EditControl"
+                                     and SEARCH_EDIT_NAME in (c.Name or "")),
+            "session_list": lambda c: _aid_hit(getattr(c, "AutomationId", ""),
+                                               SESSION_LIST_AIDS),
+            "chat_input": lambda c: _aid_hit(getattr(c, "AutomationId", ""),
+                                             CHAT_INPUT_AIDS),
+            "main_tabbar": lambda c: (c.ClassName or "") == "mmui::MainTabBar",
+            "sns_list": lambda c: (c.ClassName or "") in SNS_LIST_CLASSES
+                                  or _aid_hit(getattr(c, "AutomationId", ""), SNS_LIST_AIDS),
+        }
+        for name, pred in checks.items():
+            rep["anchors"][name] = _desc(_find_by(w, pred, max_depth=30))
+        return rep
 
     def ensure_materialized(self, timeout: float = 6.0, force: bool = False) -> bool:
         """确保 mmui 树物化：窗口在但子控件扫不到时热写 gate 并校验。
@@ -791,20 +907,34 @@ class WeChatUIA:
 
     # ------------------------------------------------------------------ 控件定位
     def _search_box(self, win):
-        for kw in (dict(ClassName=SEARCH_EDIT_CLASS, Name=SEARCH_EDIT_NAME),
-                   dict(Name=SEARCH_EDIT_NAME),
-                   dict(ClassName=SEARCH_EDIT_CLASS)):
-            e = win.EditControl(**kw)
-            if e.Exists(1.0, 0.2):
-                return e
-        return None
+        # 1) 已知锚点（类名+名称 / 名称 / 类名），遍历候选类名
+        for cls in SEARCH_EDIT_CLASSES:
+            for kw in (dict(ClassName=cls, Name=SEARCH_EDIT_NAME),
+                       dict(Name=SEARCH_EDIT_NAME),
+                       dict(ClassName=cls)):
+                e = win.EditControl(**kw)
+                if e.Exists(1.0, 0.2):
+                    return e
+        # 2) 新旧版兜底：Name 含“搜索”的编辑框（忽略类名变化）
+        return _find_by(win, lambda c: (c.ControlTypeName == "EditControl"
+                                        and SEARCH_EDIT_NAME in (c.Name or "")))
 
     def _chat_input(self, win=None):
         win = win or self._win
         if win is None:
             return None
+        # 1) 旧版：aid 短名精确匹配
         e = win.EditControl(AutomationId=CHAT_INPUT_AID)
-        return e if e.Exists(1.0, 0.2) else None
+        if e.Exists(1.0, 0.2):
+            return e
+        # 2) 新版：aid 点分路径 → 容错匹配
+        hit = _find_by(win, lambda c: _aid_hit(getattr(c, "AutomationId", ""),
+                                               CHAT_INPUT_AIDS))
+        if hit is not None:
+            return hit
+        # 3) 结构兜底：聊天区里可编辑的 Edit（排除搜索框）
+        return _find_by(win, lambda c: (c.ControlTypeName == "EditControl"
+                                        and SEARCH_EDIT_NAME not in (c.Name or "")))
 
     def current_chat(self) -> Optional[str]:
         e = self._chat_input()
@@ -813,9 +943,21 @@ class WeChatUIA:
     def _find_search_list(self, timeout: float = 3.0):
         deadline = time.time() + timeout
         while time.time() < deadline:
+            # 1) 旧版：aid 短名
             lst = auto.ListControl(searchDepth=0xFFFFFFFF, AutomationId=SEARCH_LIST_AID)
             if lst.Exists(0.2, 0.1):
                 return lst
+            # 2) 新版：aid 点分路径 → 从根节点按属性容错匹配
+            try:
+                root = auto.GetRootControl()
+            except Exception:
+                root = None
+            hit = _find_by(root, lambda c: (c.ControlTypeName == "ListControl"
+                                            and _aid_hit(getattr(c, "AutomationId", ""),
+                                                         SEARCH_LIST_AIDS)),
+                           max_depth=25)
+            if hit is not None:
+                return hit
             time.sleep(0.2)
         return None
 
