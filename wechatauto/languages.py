@@ -154,6 +154,7 @@ MOMENTS = {
     '朋友圈': {'cn': '朋友圈', 'cn_t': '朋友圈', 'en': 'Moments'},
     '刷新': {'cn': '刷新', 'cn_t': '刷新', 'en': 'Refresh'},
     '评论': {'cn': '评论', 'cn_t': '評論', 'en': 'Comment'},
+    '评论区': {'cn': '评论区', 'cn_t': '評論區', 'en': 'Comments'},
     '广告': {'cn': '广告', 'cn_t': '廣告', 'en': 'Advertisement'},
     '赞': {'cn': '赞', 'cn_t': '讚', 'en': 'Like'},
     '取消': {'cn': '取消', 'cn_t': '取消', 'en': 'Cancel'},

@@ -33,6 +33,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 from ctypes import wintypes
 from typing import Dict, List, Optional, Tuple
 
@@ -72,7 +73,10 @@ MSG_TYPE_NAMES = {
     47: "动画表情",
     48: "位置",
     49: "文件/链接/卡片",
+    50: "音视频通话",          # <voipmsg> 气泡（如「已拒绝」）
     10000: "系统消息",
+    11000: "动画表情",         # 4.x 新版表情码（以复合码低 32 位出现，正文常为空）
+    8594229559345: "红包",     # 红包卡片（0x7D100000031，get_moments 等场景会用）
 }
 
 
@@ -358,6 +362,31 @@ def _decrypt_page(enc_key: bytes, page: bytes, pgno: int) -> bytes:
     return _aes_cbc_decrypt(enc_key[:32] if len(enc_key) == 48 else enc_key, iv, enc) + b"\x00" * RESERVE_SZ
 
 
+def _looks_like_text(t: str) -> bool:
+    """判断解码结果是否像可读文本（**不要求包含中文**）。
+
+    纯英文 / 纯数字 / URL / Emoji 消息同样需要还原，因此不再用「必须含中文」
+    的粗暴门槛；改用可打印字符占比 + 控制/未分配类字符占比双重判定，避免把
+    二进制噪声误判成文本。Cf（格式类，如 ZWJ）不计入噪声，否则 Emoji 组合
+    序列（👨\u200d👩\u200d👧）会被误杀。
+    """
+    if not t:
+        return False
+    bad = 0
+    printable = 0
+    for ch in t:
+        if ch in "\n\r\t":
+            printable += 1
+            continue
+        if unicodedata.category(ch) in ("Cc", "Co", "Cs", "Cn"):
+            bad += 1
+        else:
+            printable += 1
+    if printable / len(t) < 0.7:
+        return False
+    return bad / len(t) <= 0.1
+
+
 def _extract_text_from_blob(content: bytes) -> Optional[str]:
     """从微信消息容器头中还原 UTF-8 明文文本。
 
@@ -379,10 +408,7 @@ def _extract_text_from_blob(content: bytes) -> Optional[str]:
         t = re.sub(r"[\x00-\x09\x0b\x0c\x0e-\x1f\x7f]+", "", t).strip()
         if not t:
             return None
-        if not re.search(r"[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]", t):
-            return None
-        printable = sum(1 for ch in t if ch.isprintable())
-        if printable / len(t) < 0.6:
+        if not _looks_like_text(t):
             return None
         return t
 
@@ -1118,6 +1144,7 @@ class WeChatDB:
         ]
 
     def _find_msg_table(self, user: str, conns: List[sqlite3.Connection]) -> Optional[Tuple[sqlite3.Connection, str]]:
+        """定位会话消息表（只返回第一个命中分片，兼容旧接口；跨分片请用 _find_msg_tables）"""
         target = "Msg_" + _md5_hex(user.encode())
         for conn in conns:
             row = conn.execute(
@@ -1127,6 +1154,19 @@ class WeChatDB:
             if row:
                 return conn, target
         return None
+
+    def _find_msg_tables(self, user: str, conns: List[sqlite3.Connection]) -> List[Tuple[sqlite3.Connection, str]]:
+        """定位会话消息表的全部命中分片（同一 Msg_ 表可能拆分在 message_0..N）。"""
+        target = "Msg_" + _md5_hex(user.encode())
+        found = []
+        for conn in conns:
+            row = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                (target,),
+            ).fetchone()
+            if row:
+                found.append((conn, target))
+        return found
 
     def _invalidate_cache(self) -> None:
         """删除 workdir 中全部解密缓存(.db/.stamp)，key 缓存除外。
@@ -1148,19 +1188,24 @@ class WeChatDB:
         if removed:
             sys.stderr.write("[wechatauto] 已清 %d 个缓存文件等待重建\n" % removed)
 
-    def _msg_conn(self, user: str, _retry: bool = True) -> Optional[Tuple[sqlite3.Connection, str]]:
-        """打开消息库并定位用户消息表（调用方负责 close 连接）"""
+    def _msg_conns(self, user: str, _retry: bool = True) -> List[Tuple[sqlite3.Connection, str]]:
+        """打开消息库并定位用户消息表（调用方负责 close 连接）。
+
+        返回该会话**全部分片**的 (conn, table)。同一 Msg_<md5> 表可能分布在
+        多个 message_N.db 分片（按时间/容量横向切分），必须全部读齐才能
+        拿到完整消息序列。
+        """
         conns = []
         try:
             conns = [self._open(rel) for rel in self._message_dbs()]
-            found = self._find_msg_table(user, conns)
+            found = self._find_msg_tables(user, conns)
         except sqlite3.DatabaseError as exc:
             for c in conns:
                 c.close()
             if _retry and _is_malformed(exc):
                 sys.stderr.write("[wechatauto] 消息库损坏(%s)，清缓存重建并重试\n" % exc)
                 self._invalidate_cache()
-                return self._msg_conn(user, _retry=False)
+                return self._msg_conns(user, _retry=False)
             raise
         except Exception:
             for c in conns:
@@ -1169,29 +1214,34 @@ class WeChatDB:
         if not found:
             for c in conns:
                 c.close()
-            return None
+            return []
         # 只保留命中的连接，其余分片库立即关闭，避免 Windows 下删除缓存被占用
-        target = found[0]
+        keep = {id(c) for c, _ in found}
         for c in conns:
-            if c is not target:
+            if id(c) not in keep:
                 c.close()
         return found
+
+    def _msg_conn(self, user: str, _retry: bool = True) -> Optional[Tuple[sqlite3.Connection, str]]:
+        """兼容旧接口：只返回第一个命中分片（跨分片场景请用 _msg_conns）。"""
+        found = self._msg_conns(user, _retry=_retry)
+        return found[0] if found else None
 
     def _run_msg_query(self, user: str, build):
         """对消息库执行只读查询；查询到库损坏时清缓存重建并重试一次。
 
-        build(conn, table) -> rows（同 _msg_conn 的 found 连接/表名）。
+        build(tables) -> rows，其中 tables 为 List[(conn, table)]，覆盖该
+        会话的全部命中分片（跨分片由调用方合并排序）。
         _msg_conn 已处理 schema 损坏重建，本方法兜底数据页损坏。
         重试后仍失败则抛原始异常（Listener 捕获后跳过本轮，不阻断运行）。
         找不到该会话返回 None。
         """
         for attempt in (0, 1):
-            found = self._msg_conn(user)
-            if found is None:
+            found = self._msg_conns(user)
+            if not found:
                 return None
-            conn, table = found
             try:
-                return build(conn, table)
+                return build(found)
             except sqlite3.DatabaseError as exc:
                 if attempt or not _is_malformed(exc):
                     raise
@@ -1200,36 +1250,102 @@ class WeChatDB:
                 )
                 self._invalidate_cache()
             finally:
-                conn.close()
+                closed = set()
+                for conn, _ in found:
+                    if id(conn) not in closed:
+                        closed.add(id(conn))
+                        conn.close()
         return None
 
-    def get_messages(self, user: str, limit: int = 20, offset: int = 0) -> List[dict]:
-        """读取指定会话（微信号/群号）的最近消息"""
-        return self._run_msg_query(
-            user,
-            lambda conn, table: [
-                self._msg_row_to_dict(r) for r in conn.execute(
-                    "SELECT local_id, local_type, real_sender_id, create_time, "
-                    "message_content, source, packed_info_data, compress_content, sort_seq "
-                    "FROM %s ORDER BY sort_seq DESC LIMIT ? OFFSET ?" % table,
-                    (limit, offset),
-                ).fetchall()
-            ],
-        ) or []
+    def _shard_rows(self, tables, sql_ext, params=()):
+        """跨分片执行统一 SELECT，返回合并后的 sqlite3.Row 列表（调用方后续排序）。
 
-    def get_message_row(self, user: str, local_id: int) -> Optional[dict]:
-        """按 local_id 读取一条消息的完整原始字段（媒体下载用，含 server_id/packed_info）"""
+        tables: _run_msg_query 传入的 [(conn, table), ...]。
+        分片间 local_id 会重复排序（每片从 1 起），因此调用方必须显式按
+        sort_seq 排序，不能用跨分片 LIMIT/OFFSET 直查。
+        """
+        rows = []
+        for conn, table in tables:
+            try:
+                rows += conn.execute(
+                    "SELECT local_id, local_type, real_sender_id, create_time, "
+                    "message_content, source, packed_info_data, compress_content, "
+                    "server_id, sort_seq FROM %s %s" % (table, sql_ext),
+                    params,
+                ).fetchall()
+            except sqlite3.DatabaseError:
+                continue
+        return rows
+
+    def get_messages(self, user: str, limit: int = 20, offset: int = 0) -> List[dict]:
+        """读取指定会话（微信号/群号）的最近消息（跨分片合并后按 sort_seq 排序）"""
+        rows = self._run_msg_query(
+            user,
+            lambda tables: self._shard_rows(tables, ""),
+        )
+        if not rows:
+            return []
+        rows.sort(key=lambda r: r["sort_seq"], reverse=True)
+        return [self._msg_row_to_dict(r) for r in rows[offset:offset + limit]]
+
+    def get_message_rows_for_media(self, user: str, local_id: int) -> List[dict]:
+        """返回跨分片 local_id 命中的全部消息行（供媒体分发判定类型）。
+
+        跨分片下 local_id 非全局唯一，同一 local_id 可能对应不同类型消息
+        （图片/语音/文本等）。媒体下载分发时需要拿到所有候选再按类型路由。
+        """
         row = self._run_msg_query(
             user,
-            lambda conn, table: conn.execute(
-                "SELECT local_id, local_type, server_id, real_sender_id, create_time, "
-                "message_content, source, packed_info_data, compress_content, sort_seq "
-                "FROM %s WHERE local_id=? LIMIT 1" % table,
+            lambda tables: self._shard_rows(
+                tables, "WHERE local_id=?",
                 (local_id,),
-            ).fetchone(),
+            ),
+        )
+        if not row:
+            return []
+        row.sort(key=lambda r: r["sort_seq"], reverse=True)
+        out = []
+        for r in row:
+            out.append({
+                "local_id": r["local_id"],
+                "local_type": r["local_type"],
+                "server_id": r["server_id"],
+                "sender_id": r["real_sender_id"],
+                "create_time": r["create_time"],
+                "content": r["message_content"],
+                "source": r["source"],
+                "packed_info": r["packed_info_data"],
+                "compress_content": r["compress_content"],
+                "sort_seq": r["sort_seq"],
+            })
+        return out
+
+    def get_message_row(self, user: str, local_id: int,
+                        local_type: Optional[int] = None) -> Optional[dict]:
+        """按 local_id 读取一条消息的完整原始字段（媒体下载用，含 server_id/packed_info）。
+
+        Args:
+            local_id: 消息行号。注意跨分片下 local_id 非全局唯一，
+                同一 local_id 可在不同分片对应不同类型消息。
+            local_type: 可选，调用方已知消息类型时传入以精确过滤，
+                避免命中其它分片中的同号异类型消息。
+        """
+        sql = "WHERE local_id=?"
+        params = [local_id]
+        if local_type is not None:
+            sql += " AND local_type=?"
+            params.append(local_type)
+        row = self._run_msg_query(
+            user,
+            lambda tables: self._shard_rows(
+                tables, sql, tuple(params),
+            ),
         )
         if not row:
             return None
+        # 跨分片下 local_id 可能重复（各分片独立计数），取 sort_seq 最新者
+        row.sort(key=lambda r: r["sort_seq"], reverse=True)
+        row = row[0]
         sender_id = row["real_sender_id"]
         sender_username = ""
         if sender_id and sender_id != 2:
@@ -1260,26 +1376,30 @@ class WeChatDB:
         placeholders = ",".join("?" * len(types))
         rows = self._run_msg_query(
             user,
-            lambda conn, table: conn.execute(
-                "SELECT local_id FROM %s WHERE local_type IN (%s) "
-                "ORDER BY sort_seq DESC" % (table, placeholders),
+            lambda tables: self._shard_rows(
+                tables,
+                "WHERE local_type IN (%s)" % placeholders,
                 tuple(sorted(types)),
-            ).fetchall(),
+            ),
         )
-        return [r["local_id"] for r in rows] if rows else []
+        if not rows:
+            return []
+        rows.sort(key=lambda r: r["sort_seq"], reverse=True)
+        return [r["local_id"] for r in rows]
 
     def get_new_messages(self, user: str, since_seq: int = 0, limit: int = 200) -> List[dict]:
         """返回 sort_seq > since_seq 的新消息（升序），供轮询监听使用"""
         rows = self._run_msg_query(
             user,
-            lambda conn, table: conn.execute(
-                "SELECT local_id, local_type, real_sender_id, create_time, "
-                "message_content, source, packed_info_data, compress_content, sort_seq "
-                "FROM %s WHERE sort_seq > ? ORDER BY sort_seq ASC LIMIT ?" % table,
-                (since_seq, limit),
-            ).fetchall(),
+            lambda tables: self._shard_rows(
+                tables, "WHERE sort_seq > ?",
+                (since_seq,),
+            ),
         )
-        return [self._msg_row_to_dict(r) for r in rows] if rows else []
+        if not rows:
+            return []
+        rows.sort(key=lambda r: r["sort_seq"])
+        return [self._msg_row_to_dict(r) for r in rows[:limit]]
 
     def _msg_row_to_dict(self, r) -> dict:
         content = r["message_content"]
@@ -1288,6 +1408,8 @@ class WeChatDB:
             content = WeChatDB._friendly_content(content, mtype)
         # 如果内容是占位符且有 compress_content，尝试使用 compress_content
         placeholder = "[%s]" % mtype
+        if isinstance(content, str) and not content.strip():
+            content = placeholder   # 空正文（表情/贴纸类）给类型占位，避免看起来“丢消息”
         if content == placeholder:
             try:
                 cc = r["compress_content"]
@@ -1682,8 +1804,14 @@ class WeChatDB:
         """消息类型显示名；兼容微信 4.x 的资源包装类型（低字节为真实类型）"""
         if t in MSG_TYPE_NAMES:
             return MSG_TYPE_NAMES[t]
-        if isinstance(t, int) and t > 0xFFFF and (t & 0xFF) in MSG_TYPE_NAMES:
-            return MSG_TYPE_NAMES[t & 0xFF]
+        if isinstance(t, int) and t > 0xFFFF:
+            # 4.x 复合码：低 32 位才是真实类型
+            # （例：57<<32|49 → 49；17<<32|11000 → 11000 动画表情）
+            base = t & 0xFFFFFFFF
+            if base in MSG_TYPE_NAMES:
+                return MSG_TYPE_NAMES[base]
+            if (base & 0xFF) in MSG_TYPE_NAMES:
+                return MSG_TYPE_NAMES[base & 0xFF]
         return t
 
     def _export_row(self, r, mtype_names) -> dict:
@@ -1992,10 +2120,26 @@ class Listener:
     """
 
     def __init__(self, db: "WeChatDB", interval: float = 1.0,
-                 watermark: Optional[Dict[str, int]] = None):
+                 watermark: Optional[Dict[str, int]] = None,
+                 watermark_file: Optional[str] = None,
+                 max_retries: int = 3, retry_delay: float = 1.0,
+                 persist_interval: float = 1.0):
         self.db = db
         self.interval = interval
-        self._watermark: Dict[str, int] = watermark or {}
+        self.max_retries = max(0, int(max_retries))
+        self.retry_delay = max(0.0, float(retry_delay))
+        self.persist_interval = max(0.0, float(persist_interval))
+        # 水位持久化文件：默认写入 db.workdir/listener_watermark.json（回调成功
+        # 后节流落盘，重启不丢进度）；传 "" 可显式关闭落盘。
+        if watermark_file is None:
+            try:
+                watermark_file = os.path.join(db.workdir, "listener_watermark.json")
+            except Exception:
+                watermark_file = ""
+        self.watermark_file = watermark_file or ""
+        self._watermark: Dict[str, int] = dict(watermark or {})
+        if self.watermark_file:
+            self._load_watermark()
         self._callbacks: Dict[str, List[callable]] = {}
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -2003,6 +2147,61 @@ class Listener:
         self._worker_queues: Dict[str, queue.Queue] = {}
         self._worker_threads: Dict[str, threading.Thread] = {}
         self._workers_lock = threading.Lock()
+        # 已分派但回调尚未确认的边界（单调递增）：回调成功前不推进水位、
+        # 也不重复分派同一条消息
+        self._inflight: Dict[str, int] = {}
+        self._wm_lock = threading.Lock()
+        self._last_persist = 0.0
+
+    def _load_watermark(self) -> None:
+        """从持久化文件加载水位（与显式传入的水位取较大值，避免重复推送）。"""
+        path = self.watermark_file
+        if not path or not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return
+        if not isinstance(data, dict):
+            return
+        for k, v in data.items():
+            try:
+                v = int(v)
+            except (TypeError, ValueError):
+                continue
+            if v > self._watermark.get(k, 0):
+                self._watermark[k] = v
+
+    def save_watermark(self, force: bool = False) -> None:
+        """把当前水位原子落盘（默认节流；force=True 立即写）。"""
+        path = self.watermark_file
+        if not path:
+            return
+        now = time.time()
+        if not force and now - self._last_persist < self.persist_interval:
+            return
+        with self._wm_lock:
+            payload = dict(self._watermark)
+            self._last_persist = now
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=0)
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
+    def _commit_watermark(self, user: str, seq: Optional[int]) -> None:
+        """回调确认（成功或重试耗尽）后单调推进该会话水位并落盘。"""
+        if seq is None:
+            return
+        with self._wm_lock:
+            if int(seq) <= self._watermark.get(user, 0):
+                return
+            self._watermark[user] = int(seq)
+        self.save_watermark()
 
     def add_listener(self, user: str, callback: callable) -> None:
         """注册新消息回调：callback(msg: dict, listener)"""
@@ -2060,6 +2259,7 @@ class Listener:
             q.put(_LISTENER_STOP)
         for t in threads:
             t.join(timeout=5)
+        self.save_watermark(force=True)
 
     def _run(self) -> None:
         while not self._stop.is_set():
@@ -2081,12 +2281,18 @@ class Listener:
             except Exception:
                 pass
         for user, callbacks in list(self._callbacks.items()):
-            since = self._watermark.get(user, 0)
+            # 起读点 = 已确认水位 与 已分派未确认边界 的较大值：
+            # 回调成功前既不推进水位，也不重复分派同一条消息
+            since = max(self._watermark.get(user, 0), self._inflight.get(user, 0))
             msgs = self.db.get_new_messages(user, since_seq=since)
             if not msgs:
                 continue
-            self._watermark[user] = msgs[-1]["sort_seq"]
+            last_seq = msgs[-1]["sort_seq"]
+            with self._wm_lock:
+                if last_seq > self._inflight.get(user, 0):
+                    self._inflight[user] = last_seq
             if not callbacks:
+                self._commit_watermark(user, last_seq)
                 continue
             self._dispatch(user, msgs)
 
@@ -2114,12 +2320,39 @@ class Listener:
             task = q.get()
             if task is _LISTENER_STOP:
                 break
-            m, cbs = task
-            for cb in cbs:
-                try:
+            try:
+                m, cbs = task
+                ok = self._run_callbacks(cbs, m)
+                if not ok:
+                    sys.stderr.write(
+                        "listener message dropped after %d attempts: "
+                        "user=%s seq=%s\n"
+                        % (self.max_retries + 1, user, m.get("sort_seq"))
+                    )
+                # 回调成功后推进水位；重试耗尽后同样推进（已记录，避免永久阻塞）
+                self._commit_watermark(user, m.get("sort_seq"))
+            except Exception as exc:  # 工作线程不因单条消息异常而退出
+                sys.stderr.write("listener worker error: %r\n" % exc)
+
+    def _run_callbacks(self, cbs, m: dict) -> bool:
+        """执行某条消息的全部回调；失败按 max_retries/retry_delay 重试。
+
+        返回 True 表示回调全部成功；False 表示重试耗尽仍然失败。
+        """
+        for attempt in range(self.max_retries + 1):
+            try:
+                for cb in cbs:
                     cb(m, self)
-                except Exception as exc:
-                    sys.stderr.write("listener callback error: %r\n" % exc)
+                return True
+            except Exception as exc:
+                if attempt >= self.max_retries:
+                    sys.stderr.write(
+                        "listener callback error after %d attempts: %r\n"
+                        % (attempt + 1, exc)
+                    )
+                    return False
+                time.sleep(self.retry_delay)
+        return False
 
 
 def _extract_path_from_config(content: str) -> Optional[str]:

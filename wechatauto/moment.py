@@ -17,12 +17,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import html
+import io
+import json
 import os
 import re
 import time
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Union
+
+from PIL import Image
 
 from wechatauto import uia
 from wechatauto.languages import MOMENTS, get_lang
@@ -31,6 +36,11 @@ from wechatauto.param import WxParam, WxResponse
 from wechatauto.ui.base import BaseUISubWnd
 from wechatauto.utils.tools import find_all_windows_from_root
 from wechatauto.utils.win32 import SetClipboardText
+
+
+# 多候选 dims 消歧的字节数偏差上限（绝对），相对 feed size 的 10% 同时生效。
+# 真图不在缓存 + 同尺寸多张缓存图时，偏差超限即拒绝，避免无关图冒充。
+_MAX_SIZE_DEV = 512
 
 
 def _asset_path(name: str) -> Optional[str]:
@@ -113,6 +123,56 @@ def _is_time_line(text: str) -> bool:
     return any(re.search(pattern, text) for pattern in patterns)
 
 
+_REL_TIME_PATTERNS = [
+    r"刚刚",
+    r"\d+\s*分钟前",
+    r"\d+\s*小时前",
+    r"\d+\s*天前",
+    r"昨天",
+]
+
+
+def _find_time_tail(text: str) -> Optional[re.Match]:
+    """在合并布局单行摘要里找时间片段（取最靠右的匹配）。
+
+    微信合并布局把「昵称 正文… 媒体标记 时间」压成一行 UIA Name，
+    时间通常在行尾，形如 ``39分钟前``、``1小时前``、``昨天`` 或绝对时间。
+    """
+    if not text:
+        return None
+    patterns = _REL_TIME_PATTERNS + [
+        r"\d{4}年\d{1,2}月\d{1,2}日",
+        r"\d{1,2}月\d{1,2}日",
+        r"\d{2}-\d{2}",
+        r"\d{1,2}:\d{2}",
+    ]
+    found: Optional[re.Match] = None
+    for pat in patterns:
+        for m in re.finditer(pat, text):
+            if found is None or m.start() > found.start():
+                found = m
+    return found
+
+
+def _is_layout_decoration_cell(class_name: str, name: str) -> bool:
+    """判断一个 ListItem 是否为合并布局的装饰性 cell（非动态正文）。
+
+    合并布局下每条动态在时间线里摊成同一层的 3 个 ListItem：正文
+    （``TimelineContentCell``）、评论区（Name ``评论区``）、余下计数
+    （Name ``余下N条``）。这里识别并剔除后两者，避免污染动态列表。
+    """
+    if 'ContentCell' in class_name:
+        return False
+    name = (name or '').strip()
+    if not name:
+        return True
+    if name in {_lang(MOMENTS, '评论'), _lang(MOMENTS, '评论区')}:
+        return True
+    if re.match(r'^(余下|餘下|Remaining)\s*\d+', name):
+        return True
+    return False
+
+
 def _split_like_names(text: str) -> List[str]:
     """解析点赞字符串。"""
 
@@ -192,6 +252,13 @@ class MomentItem(BaseUISubWnd):
         raw_text = self.control.Name or ''
         lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
 
+        if len(lines) == 1:
+            # 合并布局：单行摘要（昵称/正文片段/媒体/时间压在一行）
+            if self._parse_merged_summary(lines[0]):
+                self._parsed = True
+                self._collect_comment_controls()
+                return
+
         if lines:
             self.nickname = lines[0]
 
@@ -245,14 +312,74 @@ class MomentItem(BaseUISubWnd):
         self.content = '\n'.join(content_lines).strip()
         self.comments = [MomentComment.from_text(line) for line in comment_lines if line.strip()]
 
-        # 记录可用于回复的控件
+        self._collect_comment_controls()
+        self._parsed = True
+
+    def _collect_comment_controls(self) -> None:
+        """收集可用于回复的评论控件（TextControl）。"""
         for child in self.control.GetChildren():
             if child.ControlTypeName == 'TextControl':
                 text = (child.Name or '').strip()
                 if text:
                     self._comment_controls.setdefault(text, child)
 
-        self._parsed = True
+    def _parse_merged_summary(self, line: str) -> bool:
+        """解析合并布局下的单行摘要 Name。
+
+        格式：``<昵称> <正文摘要…> <媒体标记> <时间>``，其中媒体标记形如
+        ``包含N张图片`` / ``视频``，时间形如 ``39分钟前`` / ``昨天``。
+        单行时昵称与正文片段以空格分隔，第一个 token 视为昵称。
+
+        Returns:
+            True 表示识别到有效正文 cell 并已填充字段；False 表示装饰性 cell。
+        """
+        s = line.strip()
+        if not s:
+            return False
+
+        # 排除装饰性 cell（评论区 / 余下N条）
+        if s in {_lang(MOMENTS, '评论'), _lang(MOMENTS, '评论区')}:
+            return False
+        if re.match(r'^(余下|餘下|Remaining)', s):
+            return False
+
+        # 广告标记：可能出现在行首（广告 cell）或正文后
+        if _lang(MOMENTS, '广告') in s:
+            self.is_advertisement = True
+            s = s.replace(_lang(MOMENTS, '广告'), '').strip()
+
+        # 1) 时间（取最靠右的匹配，通常在行尾）
+        time_hit = _find_time_tail(s)
+        if time_hit:
+            self.time = time_hit.group(0)
+            s = s[:time_hit.start()].rstrip()
+
+        # 2) 媒体标记（图片数 / 视频）
+        mm = re.search(_lang(MOMENTS, 're_图片数'), s)
+        if mm:
+            count = re.findall(r'\d+', mm.group())
+            if count:
+                self.image_count = int(count[0])
+            s = s[:mm.start()] + s[mm.end():]
+
+        # 视频标记（中文硬编码，与微信 UI 一致）
+        mv = re.search(r'视频', s)
+        if mv:
+            s = s[:mv.start()] + s[mv.end():]
+
+        # 3) 昵称 + 正文片段（空格分隔：第一块昵称，其余为正文片段）
+        tokens = s.split()
+        if not tokens:
+            self.nickname = ''
+            return True
+        self.nickname = tokens[0]
+        rest = ' '.join(tokens[1:])
+
+        # 4) 内容片段：微信 UIA 把长文截为省略，片段含关键字可用于 keyword 定位
+        if rest:
+            self.content = rest.strip()
+
+        return True
 
     # ----------------------------------------------------------------------------------------------
     # 对外属性访问
@@ -319,53 +446,51 @@ class MomentList(BaseUISubWnd):
 
     def _locate_list(self, parent: 'Moment') -> Optional[uia.Control]:
         wxlog.debug('尝试定位朋友圈列表控件')
-        # 首先尝试通过常用 className 定位
-        candidates: Iterable[uia.Control] = []
-        try:
-            root_control = parent.control  # mmui::SNSWindow（时间线所在独立窗口）
-            candidates = root_control.GetChildren() if root_control is not None else []
-        except Exception:
-            candidates = []
+        counter = [0]
 
-        queue = list(candidates)
-        visited = set()
-
-        while queue:
-            ctrl = queue.pop(0)
-            if ctrl in visited:
-                continue
-            visited.add(ctrl)
-
-            class_name = getattr(ctrl, 'ClassName', '') or ''
-            automation_id = getattr(ctrl, 'AutomationId', '') or ''
-            # 微信 4.x：时间线列表为 mmui::TimeLineListView（位于独立 SNSWindow 内）
-            if ctrl.ControlTypeName == 'ListControl' and 'TimeLineListView' in class_name:
-                wxlog.debug(f'找到朋友圈时间线列表控件：{class_name}')
-                return ctrl
-            if ctrl.ControlTypeName == 'ListControl' and ('Moment' in class_name or 'moment' in automation_id.lower()):
-                wxlog.debug(f'找到疑似朋友圈列表控件：{class_name}')
-                return ctrl
-
-            # 朋友圈列表一般会包含"评论"按钮
-            children = []
+        def _walk(node, depth):
+            counter[0] += 1
+            if counter[0] > 20000 or depth > 30:
+                return None
             try:
-                children = ctrl.GetChildren()
+                ctrl_type = node.ControlTypeName or ''
+                cls = (node.ClassName or '') or ''
+                aid = (node.AutomationId or '') or ''
             except Exception:
-                children = []
-
-            if ctrl.ControlTypeName == 'ListControl':
-                for child in children:
+                return None
+            # 微信 4.x：时间线列表为 mmui::TimeLineListView（位于独立 SNSWindow 内）
+            if ctrl_type == 'ListControl' and ('TimeLineListView' in cls
+                                               or 'Moment' in cls
+                                               or 'moment' in aid.lower()):
+                wxlog.debug(f'找到朋友圈时间线列表控件：{cls}')
+                return node
+            try:
+                kids = node.GetChildren()
+            except Exception:
+                return None
+            # 朋友圈列表一般会包含"评论"按钮（作为列表的直接子元素）
+            if ctrl_type == 'ListControl':
+                for child in kids:
                     try:
                         if getattr(child, 'Name', '') == _lang(MOMENTS, '评论'):
                             wxlog.debug('通过子元素匹配到朋友圈列表控件')
-                            return ctrl
+                            return node
                     except Exception:
                         continue
+            for kid in kids:
+                found = _walk(kid, depth + 1)
+                if found is not None:
+                    return found
+            return None
 
-            queue.extend(children)
-
-        wxlog.debug('未能定位到朋友圈列表控件')
-        return None
+        try:
+            root_control = parent.control  # mmui::SNSContentView / SNSWindow
+        except Exception:
+            root_control = None
+        if root_control is None:
+            wxlog.debug('未能定位到朋友圈列表控件')
+            return None
+        return _walk(root_control, 0)
 
     def exists(self, wait: float = 0) -> bool:  # type: ignore[override]
         if not self.control:
@@ -385,6 +510,8 @@ class MomentList(BaseUISubWnd):
                 return self._items
 
             try:
+                if not self.control.Exists(1.0):
+                    return self._items
                 children = self.control.GetChildren()
             except Exception:
                 children = []
@@ -394,6 +521,9 @@ class MomentList(BaseUISubWnd):
                     if child.ControlTypeName in {'ListItemControl', 'CustomControl'}:
                         text = getattr(child, 'Name', '') or ''
                         if text.strip():
+                            cls_name = getattr(child, 'ClassName', '') or ''
+                            if _is_layout_decoration_cell(cls_name, text):
+                                continue
                             self._items.append(MomentItem(child, self))
                 except Exception:
                     continue
@@ -424,28 +554,89 @@ class Moment:
             return None
 
     def _find_sns_window(self, timeout: float = 3.0) -> Optional[uia.Control]:
-        """定位独立的“朋友圈”顶层窗口（``mmui::SNSWindow``）。
+        """定位朋友圈时间线所在窗口/容器控件。
 
-        微信 4.x 的 t朋友圈 时间线是一个独立顶层窗口，不在主窗口内容区；
-        早期的定位逻辑基于主窗口，故找不到列表。这里按 UIA 类名扫描顶层窗口。
+        兼容两种布局：
+
+        - 旧版独立窗口：朋友圈时间线是顶层 ``mmui::SNSWindow``。
+        - 新版合并布局：朋友圈内容嵌入主窗口，成为主窗口子树里的
+          ``mmui::SNSContentView``（内有 ``mmui::TimeLineListView``）。
+
+        先按顶层窗口扫描，找不到再回退从主窗口子树 BFS 定位
+        ``SNSContentView``，保证两种布局都能把时间线容器交还给
+        :class:`MomentList` 复用后续逻辑。
         """
         t0 = time.time()
         pid = None
         try:
-            api = getattr(self._wx, '_api', None)
-            pid = api.pid if (api is not None) else None
+            mw_hwnd = self._wx._gui.main_hwnd
+            if mw_hwnd:
+                import ctypes
+                _pid = ctypes.c_ulong()
+                ctypes.windll.user32.GetWindowThreadProcessId(ctypes.c_void_p(mw_hwnd), ctypes.byref(_pid))
+                pid = int(_pid.value or 0) or None
         except Exception:
             pid = None
         while time.time() - t0 < timeout:
-            try:
-                wins = find_all_windows_from_root(uiaclsname='mmui::SNSWindow', pid=pid) \
-                    if pid else find_all_windows_from_root(uiaclsname='mmui::SNSWindow')
-            except Exception:
-                wins = []
-            if wins:
-                return wins[0]
+            # 合并布局：直接从主窗口子树 BFS 定位 SNSContentView / TimeLineListView
+            ctl = self._main_window_control()
+            if ctl is not None:
+                sc = self._bfs_control(ctl, 'SNSContentView', max_nodes=20000, max_depth=30)
+                if sc is not None:
+                    return sc
+                tl = self._bfs_control(ctl, 'TimeLineListView', max_nodes=20000, max_depth=30)
+                if tl is not None:
+                    return tl
             time.sleep(0.3)
         return None
+
+    def _main_window_control(self) -> Optional[uia.Control]:
+        """从微信主窗口句柄锚定 UIA 控件（合并布局回退用）。"""
+        try:
+            mw = self._wx._gui.main_hwnd
+        except Exception:
+            return None
+        if not mw:
+            return None
+        try:
+            from uiautomation import ControlFromHandle
+            return ControlFromHandle(mw)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _bfs_control(root: 'uia.Control', class_name: str,
+                     max_nodes: int = 2000, max_depth: int = 20) -> Optional['uia.Control']:
+        """在控件子树里查找 ``class_name``（包含匹配）的控件。
+
+        uiautomation 的包装对象每次 ``GetChildren()`` 返回新引用，不易用
+        ``id()`` 去重，且子控件需从父节点即时取得才能可靠展开；这里用朴素
+        递归深度优先遍历（与探针已验证一致的行为），以 ``max_nodes`` 限制
+        总访问量、``max_depth`` 限制深度，避免爬满整棵微信控件树。
+        """
+        counter = [0]
+
+        def _walk(node, depth):
+            counter[0] += 1
+            if counter[0] > max_nodes or depth > max_depth:
+                return None
+            try:
+                cls = getattr(node, 'ClassName', '') or ''
+            except Exception:
+                cls = ''
+            if class_name in cls:
+                return node
+            try:
+                children = node.GetChildren()
+            except Exception:
+                children = []
+            for ch in children:
+                hit = _walk(ch, depth + 1)
+                if hit is not None:
+                    return hit
+            return None
+
+        return _walk(root, 0)
 
     def _ensure_list(self) -> Optional[MomentList]:
         if self._list and self._list.exists(0):
@@ -454,8 +645,7 @@ class Moment:
         try:
             self._wx.SwitchToMoments()
         except Exception:
-            wxlog.debug('切换到朋友圈页面失败')
-            return None
+            wxlog.debug('切换到朋友圈页面失败，继续尝试定位已打开的时间线')
 
         # 时间线在独立的 mmui::SNSWindow 顶层窗口中，等待其出现
         win = self._find_sns_window()
@@ -493,10 +683,63 @@ class Moment:
         _send_scroll(x, y, delta=delta, times=times)
 
 
-    def _scroll_to_top(self, steps: int = 20) -> None:
-        """向上滚动到时间线顶部，作为定位的参考起点。"""
-        self._scroll(delta=120, times=steps)
-        time.sleep(0.6)
+    def _scroll_to_top(self, steps: int = 20, chunk: int = 5) -> None:
+        """向上滚动到时间线顶部，作为定位的参考起点。
+
+        逐块上滚并在「顶部指纹不再变化」（已到顶）时提前停止：
+        否则已经在顶部时仍空翻 20 格——用户反馈「最开始在顶部还往上翻」。
+        """
+        remain = max(1, steps)
+        prev = self._visible_fingerprint()
+        while remain > 0:
+            take = min(chunk, remain)
+            self._scroll(delta=120, times=take)
+            remain -= take
+            time.sleep(0.35)
+            cur = self._visible_fingerprint()
+            if cur is not None and cur == prev:
+                return          # 滚不动了 = 已在顶部
+            prev = cur
+        time.sleep(0.2)
+
+
+    def _visible_fingerprint(self, items=None) -> Optional[str]:
+        """顶部若干 cell 的稳定指纹（含几何位置），用于判断是否真的滚动了。
+
+        重要：微信合并布局下整屏复用 ListItem，**Name 可能完全相同**；
+        只用 Name 会把“真实滚动了”误判成“卡死”，导致翻到一半就放弃。
+        因此指纹 = Name + 包围盒(top:bottom:left)，真的滚了就会变。
+        """
+        if items is None:
+            items = self._read_visible_items(refresh=True)
+        parts = []
+        for it in items[:3]:
+            try:
+                name = ''.join((it.control.Name or '').split())[:40]
+            except Exception:
+                name = ''
+            try:
+                br = it.control.BoundingRectangle
+                geo = '%d:%d:%d' % (br.top, br.bottom, br.left)
+            except Exception:
+                geo = ''
+            parts.append(name + '#' + geo)
+        return '|'.join(parts) or None
+
+
+    @staticmethod
+    def _notches_for(px: float, per_notch: int = 55, hi: int = 8) -> int:
+        """把需要滚动的像素换算成滚轮格数（1~hi 格）。
+
+        原先固定 1 格/次，对高动态（长文+图+评论）距离不够，
+        导致目标或 “…” 按钮迟迟进不了视口；这里下调 px/格 并抬高上限，
+        让接近目标时也能一次滚够。
+        """
+        try:
+            n = int(abs(float(px)) // max(1, per_notch)) + 1
+        except Exception:
+            n = 1
+        return max(1, min(hi, n))
 
 
     def _read_visible_items(self, refresh: bool = True) -> List[MomentItem]:
@@ -508,11 +751,12 @@ class Moment:
     def _scroll_item_fully_visible(self, publisher: Optional[str] = None,
                                    keyword: Optional[str] = None,
                                    max_retry: int = 10) -> Optional[MomentItem]:
-        """把目标朋友圈整个滚入时间线视野内，返回刷新后的完整 cell。
+        """把目标朋友圈滚入视野，返回刷新后的完整 cell。
 
-        find_moment 命中即返回，但该条可能只露出一部分，评论文本不全。
-        这里依据 cell 与时间线矩形的位置关系，把超出屏幕的部分滚进来，
-        直到 cell 完全位于视野内（top>=视图顶 且 bottom<=视图底）。
+        停止判据（用户指定）：**下一条朋友圈的 UIA 控件出现在本条下方**时
+        立即停止翻动（`_has_next_moment_below`，自带视口过滤与不同发布者
+        校验）——能看见下一条，就说明本条（含 “…” 按钮/评论区）已完整露出。
+        仅当目标已是最后一条（永远没有“下一条”）时，才退回像素余量兜底。
 
         Returns:
             刷新后完整可见的目标 :class:`MomentItem`；失败返回 None。
@@ -521,6 +765,9 @@ class Moment:
         if not rect:
             return None
         vleft, vtop, vright, vbottom = rect
+        view_h = max(1, vbottom - vtop)
+        margin = 40          # 兜底（目标已是最后一条、永远没有“下一条”时）用的底部余量
+        no_next = 0
         for _ in range(max_retry):
             item = None
             for it in self._read_visible_items(refresh=True):
@@ -534,20 +781,45 @@ class Moment:
                 top, bottom = br.top, br.bottom
             except Exception:
                 return item
-            if top >= vtop and bottom <= vbottom:
-                return item
-            if top < vtop:
-                self._scroll(delta=-120, times=1)   # 顶部被裁，向下滚
+            # 主判据（用户指定）：**下一条朋友圈的 UIA 已出现在本条下方** →
+            # 说明本条（含 “…” 按钮/评论区）已完整露出，立即停止翻动。
+            # 该判据自带视口过滤与“不同发布者”校验，且成立时本条底边必然
+            # 落在视口内，比按像素余量猜更可靠。
+            try:
+                if self._has_next_moment_below(item, bottom):
+                    wxlog.debug('下一条朋友圈已出现，停止翻动')
+                    return item
+            except Exception:
+                pass
+            # 兜底：目标已是最后一条（永远没有下一条）时，退回像素余量判据
+            roomy = (bottom <= vbottom - margin and
+                     ((bottom - top) > view_h or top >= vtop))
+            if roomy:
+                no_next += 1
+                if no_next >= 2:
+                    wxlog.debug('下方无下一条朋友圈（末条），按底部余量判据停止')
+                    return item
             else:
-                self._scroll(delta=120, times=1)    # 底部被裁，向上滚
-            time.sleep(0.4)
+                no_next = 0
+            # 未到位：向下滚，把本条底边继续上移、把“下一条”带进视口；
+            # 若本条顶边还被裁着（翻过头且不高于视口），先向上拉回。
+            if top < vtop and (bottom - top) <= view_h:
+                self._scroll(delta=120, times=self._notches_for(vtop - top))
+            else:
+                need = max(0, bottom - (vbottom - margin))
+                self._scroll(delta=-120,
+                             times=self._notches_for(need) if need > 0 else 2)
+            time.sleep(0.25)
         return None
 
 
-    def _db_posts(self, db) -> List[dict]:
-        """取数据库朋友圈有序列表（最新在前），供标尺对齐。"""
+    def _db_posts(self, db, limit: int = 500) -> List[dict]:
+        """取数据库朋友圈有序列表（最新在前），供标尺对齐。
+
+        默认最多拉 500 条（避免 limit=0 全量拉取导致卡死）。
+        """
         try:
-            return list(db.get_moments(limit=0))
+            return list(db.get_moments(limit=limit))
         except Exception:
             return []
 
@@ -559,29 +831,81 @@ class Moment:
     def _db_pos(self, db_posts: List[dict], item: MomentItem) -> Optional[int]:
         """把 UIA 单元格对齐到数据库索引位置。
 
-        用「昵称 + 正文前缀」签名在 db_posts 里找最接近的匹配索引。
-        可能有同昵称多条，故优先正文开头的子串匹配；都失败返回 None。
+        先按「DB 条目的昵称+正文文本是否连续出现在 cell 的 UIA 摘要里」
+        做全文子串匹配（兼容昵称含空格时摘要解析被拆散的情况）；成功时
+        顺便校正 item 的 nickname/text（用 DB 中的权威昵称边界）。失败再
+        退回「昵称+正文前缀」签名匹配。
         """
+        norm = lambda s: ''.join((s or '').split()) or ''
+        try:
+            raw_name = norm(item.control.Name or '')
+        except Exception:
+            raw_name = ''
+        # 1) DB 全文作为 cell 摘要的连续子串（去空格后比对）
+        if raw_name:
+            for i, f in enumerate(db_posts):
+                db_full = norm((f.get('nickname', '') or '') + ' ' + (f.get('text', '') or ''))
+                if db_full and (db_full in raw_name or raw_name.startswith(db_full)):
+                    # 校正昵称/正文（用 DB 权威边界）
+                    db_nick = f.get('nickname', '') or ''
+                    db_text = f.get('text', '') or ''
+                    if db_nick:
+                        item.nickname = db_nick
+                    item.content = db_text
+                    return i
+        # 2) 精确签名
         try:
             nickname = item.publisher or ''
             text = item.text or ''
         except Exception:
             return None
-        norm = lambda s: ''.join((s or '').split()) or ''
         n_nick = norm(nickname)
         n_text = norm(text)
-        # 先精确签名
-        for i, f in enumerate(db_posts):
-            if self._signature(f.get('nickname', ''), f.get('text', '')) == self._signature(nickname, text):
-                return i
-        # 退化：同昵称，且正文前缀匹配
-        for i, f in enumerate(db_posts):
-            if norm(f.get('nickname', '')) != n_nick:
-                continue
-            f_text = norm(f.get('text', ''))
-            if n_text and (n_text[:10] in f_text or f_text[:10] in n_text):
-                return i
+        if n_nick:
+            for i, f in enumerate(db_posts):
+                if self._signature(f.get('nickname', ''), f.get('text', '')) == self._signature(nickname, text):
+                    return i
+        # 3) 退化：同昵称。仅在正文够长（防止把纯图片/短文案错配到任意旧条目）
+        #    且命中的候选里，**返回该昵称在 db 中最新（index 最小）的一条**。
+        #    微信时间线同昵称按时间倒序连续排列，屏幕顶部该昵称动态应对应其
+        #    db 最新一条；取 index 最小者即可避免在“文本为空 / 正文过短”时
+        #    全局错配导致 pos 跳变、方向误判（滚动震荡）。
+        if len(n_text) >= 6:
+            best: Optional[int] = None
+            for i, f in enumerate(db_posts):
+                fn_nick = norm(f.get('nickname', ''))
+                if not (fn_nick and n_nick and (fn_nick == n_nick
+                        or fn_nick.startswith(n_nick) or n_nick.startswith(fn_nick))):
+                    continue
+                f_text = norm(f.get('text', ''))
+                if n_text[:10] in f_text or f_text[:10] in n_text:
+                    if best is None or i < best:
+                        best = i
+            if best is not None:
+                return best
         return None
+
+    def _correct_nickname_from_db(self, db_posts: List[dict], item: MomentItem) -> None:
+        """用 DB 全文子串反查校正 item 的 nickname/text（OpenClaw 建议的昵称边界修复）。
+
+        只在 DB 可用时由外部（如 find_moment）调用；纯 UIA 路径不依赖此方法。
+        """
+        norm = lambda s: ''.join((s or '').split()) or ''
+        try:
+            raw_name = norm(item.control.Name or '')
+        except Exception:
+            raw_name = ''
+        if not raw_name:
+            return
+        for f in db_posts:
+            db_full = norm((f.get('nickname', '') or '') + ' ' + (f.get('text', '') or ''))
+            if db_full and (db_full in raw_name or raw_name.startswith(db_full)):
+                db_nick = f.get('nickname', '') or ''
+                db_text = f.get('text', '') or ''
+                if db_nick:
+                    item.nickname = db_nick
+                item.content = db_text
+                return
 
     def _target_idx(self, db_posts: List[dict], publisher: Optional[str],
                     keyword: Optional[str]) -> Optional[int]:
@@ -661,54 +985,153 @@ class Moment:
             return None
 
         if start_from_top:
-            self._scroll_to_top()
+            # 先用数据库标尺判断目标在当前视野的上方还是下方：目标在**下方**
+            # 时直接向下滚，不必先翻到顶部（用户反馈：开始时向上翻了几下，
+            # 但目标其实在下面）。
+            skip_top = False
+            if target_idx is not None:
+                try:
+                    items0 = self._read_visible_items(refresh=True)
+                except Exception:
+                    items0 = []
+                pos0 = None
+                for it in (items0 or []):
+                    pos0 = self._db_pos(db_posts, it)
+                    if pos0 is not None:
+                        break
+                if pos0 is not None and target_idx > pos0:
+                    skip_top = True
+                    wxlog.debug(
+                        f'目标在下方（target={target_idx} > 当前 pos={pos0}），跳过滚到顶部')
+            if not skip_top:
+                self._scroll_to_top()
+
+        # 方向震荡防护（沿用既有做法：稳定对齐 + 单向收敛，不来回翻）：
+        #   1) 顶部 cell 连续多屏指纹不变 → 视为到底/加载失败，先反向解锁
+        #      一次，仍不变则放弃，避免空转 max_screens（原注释只声明未实现）；
+        #   2) 反向次数上限 max_reversals：往回滚超过上限即改为**只向下**
+        #      扫描到尽头，杜绝“上翻几下又下翻几下”；
+        #   3) |diff|<=proximity 时若仍未命中，用发布者兜底命中对齐条；
+        #      连续多屏都命中不了则停止，不再掉头。
+        stall_key = None
+        stall_count = 0
+        unlock_tried = False
+        max_reversals = 1
+        reversals = 0
+        near_miss = 0
+        downward_only = False
+        last_delta = None
+
+        # 注：顶部指纹复用 _visible_fingerprint()，与 _scroll_to_top 一致
 
         for screen in range(max_screens):
             items = self._read_visible_items(refresh=True)
             if not items:
                 break
 
+            # 0) 卡死检测：顶部指纹连续不变 = 到底/未加载
+            key = self._visible_fingerprint(items)
+            if key is not None and key == stall_key:
+                stall_count += 1
+            else:
+                stall_count = 0
+                stall_key = key
+            if stall_count >= 3:
+                if not unlock_tried:
+                    unlock_tried = True
+                    # 反向解锁：与最近一次滚动方向相反（顶部卡死时上滚无意义）
+                    undo = -last_delta if last_delta else -120
+                    wxlog.debug(f'滚动定位疑似到底/未加载，反向解锁一次（delta={undo}）')
+                    self._scroll(delta=undo, times=3)
+                    last_delta = undo
+                    time.sleep(0.3)
+                    continue
+                wxlog.debug('滚动定位卡死（顶部 cell 多屏不变），放弃')
+                break
+
             # 1) 目标当前可见 -> 命中
             for item in items:
                 if self._matches(item, publisher, keyword):
                     wxlog.debug(f'第 {screen} 屏命中目标朋友圈')
+                    if db_posts:
+                        self._correct_nickname_from_db(db_posts, item)
                     return item
 
             # 2) 无 DB：只能向下逐屏
             if target_idx is None:
-                self._scroll(delta=-120, times=2)
-                time.sleep(0.5)
+                self._scroll(delta=-120, times=3)
+                last_delta = -120
+                time.sleep(0.25)
                 continue
 
-            # 3) 对齐当前顶部 cell 到 DB 索引
+            # 3) 对齐当前顶部 cell 到 DB 索引（先 items[0]，失败再试可见项）
             pos = self._db_pos(db_posts, items[0])
             if pos is None:
-                # 顶部对不上，尝试可见区任意一个可对齐 item
                 for it in items:
                     pos = self._db_pos(db_posts, it)
                     if pos is not None:
                         break
-            if pos is None:
-                # 无法对齐：保守地向下滚一屏
+
+            diff = target_idx - pos if pos is not None else None
+            if diff is None:
+                # 顶部对不上，保守向下滚一屏
                 self._scroll(delta=-120, times=3)
-                time.sleep(0.35)
+                last_delta = -120
+                time.sleep(0.25)
                 continue
 
-            diff = target_idx - pos
             wxlog.debug(f'当前 pos={pos} 目标={target_idx} diff={diff} 屏={screen}')
 
-            # 4) 按距离自适应步长；接近时缩小步长精确逼近
             adiff = abs(diff)
+            direction = 1 if diff >= 0 else -1   # +1=向下(更旧)  -1=向上(更新)
+
+            # 3.1) 已在目标下方：只允许有限次反向，超过即改单向向下，
+            #      否则对齐抖动会让方向反复翻转（上翻几下又下翻几下）
+            if direction < 0:
+                if downward_only or reversals >= max_reversals:
+                    wxlog.debug('反向次数达上限，改为单向向下扫描')
+                    downward_only = True
+                    self._scroll(delta=-120, times=2)
+                    last_delta = -120
+                    time.sleep(0.25)
+                    continue
+                reversals += 1
+
+            # 3.2) 贴近目标索引：不再掉头，用发布者兜底命中；连续失败则停止
             if adiff <= proximity:
-                times, delta = 1, (-120 if diff >= 0 else 120)
-                sleep = 0.45
-            elif adiff <= 20:
-                times, delta, sleep = 2, (-120 if diff > 0 else 120), 0.4
-            elif adiff <= 60:
-                times, delta, sleep = 4, (-120 if diff > 0 else 120), 0.35
+                for it in items:
+                    if publisher and self._matches(it, publisher, None):
+                        wxlog.debug(f'第 {screen} 屏按发布者兜底命中（diff={diff}）')
+                        if db_posts:
+                            self._correct_nickname_from_db(db_posts, it)
+                        return it
+                near_miss += 1
+                if near_miss >= 4:
+                    if downward_only:
+                        wxlog.debug('贴近目标索引但连续多屏未命中且已单向，停止滚动')
+                        break
+                    # 不急着放弃：对齐偏差可能把 pos 拉偏，改为单向向下继续找
+                    wxlog.debug('贴近目标索引但未命中，改为单向向下继续找')
+                    downward_only = True
+                    near_miss = 0
             else:
-                times, delta, sleep = 6, (-120 if diff > 0 else 120), 0.3
+                near_miss = 0
+
+            # 4) 按距离自适应步长；接近时缩小步长精确逼近（同时加快节奏）
+            if adiff <= proximity:
+                # 接近目标：多滚一档避免“还差一次滚动”，并加快节奏
+                times, delta = 2, (-120 if direction > 0 else 120)
+                sleep = 0.25
+            elif adiff <= 20:
+                times, delta, sleep = 3, (-120 if direction > 0 else 120), 0.25
+            elif adiff <= 60:
+                times, delta, sleep = 5, (-120 if direction > 0 else 120), 0.22
+            else:
+                times, delta, sleep = 7, (-120 if direction > 0 else 120), 0.2
+            if downward_only:
+                delta = -120
             self._scroll(delta=delta, times=times)
+            last_delta = delta
             time.sleep(sleep)
 
         wxlog.debug('滚动定位超过最大屏数或到尽头，未命中')
@@ -751,6 +1174,41 @@ class Moment:
     def _more_template(self, theme: str) -> Optional[str]:
         return _asset_path('moments_more_dark.png' if theme == 'dark' else 'moments_more_light.png')
 
+    def _match_template_multi(self, scr, tpl, rleft, rtop, rw, rh,
+                              scales=None, min_ncc: float = 0.65) -> Optional[tuple]:
+        """多尺度模板匹配，返回 (ncc, center_x, center_y, scale) 或 None。
+
+        在该方法之前调用方应保证 rleft/rtop/rw/rh 已裁剪到截图范围内。
+        坐标系说明：scr 为物理像素截图（如 pyautogui 3072x1920），
+        tpl 来自 assets（采集时即物理像素），两者同源即可直接匹配；
+        BoundingRectangle 亦为物理像素（已用 OCR 交叉验证），无需换算。
+        """
+        try:
+            import cv2
+            import numpy as np
+        except Exception as e:
+            wxlog.debug(f'cv2/numpy 不可用：{e}')
+            return None
+        if scales is None:
+            scales = (0.6, 0.7, 0.8, 0.9, 1.0, 1.05, 1.1, 1.15, 1.2)
+        sub = scr[rtop:rtop + rh, rleft:rleft + rw]
+        best = (0.0, None)
+        for s in scales:
+            tw, th = int(tpl.shape[1] * s), int(tpl.shape[0] * s)
+            if tw < 8 or th < 8 or tw >= sub.shape[1] or th >= sub.shape[0]:
+                continue
+            tmp = cv2.resize(tpl, (tw, th), interpolation=cv2.INTER_AREA)
+            res = cv2.matchTemplate(sub, tmp, cv2.TM_CCOEFF_NORMED)
+            _, mx, _, mxloc = cv2.minMaxLoc(res)
+            if mx > best[0]:
+                cx = rleft + mxloc[0] + tw // 2
+                cy = rtop + mxloc[1] + th // 2
+                best = (mx, (int(cx), int(cy), s))
+        if best[0] < min_ncc:
+            return None
+        ncc, (cx, cy, scale) = best
+        return (ncc, cx, cy, scale)
+
     def _find_more_button(self, item: MomentItem,
                           region: Optional[tuple] = None) -> Optional[tuple]:
         """在 cell 右下角用模板匹配定位 “…” 按钮，返回其中心 (x, y) 或 None。
@@ -761,59 +1219,265 @@ class Moment:
         """
         try:
             import pyautogui
+            import numpy as np
         except Exception as e:
-            wxlog.debug(f'pyautogui 不可用：{e}')
+            wxlog.debug(f'pyautogui/numpy 不可用：{e}')
             return None
         br = item.control.BoundingRectangle
         theme = self._theme((br.left, br.top, br.right, br.bottom))
-        tpl = self._more_template(theme)
-        if not tpl:
-            wxlog.debug('缺少 “…” 按钮模板资源')
+        tpls = [self._more_template(theme), self._more_template('light' if theme == 'dark' else 'dark')]
+        try:
+            import cv2
+        except Exception as e:
+            wxlog.debug(f'cv2 不可用：{e}')
             return None
 
         if region is not None:
             rleft, rtop, rw, rh = region
         else:
             left, top, right, bottom = br.left, br.top, br.right, br.bottom
-            rleft, rtop = max(0, left - 10), max(0, top - 10)
-            rw = (right - left) + 20
+            rleft, rtop = max(0, left - 30), max(0, top - 10)
+            rw = (right - left) + 60
             rh = (bottom - top) + 20
+        shot = pyautogui.screenshot()
+        scr = np.array(shot.convert('RGB'))[:, :, ::-1]
+        rw = min(rw, max(1, scr.shape[1] - rleft))
+        rh = min(rh, max(1, scr.shape[0] - rtop))
+        if rw < 16 or rh < 16:
+            return None
+        best = None
+        for tp in tpls:
+            if not tp:
+                continue
+            tpl = cv2.imread(tp)
+            if tpl is None:
+                continue
+            hit = self._match_template_multi(scr, tpl, rleft, rtop, rw, rh)
+            if hit and (best is None or hit[0] > best[0]):
+                best = hit
+        if best is None:
+            wxlog.debug(f'“…” 模板多尺度匹配失败（region=({rleft},{rtop},{rw},{rh})）')
+            return None
+        ncc, cx, cy, scale = best
+        wxlog.debug(f'“…” 匹配 NCC={ncc:.3f} scale={scale:.2f} center=({cx},{cy})')
+        return (cx, cy)
+
+    def _float_region_shot(self, item: MomentItem) -> tuple:
+        """拍摄浮层候选区域，返回 (region, PIL Image) 供点击前后对比。"""
         try:
-            pos = pyautogui.locateOnScreen(tpl, region=(rleft, rtop, rw, rh),
-                                           confidence=0.75)
+            import pyautogui
         except Exception as e:
-            wxlog.debug(f'“…” 模板匹配失败：{e}')
+            wxlog.debug(f'pyautogui 不可用：{e}')
             return None
-        if not pos:
-            return None
-        return (int(pos.left + pos.width // 2), int(pos.top + pos.height // 2))
+        br = item.control.BoundingRectangle
+        left, top, right, bottom = br.left, br.top, br.right, br.bottom
+        w, h = right - left, bottom - top
+        sw, sh = pyautogui.size()
+        rl, rt = max(0, right - 120), max(0, top)
+        rw = min(200, max(1, sw - rl))
+        rh = min(h + 100, max(1, sh - rt))
+        region = (rl, rt, rw, rh)
+        return (region, pyautogui.screenshot(region=region))
+
+    def _float_region_diff(self, before_shot) -> float:
+        """对比点击前后浮层候选区域，返回像素变化比例（0~1）。
+
+        浮层为自绘覆盖层（UIA 不可见），用点击前后截图 diff 判断是否弹出。
+        """
+        if before_shot is None:
+            return 0.0
+        try:
+            import pyautogui
+            import numpy as np
+        except Exception as e:
+            wxlog.debug(f'pyautogui/numpy 不可用：{e}')
+            return 0.0
+        region, before_img = before_shot
+        after = pyautogui.screenshot(region=region)
+        a = np.asarray(before_img.convert('L'), dtype=np.int16)
+        b = np.asarray(after.convert('L'), dtype=np.int16)
+        changed = int((np.abs(a - b) > 30).sum())
+        return changed / float(max(1, region[2] * region[3]))
+
+    def _ensure_window_foreground(self, timeout: float = 2.0) -> bool:
+        """确保微信主窗口为前台窗口。
+
+        微信窗口非前台时，第一次 click 往往只用来激活窗口而被吞掉。
+        先检查 GetForegroundWindow 是否等于主窗口句柄；不是则调用
+        SetForegroundWindow，并再做一次窗口内空白点击确认前台。
+        """
+        import ctypes
+        user32 = ctypes.windll.user32
+        try:
+            hwnd = self._wx._gui.main_hwnd
+        except Exception as e:
+            wxlog.debug(f'获取主窗口句柄失败：{e}')
+            return False
+        if not hwnd:
+            return False
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            try:
+                fg = user32.GetForegroundWindow()
+                if fg == hwnd:
+                    return True
+            except Exception:
+                pass
+            try:
+                user32.SetForegroundWindow(hwnd)
+            except Exception:
+                pass
+            time.sleep(0.3)
+        # 兜底：点击窗口标题栏（顶部）激活，避免误触内容区
+        try:
+            import pyautogui
+            r = user32.GetWindowRect(hwnd)
+            left, top = max(0, r[0]), max(0, r[1])
+            right, bottom = r[2], r[3]
+            if right - left < 100 or bottom - top < 100:
+                return False
+            x = int((left + right) // 2)
+            y = int(top + 25)
+            pyautogui.FAILSAFE = False
+            pyautogui.click(x, y)
+            time.sleep(0.5)
+            return True
+        except Exception as e:
+            wxlog.debug(f'前台激活兜底点击失败：{e}')
+            return False
+
+    def _try_invoke_cell_button(self, item: MomentItem) -> bool:
+        """在 cell 内找可 Invoke/Click 的 ButtonControl 并直接触发一次。
+
+        某些新版微信 self-drawn 的 “…” 按钮在 UIA 里是真实 ButtonControl，
+        但屏幕坐标点击可能因 focus 等原因失效；这里直接走 UIA 模式触发。
+        """
+        try:
+            for child in item.control.GetChildren():
+                try:
+                    if child.ControlTypeName != 'ButtonControl':
+                        continue
+                    if not getattr(child, 'IsVisible', True):
+                        continue
+                except Exception:
+                    continue
+                try:
+                    inv = child.GetPattern('InvokePattern')
+                    if inv is not None:
+                        inv.Invoke()
+                        return True
+                except Exception:
+                    pass
+                try:
+                    child.Click()
+                    return True
+                except Exception:
+                    pass
+        except Exception:
+            return False
+        return False
+
+    def _nudge_to_reveal(self, item: MomentItem) -> tuple:
+        """微调滚动让目标 cell 完整进入视口，返回 (delta, times)。
+
+        原先固定“向下滚 1 格”，对高动态（长文+图+评论）距离不够，导致
+        “…” 按钮始终进不了视口。这里按 cell 与时间线视口的位置关系决定
+        方向与格数：底部被裁→向下滚；顶部被裁→向上滚；已完整可见则小步
+        下移换屏继续找。
+        """
+        vp = self._time_line_rect()
+        try:
+            br = item.control.BoundingRectangle
+            top, bottom = br.top, br.bottom
+        except Exception:
+            return -120, 3
+        if vp is None:
+            return -120, 3
+        vtop, vbottom = vp[1], vp[3]
+        margin = 40          # “…” 按钮贴边会点不到：多留余量（相当于多滚 1 格）
+        if top < vtop:
+            return 120, self._notches_for(vtop - top + margin, hi=6)
+        if bottom > vbottom - margin:
+            return -120, self._notches_for(bottom - vbottom + margin, hi=6)
+        return -120, 2
 
     def _locate_more_click(self, item: MomentItem, max_retry: int = 8) -> bool:
         """定位并点击目标朋友圈的 “…” 按钮，弹出点赞/评论浮层。
 
         未识别到 “…” 时微调滚动让该条完整进入视野后重试，最多 max_retry 次。
-        只点击 “…”；不含后续的点赞/评论动作。
+        每次点击前先确保微信主窗口为前台窗口（否则第一次 click 只激活窗口
+        会被吞掉、浮层不弹）。点击后必须确认浮层已弹出（UIA
+        `_find_float_button('赞'/'评论')` 或 before/after 像素 diff），
+        确认不了就继续重试，最终仍确认不了则返回 False，绝不静默返回 True。
 
         Returns:
-            True 表示识别到并已点击 “…”（浮层应已弹出）。
+            True 表示浮层已确认弹出。
         """
         if max_retry < 1:
             return False
         for attempt in range(max_retry):
             pt = self._find_more_button(item)
             if pt is not None:
+                before_shot = self._float_region_shot(item)
                 try:
                     import pyautogui
-                    pyautogui.click(pt[0], pt[1])
-                    time.sleep(0.6)
-                    return True
+                except Exception as e:
+                    wxlog.debug(f'pyautogui 不可用：{e}')
+                    return False
+                if not self._ensure_window_foreground():
+                    wxlog.debug(f'未能确认微信窗口为前台（第 {attempt + 1} 次）')
+                # moveTo + 短暂停留 + down/up，避免点击过快被丢弃
+                try:
+                    pyautogui.moveTo(pt[0], pt[1], duration=0.1)
+                    time.sleep(0.15)
+                    pyautogui.FAILSAFE = False
+                    pyautogui.mouseDown()
+                    time.sleep(0.05)
+                    pyautogui.mouseUp()
                 except Exception as e:
                     wxlog.debug(f'点击 “…” 失败：{e}')
-                    return False
-            # 未识别到：微调滚动（向下一点）让该条 “…” 完整露出
-            wxlog.debug(f'未识别到 “…”（第 {attempt} 次），微调滚动')
-            self._scroll(delta=-120, times=1)
-            time.sleep(0.4)
+                    time.sleep(1.2)
+                    continue
+                time.sleep(1.2)
+
+                def _verify_float():
+                    diff = self._float_region_diff(before_shot)
+                    if diff >= 0.05:
+                        return True, f'像素变化比例={diff:.3f}'
+                    if self._find_float_button('赞', timeout=0.8) is not None or \
+                            self._find_float_button('评论', timeout=0.8) is not None:
+                        return True, 'UIA 找到 “赞/评论”'
+                    return False, '未见浮层'
+
+                ok, why = _verify_float()
+                if ok:
+                    wxlog.debug(f'点击 “…” 后 {why}（第 {attempt + 1} 次）')
+                    return True
+                wxlog.debug(f'点击 “…” 后 {why}（第 {attempt + 1} 次），尝试 hover 展开')
+                # hover 展开：某些新版微信 “…” 是 hover 触发
+                try:
+                    pyautogui.moveTo(pt[0], pt[1], duration=0.2)
+                    time.sleep(1.5)
+                except Exception:
+                    pass
+                ok, why = _verify_float()
+                if ok:
+                    wxlog.debug(f'hover 后 {why}（第 {attempt + 1} 次）')
+                    return True
+                wxlog.debug(f'hover 后 {why}（第 {attempt + 1} 次），尝试 UIA Invoke')
+                # UIA 直接 Invoke cell 内按钮
+                if self._try_invoke_cell_button(item):
+                    time.sleep(0.8)
+                    ok, why = _verify_float()
+                    if ok:
+                        wxlog.debug(f'UIA Invoke 后 {why}（第 {attempt + 1} 次）')
+                        return True
+                wxlog.debug(f'Invoke 后 {why}（第 {attempt + 1} 次），重试')
+            else:
+                wxlog.debug(f'未识别到 “…”（第 {attempt + 1} 次），微调滚动')
+            _d, _t = self._nudge_to_reveal(item)
+            self._scroll(delta=_d, times=_t)
+            time.sleep(0.25)
         return False
 
 
@@ -934,14 +1598,21 @@ class Moment:
 
         新版本评论输入框为自绘控件，可能没有 UIA EditControl；此时假定
         点击「评论」后输入框已自动聚焦，直接进入输入阶段即可。
+
+        如果 EditControl 存在但 BoundingRectangle 为零（自绘控件 UIA 无法
+        获取屏幕坐标），同样假定已自动聚焦，返回 False 以示区分。
         """
         try:
             root = uia.GetRootControl()
             hit = self._find_edit_control(root, max_depth=30)
             if hit is None:
+                wxlog.debug('未找到评论输入框 EditControl（可能为自绘控件）')
                 return False
             r = hit.BoundingRectangle
             cx, cy = int((r.left + r.right) // 2), int((r.top + r.bottom) // 2)
+            if cx == 0 and cy == 0:
+                wxlog.debug('评论输入框 EditControl 坐标为零，跳过手动聚焦')
+                return False
             import pyautogui
             pyautogui.click(cx, cy)
             time.sleep(0.3)
@@ -1018,19 +1689,40 @@ class Moment:
         rect = self._time_line_rect()
         if rect:
             left, top, right, bottom = rect
-            rh = bottom - top
-            region = (left, max(0, int(top + rh * 0.6)),
-                      right - left, int(rh * 0.4) + 30)
+            rl = left
+            rt = max(0, int(bottom) + 8)
+            rw = (right - left)
+            rh = 80
+            region = (rl, rt, rw, rh)
         try:
-            found = pyautogui.locateOnScreen(tpl, confidence=0.8, region=region)
+            import numpy as np
+            import cv2
+            shot = pyautogui.screenshot()
+            scr = np.array(shot.convert('RGB'))[:, :, ::-1]
+            tpl_img = cv2.imread(tpl)
+            if tpl_img is None:
+                return WxResponse.failure(f'「发送」模板读取失败：{tpl}')
+            if region is None:
+                rl, rt = 0, 0
+                rw, rh = scr.shape[1], scr.shape[0]
+            else:
+                rl, rt, rw, rh = region
+                rl, rt = max(0, rl), max(0, rt)
+                rw = min(rw, max(1, scr.shape[1] - rl))
+                rh = min(rh, max(1, scr.shape[0] - rt))
+            if rw < 16 or rh < 16:
+                return WxResponse.failure('「发送」匹配区域过小')
+            hit = self._match_template_multi(scr, tpl_img, rl, rt, rw, rh,
+                                             scales=(0.7, 0.8, 0.9, 1.0, 1.1, 1.2),
+                                             min_ncc=0.55)
         except Exception as e:
             wxlog.debug(f'识别「发送」按钮失败：{e}')
             return WxResponse.failure(f'识别「发送」按钮失败：{e}')
-        if found is None:
+        if hit is None:
             wxlog.debug('屏幕中未识别到「发送」按钮')
             return WxResponse.failure('屏幕中未识别到「发送」按钮')
-        x = int(found.left + found.width / 2)
-        y = int(found.top + found.height / 2)
+        ncc, x, y, scale = hit
+        wxlog.debug(f'「发送」匹配 NCC={ncc:.3f} scale={scale:.2f} center=({x},{y})')
         try:
             old = pyautogui.FAILSAFE
             pyautogui.FAILSAFE = False
@@ -2027,6 +2719,8 @@ class MomentDB:
 
     def __init__(self, db):
         self.db = db
+        self._media_dl = None
+        self._cache_index = None
 
     # ------------------------------------------------------------------
     # 数据访问
@@ -2245,8 +2939,10 @@ class MomentDB:
             m = re.search(r"\bmd5=\"([0-9a-fA-F]{32})\"", block)
             md5 = m.group(1).lower() if m else ""
             vm = re.search(r"\bvideomd5=\"([0-9a-fA-F]{32})\"", block)
-            msz = re.search(r"<size[^>]*\btotalSize=\"(\d+)\"", block)
-            size = int(msz.group(1)) if msz else 0
+            msz = re.search(r"<size[^>]*\bwidth=\"(\d+)\"\s*height=\"(\d+)\"\s*totalSize=\"(\d+)\"", block)
+            width = int(msz.group(1)) if msz else 0
+            height = int(msz.group(2)) if msz else 0
+            size = int(msz.group(3)) if msz else 0
             is_video = any(ext in url.lower() for ext in (".mp4", ".mov", ".avi")) \
                 or vm is not None \
                 or re.search(r"<videoDuration>\s*[1-9]", block) \
@@ -2255,6 +2951,8 @@ class MomentDB:
                 "md5": (vm.group(1).lower() if vm else md5),
                 "url": url,
                 "size": size,
+                "width": width,
+                "height": height,
             }
             if is_video:
                 videos.append(entry)
@@ -2365,60 +3063,293 @@ class MomentDB:
     def _cache_root(db) -> str:
         return os.path.join(db.account_dir, "cache")
 
-    def find_local_media(self, md5: str, kind: str = "image",
-                         size: int = 0) -> Optional[str]:
-        """在 cache/<月>/Sns/<Img|Video>/<md5前两位> 下按 md5 查找本地缓存。
+    def _get_downloader(self):
+        """按需创建共享的 MediaDownloader（缓存实例）。"""
+        if self._media_dl is None:
+            from wechatauto.media import MediaDownloader
+            self._media_dl = MediaDownloader(self.db)
+        return self._media_dl
 
-        微信把 Sns 缩略图/媒体按内容哈希散列到 ``Sns/Img|Video/xx/`` 分桶，
-        文件名通常是该 md5 的前缀或后缀（可能与 feed 里的 url md5 不完全一致，
-        这里做前缀与后缀双向匹配）。``size`` 非 0 时，md5 未命中的情况下
-        再按文件大小近似匹配一次（对 Video 明文缓存尤其有用），未命中返回 None。
+    def decrypt_cache(self, path: str) -> Optional[bytes]:
+        """解密朋友圈 Sns 缓存容器，返回明文（图片 JPEG / 视频 MP4）。
+
+        缓存是 ``070856320807`` 开头的 V2 加密容器；解密依赖微信主库
+        的 key 派生。若输入文件不是 V2 容器则原样返回其字节。
+        """
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+        except OSError as e:
+            wxlog.debug(f'读取缓存失败：{e}')
+            return None
+        if raw.startswith(b"\x07\x08"):
+            try:
+                return self._get_downloader().decrypt_image(path)
+            except Exception as e:
+                wxlog.debug(f'解密缓存失败：{path} {e}')
+                return None
+        return raw or None
+
+    def _build_cache_index(self, kind: str = "image"):
+        """一次性扫描 Sns 缓存并建立索引，避免每次匹配全树解密。
+
+        索引：``{(w, h): [(plain_size, path), ...]}`` 与 ``{plain_size: [path, ...]}``。
+        微信 Sns 缓存带 31 字节 V2 容器头，明文尺寸=文件尺寸-31（视频/图片通用，
+        个别文件可能有偏差，仍以实测为准）。缓存是易失的，每次调用都会重扫目录
+        结构（廉价），但只在文件集合变化时才重新解密。
+
+        Returns:
+            dict: 含 ``"dims"``、``"sizes"``、``"files"`` 三张表。
+        """
+        base = self._cache_root(self.db)
+        files = []
+        for mon in sorted(os.listdir(base)):
+            d_root = os.path.join(base, mon, "Sns", "Img" if kind == "image" else "Video")
+            if not os.path.isdir(d_root):
+                continue
+            for bucket in sorted(os.listdir(d_root)):
+                bd = os.path.join(d_root, bucket)
+                if not os.path.isdir(bd):
+                    continue
+                for f in sorted(os.listdir(bd)):
+                    p = os.path.join(bd, f)
+                    if os.path.isfile(p):
+                        try:
+                            files.append((p, os.path.getsize(p), os.path.getmtime(p)))
+                        except OSError:
+                            continue
+        files.sort()
+        sig = tuple((p, sz, mt) for p, sz, mt in files)
+        if self._cache_index is not None and self._cache_index.get("sig") == sig:
+            return self._cache_index
+
+        idx = {"sig": sig, "dims": {}, "sizes": {}, "fail": 0}
+        if not files:
+            self._cache_index = idx
+            return idx
+        md = self._get_downloader()
+        for p, fsz, _ in files:
+            data = self.decrypt_cache(p)
+            w = h = 0
+            if data and data.startswith(b"\xff\xd8"):
+                try:
+                    w, h = Image.open(io.BytesIO(data)).size
+                except Exception:
+                    w = h = 0
+            plain_size = len(data) if data else -1
+            if w and h:
+                idx["dims"].setdefault((w, h), []).append((plain_size, p))
+            if plain_size > 0:
+                idx["sizes"].setdefault(plain_size, []).append(p)
+            else:
+                idx["fail"] += 1
+        self._cache_index = idx
+        return idx
+
+    def find_local_candidates(self, md5: str, kind: str = "image",
+                              size: int = 0, width: int = 0,
+                              height: int = 0,
+                              limit: int = 3) -> List[dict]:
+        """按内容特征查找 Sns 缓存候选，返回**排序后的候选列表**。
+
+        微信缓存文件名是不透明 32 位会话 key，与 feed 的 url md5 **无代数映射**，
+        只能按内容特征匹配。匹配规则（OpenClaw 验收结论）：
+
+        - 宽高 ``(w, h)`` 是主判据：与 feed ``<size width height/>`` **精确相等**
+          的候选进入列表，优先；宽高为 0（未知）时跳过主判据。
+        - 明文字节数降为**加分项**（微信常存重编码版，字节数仅供消歧排序），
+          不再作为硬门槛。
+        - 无精确宽高命中时，只有 feed 宽高**未知**且「候选唯一 + 明文偏差
+          ≤32B」才退回 1 个 near-size 候选；多候选/偏差大一律返回空，
+          避免字节数接近但内容无关的图被当作命中。
+        - 存在多个 dims 候选时（同一尺寸多张图），加分排序后返回候选列表，
+          **不静默取第一个**，由 `find_local_media` 用 size 消歧或拒绝。
+
+        Args:
+            md5: feed 媒体的 md5（用于区分图片/视频子目录，非匹配键）。
+            kind: ``"image"`` / ``"video"``。
+            size: feed 的 ``<size totalSize/>``（CDN 原图字节数，加分项）。
+            width/height: feed 的 ``<size width/height>``（主判据）。
+            limit: 最多返回候选数。
+
+        Returns:
+            排序后的候选 dict 列表，每项含 ``path``、``width``、``height``、
+            ``plain_size``、``score``。无候选返回空列表。
         """
         if len(md5) < 2:
+            return []
+        base = self._cache_root(self.db)
+        if not os.path.isdir(base):
+            return []
+        idx = self._build_cache_index(kind)
+        scored = []
+
+        # 精确宽高命中
+        if width and height:
+            for plain_size, p in idx["dims"].get((width, height), []):
+                score = 100.0
+                # 加分项：明文尺寸与 feed totalSize 越接近分越高
+                if size > 0:
+                    d = abs(plain_size - size)
+                    score += 50.0 if d <= 64 else 20.0 if d <= 512 else 0.0
+                scored.append({
+                    "path": p, "width": width, "height": height,
+                    "plain_size": plain_size, "score": score, "hit": "dims",
+                })
+
+        # 无精确宽高命中时的兜底：仅当 feed 宽高**未知**（0/0）且「候选唯一 +
+        # 明文偏差极小(≤32B)」才收一个 near-size 候选（OpenClaw P0：命中即整图，
+        # 绝不能在宽高对不上时用字节数接近的图冒充）。宽高已知时必须用宽高
+        # 精确匹配，bytes 只能作排序加分项。
+        if not scored and size > 0 and not (width and height):
+            near = []
+            for p, fsz, _ in self._scan_cached_files(base, "Img" if kind == "image" else "Video"):
+                if abs(fsz - (size + 31)) <= 128:
+                    data = self.decrypt_cache(p)
+                    if not data:
+                        continue
+                    w = h = 0
+                    if data.startswith(b"\xff\xd8"):
+                        try:
+                            w, h = Image.open(io.BytesIO(data)).size
+                        except Exception:
+                            pass
+                    near.append({
+                        "path": p, "width": w, "height": h,
+                        "plain_size": len(data), "fsz": fsz,
+                    })
+            if near:
+                deviation = min(abs(c["plain_size"] - size) for c in near)
+                if deviation <= 32:
+                    best = [c for c in near
+                            if abs(c["plain_size"] - size) == deviation]
+                    if len(best) == 1:
+                        c = best[0]
+                        score = 100.0 - deviation / max(size, 1) * 100.0
+                        scored.append({
+                            "path": c["path"], "width": c["width"],
+                            "height": c["height"], "plain_size": c["plain_size"],
+                            "score": score, "hit": "near-size",
+                        })
+
+        scored.sort(key=lambda c: c["score"], reverse=True)
+        scored = scored[:limit]
+        # 多候选歧义（宽高已知且 >1 个 dims 命中）时不再静默取第一个：
+        # 让调用方看到候选列表，由 find_local_media 用 size 消歧或拒绝。
+        return scored
+
+    def _scan_cached_files(self, base: str, sub: str):
+        for mon in sorted(os.listdir(base)):
+            d_root = os.path.join(base, mon, "Sns", sub)
+            if not os.path.isdir(d_root):
+                continue
+            for bucket in sorted(os.listdir(d_root)):
+                bd = os.path.join(d_root, bucket)
+                if not os.path.isdir(bd):
+                    continue
+                for f in sorted(os.listdir(bd)):
+                    p = os.path.join(bd, f)
+                    if os.path.isfile(p):
+                        try:
+                            yield p, os.path.getsize(p), os.path.getmtime(p)
+                        except OSError:
+                            continue
+
+    def find_local_media(self, md5: str, kind: str = "image",
+                         size: int = 0, width: int = 0,
+                         height: int = 0) -> Optional[str]:
+        """在 Sns 缓存里按内容特征查找本地缓存，返回最佳命中路径。
+
+        消歧策略（第三轮 OpenClaw 验收）：单一 dims 候选直接采纳；
+        同尺寸多候选时用 ``size`` 绝对偏差消歧，但**偏差不得超过
+        ``_MAX_SIZE_DEV=512B``（绝对）或相对 feed size 的 10%**——
+        真图不在缓存 + 同尺寸有多张缓存图时，宁返回 None 也不让
+        另一张无关图冒充命中。
+
+        Args:
+            md5: feed 媒体的 md5（区分图片/视频子目录）。
+            kind: ``"image"`` / ``"video"``。
+            size: feed 的 ``<size totalSize/>``（加分项）。
+            width/height: feed 的 ``<size width/height>``（主判据）。
+
+        Returns:
+            最佳命中的缓存文件绝对路径；未命中返回 None。
+        """
+        if kind == "video":
+            return self._find_local_video(md5, size)
+        cands = self.find_local_candidates(md5, kind, size=size,
+                                           width=width, height=height, limit=3)
+        if not cands:
             return None
-        sub = "Img" if kind == "image" else "Video"
-        prefix, suffix = md5[:2], md5[-2:]
+        dims_hit = [c for c in cands if c["hit"] == "dims"]
+        if dims_hit:
+            # 宽高精确命中
+            if len(dims_hit) == 1:
+                return dims_hit[0]["path"]
+            # 同尺寸多张图：用 size 消歧（唯一最小值才采纳，且偏差受限）
+            if size > 0:
+                max_dev = max(_MAX_SIZE_DEV, size * 0.10)
+                devs = [abs(c["plain_size"] - size) for c in dims_hit]
+                best_d = min(devs)
+                if best_d > max_dev:
+                    wxlog.info(f'多候选消歧偏差 {best_d}B 超上限 '
+                               f'({max_dev:.0f}B)，真图可能不在缓存，'
+                               f'返回 None 拒绝冒充')
+                    return None
+                best = [c for c, d in zip(dims_hit, devs) if d == best_d]
+                if len(best) == 1:
+                    return best[0]["path"]
+            wxlog.info(f'较多候选歧义（{len(dims_hit)} 张同尺寸图），'
+                       f'size={size} 无法唯一消歧，返回 None 待调用方处理')
+            return None
+        # 仅 near-size 候选：find_local_candidates 已保证唯一 + 极小偏差
+        if len(cands) == 1:
+            return cands[0]["path"]
+        return None
+
+    def _find_local_video(self, md5: str, size: int) -> Optional[str]:
+        """视频缓存按字节数匹配（跨桶查找），**明文优先、结果确定**。
+
+        demo 视频缓存可能有两种形态：纯明文 mp4（文件尺寸 == feed totalSize）
+        或带 31 字节 V2 容器头（文件尺寸 == totalSize + 31）。两者都接受。
+        同内容两版共存时优先明文版（直接可用、少一步解密），不依赖扫描顺序：
+        先扫一遍记录明文组（|fsz-size|≤8）与容器组（|fsz-(size+31)|≤8），
+        明文组有最佳候选则返回之，否则回退容器组。当前环境视频缓存为空，
+        行为由本方法的可复现测试（构造假缓存）验证。
+        """
+        if len(md5) < 2 or size <= 0:
+            return None
         base = self._cache_root(self.db)
         if not os.path.isdir(base):
             return None
-
-        def match(name: str) -> bool:
-            base_n = os.path.splitext(name)[0]
-            return base_n.startswith(md5) or base_n.endswith(md5) \
-                or md5.startswith(base_n) or md5.endswith(base_n)
-
-        # 1) 先按 md5 精确/前缀匹配
-        for mon in os.listdir(base):
-            for bucket in (prefix, suffix):
-                d = os.path.join(base, mon, "Sns", sub, bucket)
-                if not os.path.isdir(d):
+        plain_best = None   # (deviation, path)
+        cont_best = None    # (deviation, path)
+        for mon in sorted(os.listdir(base)):
+            d_root = os.path.join(base, mon, "Sns", "Video")
+            if not os.path.isdir(d_root):
+                continue
+            for bucket in sorted(os.listdir(d_root)):
+                bd = os.path.join(d_root, bucket)
+                if not os.path.isdir(bd):
                     continue
-                try:
-                    for f in os.listdir(d):
-                        p = os.path.join(d, f)
-                        if os.path.isfile(p) and match(f):
-                            return p
-                except OSError:
-                    continue
-        # 2) 未命中且指定了 size：遍历整个 media 树按文件大小近似匹配
-        #    （视频缓存文件名是内容哈希、分桶与 feed md5 无关，须跨桶查找）
-        if size:
-            for mon in os.listdir(base):
-                d_root = os.path.join(base, mon, "Sns", sub)
-                if not os.path.isdir(d_root):
-                    continue
-                if sub == "Video":
+                for f in sorted(os.listdir(bd)):
+                    p = os.path.join(bd, f)
+                    if not os.path.isfile(p):
+                        continue
                     try:
-                        for bucket in os.listdir(d_root):
-                            bd = os.path.join(d_root, bucket)
-                            if not os.path.isdir(bd):
-                                continue
-                            for f in os.listdir(bd):
-                                p = os.path.join(bd, f)
-                                if os.path.isfile(p) and os.path.getsize(p) == size:
-                                    return p
+                        fsz = os.path.getsize(p)
                     except OSError:
                         continue
+                    if abs(fsz - size) <= 8:
+                        if plain_best is None or abs(fsz - size) < plain_best[0]:
+                            plain_best = (abs(fsz - size), p)
+                    if abs(fsz - (size + 31)) <= 8:
+                        if cont_best is None or abs(fsz - (size + 31)) < cont_best[0]:
+                            cont_best = (abs(fsz - (size + 31)), p)
+        if plain_best:
+            return plain_best[1]
+        if cont_best:
+            return cont_best[1]
         return None
 
     def download_media(self, media: dict, save_dir: Optional[str] = None,
@@ -2432,26 +3363,71 @@ class MomentDB:
             kind: ``"image"`` 或 ``"video"``，决定本地缓存子目录。
 
         Returns:
-            保存后的文件绝对路径；失败或缺少 md5/url 时返回 None。
+            保存后的文件绝对路径；失败返回 None（具体原因见日志，
+            或改用 :meth:`download_media_detailed` 拿到结构化结果）。
+        """
+        res = self.download_media_detailed(media, save_dir, kind)
+        return res.get("path")
+
+    def download_media_detailed(self, media: dict, save_dir: Optional[str] = None,
+                                kind: str = "image") -> dict:
+        """下载图片/视频并返回**结构化结果**（含失败原因）。
+
+        两条路都可能失败：本地缓存未命中、缓存解密失败、URL 缺失、
+        URL 拉取失败。此方法不静默丢弃，而是把原因明确返回/记录，
+        让「下载了 0 个文件」有可解释来源。
+
+        Returns:
+            dict: ``{"status", "path", "reason", "media"}``。
+            ``status`` 取 ``ok`` / ``no-cache`` / ``cache-decrypt-failed`` /
+            ``url-missing`` / ``url-dead`` / ``write-failed``。
         """
         save_dir = save_dir or os.path.join(
             os.path.expanduser("~"), "Documents", "wechatauto_moments"
         )
-        os.makedirs(save_dir, exist_ok=True)
+        try:
+            os.makedirs(save_dir, exist_ok=True)
+        except OSError as e:
+            wxlog.error(f'创建保存目录失败：{e}')
+            return {"status": "write-failed", "path": None,
+                    "reason": f"mkdir: {e}", "media": media}
         media = media or {}
         md5 = media.get("md5")
         size = media.get("size") or 0
-        local = self.find_local_media(md5, kind, size=size) if md5 else None
+        width = media.get("width") or 0
+        height = media.get("height") or 0
         url = media.get("url") or ""
 
+        local = None
+        if md5:
+            local = self.find_local_media(md5, kind, size=size,
+                                          width=width, height=height)
+            if local and not os.path.isfile(local):
+                local = None
+
         if local:
-            src = local
-            with open(src, "rb") as f:
-                data = f.read()
-            name = os.path.basename(src)
+            data = self.decrypt_cache(local)
+            if not data:
+                wxlog.error(f'缓存解密失败：{local}')
+                return {"status": "cache-decrypt-failed", "path": None,
+                        "reason": f"decrypt failed: {local}", "media": media}
+            if md5:
+                if kind == "video" or not data.startswith(b"\xff\xd8"):
+                    name = "%s.mp4" % md5
+                else:
+                    name = "%s.jpg" % md5
+            else:
+                name = os.path.basename(local)
         else:
             if not url:
-                return None
+                # no-cache（有 md5 但本地命中 none）与 url-missing（连 md5 都
+                # 没有、无 URL 可兜底）是两种独立状态，均可达。
+                if md5:
+                    return {"status": "no-cache", "path": None,
+                            "reason": "md5 given but no local cache hit and no url",
+                            "media": media}
+                return {"status": "url-missing", "path": None,
+                        "reason": "media has neither md5 nor url", "media": media}
             try:
                 import urllib.request
                 req = urllib.request.Request(
@@ -2459,18 +3435,34 @@ class MomentDB:
                 )
                 data = urllib.request.urlopen(req, timeout=20).read()
             except Exception as e:
-                wxlog.debug(f'下载朋友圈媒体失败：{e}')
-                return None
+                wxlog.error(f'URL 拉取失败：{url} {e}')
+                return {"status": "url-dead", "path": None,
+                        "reason": f"urlopen: {e}", "media": media}
             if kind == "video" or url.lower().endswith((".mp4", ".mov", ".avi")):
                 ext = ".mp4"
             else:
-                ext = os.path.splitext(url)[1].lower() or ".jpg"
-            name = "%s%s" % (md5 or os.path.basename(url) or "media", ext)
+                tail = os.path.splitext(url.rsplit("?", 1)[0])[1].lower()
+                ext = tail if tail in (".jpg", ".jpeg", ".png", ".gif", ".webp") else ".jpg"
+            stem = md5
+            if not stem:
+                import re
+                base = url.rsplit("?", 1)[0].rstrip("/")
+                base = os.path.basename(base)
+                if base:
+                    stem = re.sub(r"[^0-9a-zA-Z._-]", "_", base)
+                else:
+                    stem = "media"
+            name = "%s%s" % (stem, ext)
 
         out = os.path.join(save_dir, name)
-        with open(out, "wb") as f:
-            f.write(data)
-        return out
+        try:
+            with open(out, "wb") as f:
+                f.write(data)
+        except OSError as e:
+            wxlog.error(f'写文件失败：{out} {e}')
+            return {"status": "write-failed", "path": None,
+                    "reason": f"write: {e}", "media": media}
+        return {"status": "ok", "path": out, "reason": None, "media": media}
 
     def download_moment_media(self, feed: dict, save_dir: Optional[str] = None,
                               images: bool = True, videos: bool = True,
@@ -2505,14 +3497,205 @@ class MomentDB:
             return []
 
         saved: List[str] = []
+        failures: List[dict] = []
         for img in (feed.get("images") or []):
             if images:
-                p = self.download_media(img, target, "image")
-                if p:
-                    saved.append(p)
+                res = self.download_media_detailed(img, target, "image")
+                if res.get("path"):
+                    saved.append(res["path"])
+                elif res.get("status") != "ok":
+                    failures.append(res)
         for vid in (feed.get("videos") or []):
             if videos:
-                p = self.download_media(vid, target, "video")
-                if p:
-                    saved.append(p)
+                res = self.download_media_detailed(vid, target, "video")
+                if res.get("path"):
+                    saved.append(res["path"])
+                elif res.get("status") != "ok":
+                    failures.append(res)
+        if failures:
+            by = {}
+            for f in failures:
+                s = f.get("status")
+                by[s] = by.get(s, 0) + 1
+            wxlog.info(f'朋友圈媒体下载部分失败：{by} 成功={len(saved)}')
         return saved
+
+    # ------------------------------------------------------------------
+    # 观察即固化（P0-1）：把易失的 Sns 缓存转成持久映射 + 解密字节
+    # ------------------------------------------------------------------
+    def snapshot_cache_keys(self) -> dict:
+        """快照当前 Sns 缓存全部 key（key = 目录2位 + 文件名30位）。
+
+        Returns:
+            ``{(month, kind, key): path}`` 全量字典。
+        """
+        base = self._cache_root(self.db)
+        out = {}
+        if not os.path.isdir(base):
+            return out
+        for mon in os.listdir(base):
+            sns_dir = os.path.join(base, mon, "Sns")
+            if not os.path.isdir(sns_dir):
+                continue
+            for kind in ("Img", "Video"):
+                kd = os.path.join(sns_dir, kind)
+                if not os.path.isdir(kd):
+                    continue
+                for b in os.listdir(kd):
+                    bd = os.path.join(kd, b)
+                    if not os.path.isdir(bd):
+                        continue
+                    for f in os.listdir(bd):
+                        p = os.path.join(bd, f)
+                        if os.path.isfile(p):
+                            out[(mon, kind, b + f)] = p
+        return out
+
+    def diff_cache_keys(self, before: dict,
+                        after: Optional[dict] = None) -> dict:
+        """对比两次快照，返回**新增**的缓存 key→路径。"""
+        after = after if after is not None else self.snapshot_cache_keys()
+        return {k: p for k, p in after.items() if k not in before}
+
+    @staticmethod
+    def _export_root(base=None) -> str:
+        """持久导出根目录（默认 ~/Documents/wechatauto_moments/_cache_export）。"""
+        return os.path.join(base or os.path.join(
+            os.path.expanduser("~"), "Documents", "wechatauto_moments"),
+            "_cache_export")
+
+    def export_cache_key(self, key, path, export_dir=None,
+                         tid: Optional[int] = None,
+                         username: str = "", nickname: str = "",
+                         create_time: int = 0,
+                         media_index: int = 0,
+                         kind: str = "image",
+                         mapping_path: Optional[str] = None) -> dict:
+        """把单个缓存 key 解密并固化到持久目录，同时写映射条目。
+
+        幂等：映射文件里已记录该 key（相同 sha256）时直接跳过，不重复导出
+        （验收标准 2）。
+
+        Args:
+            key: ``(month, kind, key_string)`` 三元组。
+            path: 缓存文件绝对路径。
+            export_dir: 持久目录，默认 ``<export_root>/<tid>``。
+            tid/username/nickname/create_time/media_index/kind: 映射元数据。
+            mapping_path: 映射 JSON 路径（默认 ``<export_root>/mapping.json``）。
+
+        Returns:
+            dict: ``{"status", "exported", "sha256", "path", "group"}``。
+        """
+        month, ckind, kstr = key
+        root = self._export_root()
+        try:
+            os.makedirs(root, exist_ok=True)
+        except OSError as e:
+            return {"status": "error", "reason": f"mkdir: {e}"}
+
+        mapping_path = mapping_path or os.path.join(root, "mapping.json")
+        mdir = os.path.dirname(mapping_path)
+        if mdir:
+            try:
+                os.makedirs(mdir, exist_ok=True)
+            except OSError as e:
+                return {"status": "error", "reason": f"mkdir mapping dir: {e}"}
+        mapping = {}
+        if os.path.isfile(mapping_path):
+            try:
+                with open(mapping_path, "r", encoding="utf-8") as fp:
+                    mapping = json.load(fp)
+            except Exception:
+                mapping = {}
+
+        data = self.decrypt_cache(path)
+        if not data:
+            return {"status": "decrypt-failed", "key": key, "path": path}
+
+        sha = hashlib.sha256(data).hexdigest()
+        # 幂等 1：同一 key + 同一 sha256 已导出 → 跳过
+        existing = mapping.get(kstr)
+        if existing and existing.get("sha256") == sha:
+            return {"status": "skip", "exported": False,
+                    "sha256": sha, "path": existing.get("path")}
+        # 幂等 2（跨 key 内容级去重）：缓存易失、每轮下载 key 可能重生成，
+        # 但同一视觉动态的**解密字节一致**。已导出过该 sha256 → 跳过，
+        # 并把新 key 记别名指向既有导出，避免内容级重复导出。
+        for other_key, other in mapping.items():
+            if other.get("sha256") == sha:
+                mapping.setdefault("_aliases", {})[kstr] = other_key
+                try:
+                    with open(mapping_path, "w", encoding="utf-8") as fp:
+                        json.dump(mapping, fp, ensure_ascii=False, indent=2)
+                except OSError:
+                    pass
+                return {"status": "skip", "exported": False,
+                        "sha256": sha, "path": other.get("path"),
+                        "alias_of": other_key}
+
+        group = str(tid) if tid else "unknown"
+        group_dir = export_dir or os.path.join(root, group)
+        try:
+            os.makedirs(group_dir, exist_ok=True)
+        except OSError as e:
+            return {"status": "error", "reason": f"mkdir group: {e}"}
+
+        fname = kstr + ("." + ("mp4" if not data.startswith(b"\xff\xd8") else "jpg"))
+        out_path = os.path.join(group_dir, fname)
+        try:
+            with open(out_path, "wb") as fp:
+                fp.write(data)
+        except OSError as e:
+            return {"status": "error", "reason": f"write: {e}"}
+
+        entry = {
+            "key": kstr, "month": month, "cache_kind": ckind,
+            "sha256": sha, "path": out_path,
+            "tid": tid, "username": username, "nickname": nickname,
+            "create_time": create_time, "media_index": media_index,
+            "feed_kind": kind,
+            "captured_at": int(time.time()),
+        }
+        mapping[kstr] = entry
+        try:
+            with open(mapping_path, "w", encoding="utf-8") as fp:
+                json.dump(mapping, fp, ensure_ascii=False, indent=2)
+        except OSError as e:
+            return {"status": "error", "reason": f"mapping write: {e}"}
+        return {"status": "ok", "exported": True, "sha256": sha,
+                "path": out_path, "group": group}
+
+    def poll_new_cache_keys(self, before: dict, poll_interval: float = 0.3,
+                            timeout: float = 15.0) -> dict:
+        """轮询新增缓存 key（点击开大图 / 滚动加载触发下载后调用）。
+
+        Args:
+            before: ``snapshot_cache_keys()`` 的基线。
+            poll_interval: 轮询间隔秒。
+            timeout: 总超时秒。
+
+        Returns:
+            新增 key→路径 字典；超时返回空。
+        """
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            new = self.diff_cache_keys(before)
+            if new:
+                return new
+            time.sleep(poll_interval)
+        return {}
+
+    def export_new_keys(self, new_keys: dict, tid: Optional[int] = None,
+                        username: str = "", nickname: str = "",
+                        create_time: int = 0,
+                        default_kind: str = "image") -> List[dict]:
+        """把轮询到的全部新增 key 固化导出（逐个字节固化到持久目录）。"""
+        out = []
+        for (month, kind, kstr), p in sorted(new_keys.items()):
+            feed_kind = "video" if kind == "Video" else default_kind
+            r = self.export_cache_key(
+                (month, kind, kstr), p, tid=tid,
+                username=username, nickname=nickname,
+                create_time=create_time, kind=feed_kind)
+            out.append(r)
+        return out

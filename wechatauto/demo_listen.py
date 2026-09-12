@@ -8,7 +8,7 @@
 例：
     python demo_listen.py wxid_xxx 123456@chatroom
     python demo_listen.py 兔仔仔 我的群    # 昵称/备注会自动映射到会话 username
-    python demo_listen.py --all             # 监听所有非隐藏会话
+    python demo_listen.py --all             # 监听全部会话（运行中自动发现新会话）
 
 ⚠️ 注意：
     names 里最终匹配的是「会话 username」——即 get_sessions() 返回的
@@ -80,31 +80,35 @@ def main():
     print(f"账号：{info.get('nick_name') or info.get('username')}")
 
     # 1. 列出当前会话，供挑选（username 就是监听必须使用的值）
-    sessions = db.get_sessions(limit=30)
+    sessions = db.get_sessions(limit=500)
     #print(f"\n当前会话（共 {len(sessions)} 个，最近 15 个，请把 username 填入 names）：")
     #for s in sessions[:15]:
         #print(f"  {s['username']:<24} 未读={s['unread']}  {s['summary'][:24] or ''}")
 
-    # 2. 确定监听目标
-    if all_chats:
-        names = [s["username"] for s in sessions]
-    elif not names:
-        names = ["送你挖银子"]
-    if not names:
-        print("未找到任何会话，退出")
-        sys.exit(1)
-
-    # 3. 昵称/备注 → username 映射
-    resolved = [resolve_name(db, sessions, n) for n in names]
-    for raw, got in zip(names, resolved):
-        if raw != got:
-            print(f"  「{raw}」→ {got}")
-
-    # 4. 注册监听（回调在后台线程触发）
+    # 2. 注册监听（回调在后台线程触发；水位自动落盘，重启不重复推送）
     lst = Listener(db, interval=1.0)
-    for name in resolved:
-        lst.add_listener(name, make_callback(db, name))
-        print(f"  监听：{name}")
+    if all_chats:
+        # 全局监听：用 add_all(discover=True) 自动发现新会话，
+        # 不局限于启动时的会话清单（之前只取最近 30 个，之后新会话不会加入）
+        def on_all(msg: dict, _lst: Listener):
+            chat = msg.get("username", "")
+            sender = sender_name(db, msg["sender_id"])
+            t = fmt_time(msg["create_time"])
+            print(f"[{t}] {chat} | {sender} ({msg['type']}) {msg['content']}")
+
+        lst.add_all(on_all, discover=True)
+        print("  全局监听：已注册现有会话，运行中自动发现新会话")
+    else:
+        if not names:
+            names = ["送你挖银子"]
+        # 昵称/备注 → username 映射
+        resolved = [resolve_name(db, sessions, n) for n in names]
+        for raw, got in zip(names, resolved):
+            if raw != got:
+                print(f"  「{raw}」→ {got}")
+        for name in resolved:
+            lst.add_listener(name, make_callback(db, name))
+            print(f"  监听：{name}")
 
     print("\n开始监听（Ctrl+C 停止）...")
     lst.start()

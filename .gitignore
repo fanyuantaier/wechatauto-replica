@@ -27,3 +27,6 @@ COMMIT_MSG.txt
 
 # sibling repo
 WeChatBot-new/
+
+# runtime scratch
+tmp_sns_mapping/

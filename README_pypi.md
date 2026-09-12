@@ -32,7 +32,7 @@
 本项目复刻上游 wxauto 项目，目标是实现对当前微信 4.x Windows 客户端的自动化
 （读取消息、发送消息、媒体下载、朋友圈），非网页版，直接操作本机客户端。
 
-> 当前版本：1.2.1
+> 当前版本：1.2.2
 >
 > **兼容范围**：Windows 10/11 ｜ Python 3.9+（已在 3.12 验证）｜ 微信 **4.1.12+**
 > （数据库读取路线对微信版本不敏感；坐标+OCR 发送路线依赖 4.1.12+ 自绘渲染
@@ -57,6 +57,19 @@
 ---
 
 ## 版本记录
+
+### v1.2.2（2026-09-12）
+
+- **修复跨分片消息读取（消息/语音不全）**：同一会话的 `Msg_<md5>` 表实际横跨多个 `message_*.db` 分片，而 `get_messages` 只命中第一个分片——实测某会话真实 8904 条消息（24 条语音）此前只返回 1 条。新增 `_find_msg_tables()` / `_msg_conns()` / `_shard_rows()`，跨全部分片合并后按 `sort_seq` 排序；`get_messages`、`get_new_messages`、`_find_media_rows` 均改用合并视图。`get_message_row` 新增 `local_type` 过滤（`local_id` 跨分片**不唯一**），并新增 `get_message_rows_for_media()` 返回全部分片命中行；媒体下载各方法传入类型码以选中正确分片行。
+- **监听可靠投递（行为变更）**：水位改为**回调成功后才推进**（新增 `_inflight` 分派边界，回调未确认前不重复分派同一消息），回调失败按 `max_retries`（默认 3 次）重试后再记丢弃；水位自动落盘 `listener_watermark.json`。进程停机期间到达的消息会在下次启动时补投，不再被静默跳过。传 `watermark_file=""` 可关闭落盘。
+- **文本还原不再要求含中文**：纯英文 / 纯数字 / URL / Emoji 的容器格式消息不再退化成 `[文本]`（改为可打印率 + 字符类别双重判定）。
+- **`Chat.GetNewMessage()` 不再丢积压**：单批 200 条以上时连续分批拉取直到追平，水位只推进到**实际取回**的最后一条，不再直接跳到库内最新位置。
+- **UIA 物化自愈（微信重启/升级后子控件全扫不到）**：微信重启或升级后 Qt accessibility gate 字节归零，`mmui::` 树退化为 Qt 空壳（`Qt51514QWindowIcon` + 2 个节点，扫不到任何控件）。现在会热写 gate → **校验 `mmui::` 是否真的出现** → 失败自动换候选 RVA 重试（真正生效过的 RVA 按 DLL 身份缓存）；`_get_uia()` 增加 30s 节流自愈，不再「一次唤醒失败就永久降级 OCR」，也不再需要人工 `refresh=True`。兜底表补 `4.1.13.65 → 0x0AE2B0C8`。
+- **朋友圈滚动定位修复**：加入反向上限（每轮最多反向 1 次，之后单向向下）与卡死检测（顶部指纹改为含包围盒几何——合并布局整屏复用 ListItem、同名 cell 不再误判「卡死」而中途放弃）；DB 标尺判断目标在下方时**跳过「先滚到顶部」**；停止判据改为**下一条朋友圈 UIA 出现即停**；方向与距离修正（被裁像素换算滚轮格数）+ 底部余量，解决「翻的距离不够、够不到 … 按钮」。
+- **消息类型表**：支持微信 4.x 复合 `local_type`（按低 32 位分解真实类型）；新增 `50 音视频通话`（`<voipmsg>` 气泡）、`11000 动画表情`、`8594229559345 红包`（库侧此前被低 8 位映射误标为「文件/链接/卡片」）；空正文（表情/贴纸类）显示 `[动画表情]` 占位；`demo_group_messages` 对所有类型统一 zstd 解压并输出一行摘要。
+- **`demo_listen.py --all`** 自动发现新会话（此前只取启动时最近 30 个，之后新建会话不会加入监听）。
+- **新增防撤回监听 `RecallGuard`（测试版）**：`watch(listener)` 后把每条新消息写入独立镜像 sqlite 库、附件（图片/语音/视频/文件）增量备份到 `media/`；收到 `revokemsg` 系统消息时终端打印 `[撤回] 撤回者 → 原文` 并写入 `recall_events` 表。**未充分实机验证，按测试版发布。**
+- **新增 `MomentObserver`（测试版）**：朋友圈缓存 key 的「观察即固化」——`snapshot()` / `diff()` 快照与轮询导出（缓存 key 与 feed md5 之间无可推导映射且缓存易失，故观察即可固化）。**未充分实机验证，按测试版发布。**
 
 ### v1.2.1（2026-09-06）
 
@@ -715,7 +728,7 @@ quick_send_file(r'D:\资料\报告.pdf', '文件传输助手')
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.2.1 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
+> **Current version:** 1.2.2 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -875,6 +888,19 @@ Runnable demo: `python -m wechatauto.demo_moments_interact [--like N | --unlike 
 - Performance: parallel export / first-scan, incremental memory-scan cache
 
 ## 📝 Changelog
+
+### v1.2.2 (2026-09-12)
+
+- **Fix cross-shard message reads (missing messages / voice)**: a conversation's `Msg_<md5>` table actually spans several `message_*.db` shards, but `get_messages` only hit the first one — e.g. a chat with 8,904 real messages (24 voice notes) reported just 1. New `_find_msg_tables()` / `_msg_conns()` / `_shard_rows()` merge reads across all shards and sort by `sort_seq`; `get_messages`, `get_new_messages` and `_find_media_rows` now use the merged view. `get_message_row` gained a `local_type` filter (a `local_id` is **not** unique across shards) and new `get_message_rows_for_media()` returns every shard row; media downloaders pass their type code so the right shard row is selected.
+- **Reliable listener delivery (behavior change)**: the watermark now advances **only after callbacks succeed** (a new `_inflight` boundary prevents re-dispatching unconfirmed messages), callbacks are retried (`max_retries`, default 3) before being logged as dropped, and the watermark is persisted to `listener_watermark.json`. Messages that arrive while your process is down are delivered on the next start instead of being skipped. Pass `watermark_file=""` to disable persistence.
+- **Text restore no longer requires CJK**: pure English / digits / URLs / emoji container-format messages are decoded instead of degrading to `[文本]`.
+- **`Chat.GetNewMessage()` no longer drops backlog**: batches are pulled until caught up (>200 messages) and the watermark only moves to the last message actually returned, instead of jumping to the newest DB position.
+- **UIA materialization self-heal (no child controls after a WeChat restart/upgrade)**: after a WeChat restart or upgrade the Qt accessibility gate byte resets to 0 and the `mmui::` tree degrades to an empty Qt shell (`Qt51514QWindowIcon` + 2 nodes). The driver now hot-writes the gate, **verifies that `mmui::` controls actually materialized**, and retries other candidate RVAs on failure (the RVA that worked is cached per DLL identity). `_get_uia()` self-heals on a 30s throttle — no more "one failed wake and OCR forever", and no manual `refresh=True`. Fallback table gained `4.1.13.65 → 0x0AE2B0C8`.
+- **Moments scroll-positioning fixes**: bounded reversals (at most one per run, then downward-only) and stall detection (the top-cell fingerprint now includes geometry — merged-layout ListItems can share the same Name, which previously looked like a stall and aborted mid-scroll); skip "scroll to top" when the DB ruler says the target is below; the stop criterion is now **"the next moment's UIA control appeared"**; direction/distance fixes (clipped pixels → wheel notches) plus a bottom margin so the "…" button is reachable.
+- **Message type table**: 4.x composite `local_type` is decomposed by its low 32 bits; added `50 音视频通话` (VoIP bubble), `11000 动画表情`, `8594229559345 红包` (the library previously mislabeled it as an appmsg/file card via the low-byte mapping); empty bodies (stickers) now show `[动画表情]` instead of a blank line; `demo_group_messages` decodes zstd for every type and prints one-line summaries.
+- **`demo_listen.py --all`** now auto-discovers new sessions (previously limited to the 30 most recent at startup).
+- **New anti-recall listener `RecallGuard` (BETA)**: after `watch(listener)` every new message is mirrored into a local sqlite DB and attachments (image/voice/video/file) are backed up to `media/`; on a `revokemsg` it prints `[撤回] <revoker> → <original text>` and records it in `recall_events`. **Not fully field-tested — shipped as BETA.**
+- **New `MomentObserver` (BETA)**: observe-and-freeze snapshots of Moments cache keys via `snapshot()` / `diff()` (cache keys have no derivable mapping to feed md5 and the cache is evictable, so observing is the only way to keep them). **Not fully field-tested — shipped as BETA.**
 
 ### v1.2.1 (2026-09-06)
 

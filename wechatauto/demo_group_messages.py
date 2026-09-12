@@ -63,7 +63,9 @@ TYPE_LABEL = {
     47: "动画表情",
     48: "位置",
     49: "文件/链接/卡片",
+    50: "音视频通话",
     10000: "系统消息",
+    11000: "动画表情",
 }
 
 
@@ -232,39 +234,111 @@ def parse_sender(content, sender_id, nickname_map) -> str:
     return "", 0
 
 
-def classify_message(row: dict, nickname_map: dict) -> dict:
-    """识别单条消息：类型 + 发送者昵称 + 内容"""
-    local_type = row.get("local_type")
+def summarize_xml(text: str) -> str:
+    """把系统消息 XML 压成一行可读摘要（如撤回提示）。"""
+    if not text or not text.lstrip("\ufeff \t\r\n").startswith("<?xml"):
+        return ""
+    m = re.search(r'<sysmsg[^>]*type="([^"]+)"', text)
+    if not m:
+        return ""
+    kind = m.group(1)
+    c = re.search(r"<content>(.*?)</content>", text, re.S)
+    body = (c.group(1).strip() if c else "")
+    return "[%s] %s" % (kind, body) if body else "[%s]" % kind
+
+
+def summarize_payload(text: str, label: str) -> str:
+    """把卡片/表情 XML 压成一行可读摘要（便于 demo 输出）。"""
+    if not isinstance(text, str):
+        return text
+    t = text.lstrip("\ufeff").strip()          # 容忍微信 XML 自带的 BOM
+    if not t:
+        return t
+    one = lambda s: " ".join(
+        re.sub(r"<!\[CDATA\[(.*?)\]\]>", r"\1", s or "", flags=re.S).split())
+    if "<appmsg" in t:
+        title = re.search(r"<title>(.*?)</title>", t, re.S)
+        des = re.search(r"<des>(.*?)</des>", t, re.S)
+        parts = []
+        if title:
+            parts.append(one(title.group(1))[:60])
+        if des:
+            d = one(des.group(1))[:40]
+            if d and d not in parts:
+                parts.append(d)
+        return " / ".join(parts) if parts else "[%s]" % label
+    if "<emoji" in t:
+        md5 = re.search(r'md5\s*=\s*"([0-9a-fA-F]{32})"', t)
+        return "[动画表情%s]" % (" md5=" + md5.group(1)[:8] if md5 else "")
+    return one(t)[:80]
+
+
+def type_label(local_type) -> str:
+    """类型名：兼容微信 4.x 复合 local_type（如 244813135921 = 57<<32 | 49）。"""
     if local_type == RED_PACKET_TYPE:
-        label = "红包"
-    else:
-        label = TYPE_LABEL.get(local_type, "类型%d" % local_type)
+        return "红包"
+    label = TYPE_LABEL.get(local_type)
+    if label is None and isinstance(local_type, int):
+        base = local_type & 0xFFFFFFFF          # 低 32 位才是真实类型（如 57<<32|49 → 49）
+        label = TYPE_LABEL.get(base)
+        if label is None:
+            label = TYPE_LABEL.get(base & 0xFF)
+    if label is None:
+        return "类型%d" % local_type
+    return label
+
+
+def classify_message(row: dict, nickname_map: dict) -> dict:
+    """识别单条消息：类型 + 发送者昵称 + 内容（bytes 一律先 ZSTD 解压）"""
+    local_type = row.get("local_type")
+    label = type_label(local_type)
 
     content = row.get("message_content")
     extra = {}
+    cut = 0
+    text = None
 
-    if local_type == RED_PACKET_TYPE:
-        xml = zstd_decompress(content)
-        extra = parse_red_packet(xml)
+    # 4.x 的卡片/表情/系统消息 message_content 都是 ZSTD 压缩 XML：
+    # 一律先解压再解析（此前只在红包分支解压，导致其它类型直接打印原始字节）
+    if isinstance(content, bytes):
+        text = zstd_decompress(content)
 
-    # 发送者：红包用 XML 里的 fromusername（content 是二进制无前缀）
-    if local_type == RED_PACKET_TYPE and extra.get("fromusername"):
+    if local_type == RED_PACKET_TYPE and text:
+        extra = parse_red_packet(text)
+
+    # 发送者：优先 content 前缀 "wxid_xxx: "，其次 XML 的 fromusername
+    sender = ""
+    if extra.get("fromusername"):
         fw = extra["fromusername"]
         sender = nickname_map.get(fw, fw)
-    else:
-        # 文本等：优先 content 前缀
-        sender, cut = parse_sender(content, row.get("real_sender_id"), nickname_map)
+    if not sender:
+        sender, cut = parse_sender(text if text is not None else content,
+                                   row.get("real_sender_id"), nickname_map)
+    if not sender and text:
+        m = re.search(r'fromusername\s*=\s*"([^"]+)"', text)
+        if m:
+            sender = nickname_map.get(m.group(1), m.group(1))
     if not sender:
         sender = "成员#%s" % row.get("real_sender_id")
 
-    if isinstance(content, bytes):
+    if text is not None:
+        display = text
+    elif isinstance(content, bytes):
         display = content
     else:
         display = str(content)
 
-    # 文本：去掉 wxid 前缀显示正文
-    if local_type == 1 and cut:
-        display = display[cut:]
+    # 系统消息 XML → 一行摘要（撤回/拍一拍等）；卡片/表情 XML → 标题摘要
+    # 注：按内容标记判断而非前缀——微信 XML 常带 BOM，前缀会匹配不上
+    if isinstance(display, str) and display:
+        summary = summarize_xml(display)
+        if summary:
+            display = summary
+        elif ("<appmsg" in display or "<emoji" in display
+              or display.lstrip("\ufeff \t\r\n").startswith("<msg")):
+            display = summarize_payload(display, label)
+        elif cut:
+            display = display[cut:]        # 去掉 "wxid_xxx: " 前缀（文本等）
 
     return {
         "local_id": row.get("local_id"),

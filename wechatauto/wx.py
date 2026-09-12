@@ -448,8 +448,13 @@ class Chat:
         self_wxid = self._db.get_self_info()['username']
         return [_db_row_to_message(r, self, self_wxid) for r in rows]
 
-    def GetNewMessage(self) -> List['Message']:
-        """获取新消息（首次调用仅建立基线，返回空列表）。"""
+    def GetNewMessage(self, max_backlog: int = 5000) -> List['Message']:
+        """获取新消息（首次调用仅建立基线，返回空列表）。
+
+        积压超过单批上限（200）时连续分批拉取直到追平；水位只推进到
+        **实际取回**的最后一条，不会跳过中间消息。max_backlog 为保护上限，
+        若因上限截断，下次调用会从断点继续拉取。
+        """
         latest = self._db.get_messages(self._wxid, limit=1)
         current = latest[0]['sort_seq'] if latest else 0
         if self._last_seq is None:
@@ -457,8 +462,23 @@ class Chat:
             return []
         if current <= self._last_seq:
             return []
-        rows = self._db.get_new_messages(self._wxid, since_seq=self._last_seq)
-        self._last_seq = current
+        rows: List[dict] = []
+        since = self._last_seq
+        batch_sz = 200
+        while len(rows) < max_backlog:
+            batch = self._db.get_new_messages(self._wxid, since_seq=since, limit=batch_sz)
+            if not batch:
+                break
+            rows.extend(batch)
+            since = batch[-1]['sort_seq']
+            if len(batch) < batch_sz:
+                break
+        if not rows:
+            return []
+        if max_backlog and len(rows) > max_backlog:
+            rows = rows[:max_backlog]
+        # 水位只推进到实际取回的最后一条（而非数据库最新位置）
+        self._last_seq = rows[-1]['sort_seq']
         self_wxid = self._db.get_self_info()['username']
         return [_db_row_to_message(r, self, self_wxid) for r in rows]
 
@@ -568,39 +588,121 @@ class WeChat(Chat, Listener):
     def SwitchToMoments(self) -> bool:
         """切换到朋友圈页面（UIA 控件点击导航栏“朋友圈”按钮）。
 
-        需要微信主窗口已登录且 UIA 树被热激活。优先用 :class:`NavigationBox`
-        的预订按钮；失败时退化为主窗口控件树的递归扫描（按 ClassName
-        ``mmui::MainTabBar`` 定位左侧导航栏，再匹配 Name 含“朋友圈”的按钮）。
-        成功返回 True，树不可用或找不到按钮时返回 False。
+        需要微信主窗口已登录且 UIA 树被热激活。优先用新版合并布局入口
+        （含已在朋友圈页的快速判定）；失败时退化为主窗口控件树的递归扫描
+        （按 ClassName ``mmui::MainTabBar`` 定位左侧导航栏，再匹配 Name 含
+        “朋友圈”的按钮），最后退回 NavigationBox 预订按钮。成功返回 True，
+        树不可用或找不到按钮时返回 False。
+
+        注意：本方法不依赖 :attr:`_api`（其背后的 ``WeChatMainWnd()`` 构造
+        会在某些环境下触发全桌面 UIA 枚举导致长时间阻塞），内部一律从
+        ``ControlFromHandle(main_hwnd)`` 直接锚定主窗口。
         """
-        api = self._api
-        if api is None:
+        # 路线 1：新版合并布局（含已在朋友圈页的快速判定，无需导航）
+        if self._switch_to_moments_new_style():
+            return True
+
+        # 路线 2：直接递归扫描主窗口控件树，命中“朋友圈”导航按钮（旧版）
+        try:
+            import uiautomation as _uia
+            mw = getattr(self, '_gui', None)
+            hwnd = getattr(mw, 'main_hwnd', None) if mw is not None else None
+            if hwnd:
+                root = _uia.ControlFromHandle(hwnd)
+                tabbar = _find_descendant(root, lambda c: getattr(c, 'ClassName', '') == 'mmui::MainTabBar')
+                if tabbar is not None:
+                    btn = _find_descendant(
+                        tabbar,
+                        lambda c: getattr(c, 'ControlTypeName', '') == 'ButtonControl'
+                                  and (getattr(c, 'Name', '') or '').strip() == '朋友圈',
+                    )
+                    if btn is not None:
+                        btn.Click()
+                        return True
+        except Exception:
+            pass
+        return False
+
+    def _switch_to_moments_new_style(self) -> bool:
+        """新版微信（4.x 合并布局）切换到朋友圈。
+
+        新版左侧导航只有 微信/通讯录/收藏/发现/更多 五个 tab，没有“朋友圈”
+        按钮；需先点“发现”tab，再点发现页左侧的“朋友圈”入口
+        （``ExtensionDiscoverContentCell`` / Name ``朋友圈`` 的按钮）。
+        双入口都先回到标注状态再判断时间线是否出现。
+        """
+        import time as _t
+        try:
+            import uiautomation as _uia
+            mw = getattr(self, '_gui', None)
+            hwnd = getattr(mw, 'main_hwnd', None) if mw is not None else None
+            if not hwnd:
+                return False
+            root = _uia.ControlFromHandle(hwnd)
+        except Exception:
             return False
 
-        # 路线 1：直接递归扫描主窗口控件树，命中“朋友圈”导航按钮（快且稳）
-        try:
-            root = api.control
-            tabbar = _find_descendant(root, lambda c: getattr(c, 'ClassName', '') == 'mmui::MainTabBar')
-            if tabbar is not None:
-                btn = _find_descendant(
-                    tabbar,
-                    lambda c: getattr(c, 'ControlTypeName', '') == 'ButtonControl'
-                              and (getattr(c, 'Name', '') or '').strip() == '朋友圈',
-                )
-                if btn is not None:
-                    btn.Click()
+        def _has_timeline() -> bool:
+            try:
+                tl = _find_descendant(root, lambda c: getattr(c, 'ClassName', '') == 'mmui::TimeLineListView', max_depth=30)
+                if tl is not None:
                     return True
+                sc = _find_descendant(root, lambda c: getattr(c, 'ClassName', '') == 'mmui::SNSContentView', max_depth=30)
+                return sc is not None
+            except Exception:
+                return False
+
+        if _has_timeline():
+            return True
+
+        try:
+            # 左侧导航：先在 MainTabBar 容器内找 XTabBarItem，避免全局遍历
+            # 命中 Name='发现' 的其它空 rect 控件。
+            tabbar = _find_descendant(root, lambda c: getattr(c, 'ClassName', '') == 'mmui::MainTabBar', max_depth=15)
+            disc = None
+            if tabbar is not None:
+                disc = _find_descendant(
+                    tabbar,
+                    lambda c: (getattr(c, 'ClassName', '') == 'mmui::XTabBarItem'
+                               or getattr(c, 'ControlTypeName', '') in ('ButtonControl', 'TabItemControl'))
+                              and (getattr(c, 'Name', '') or '').strip() == '发现',
+                    max_depth=6,
+                )
+            if disc is None:
+                disc = _find_descendant(root, lambda c: (getattr(c, 'Name', '') or '').strip() == '发现', max_depth=15)
+            if disc is not None:
+                try:
+                    disc.Click()
+                    _t.sleep(0.8)
+                except Exception:
+                    # Click 可能因控件临时失效失败，退化为坐标点击
+                    try:
+                        import pyautogui as _pg
+                        r = disc.BoundingRectangle
+                        if r.right > r.left and r.bottom > r.top:
+                            x = int(r.left + (r.right - r.left) // 2)
+                            y = int(r.top + (r.bottom - r.top) // 2)
+                            _pg.click(x, y)
+                            _t.sleep(0.8)
+                        else:
+                            return False
+                    except Exception:
+                        return False
         except Exception:
             pass
 
-        # 路线 2：复用 NavigationBox（老接口）
-        nav = getattr(api, '_navigation_api', None)
-        if nav is not None:
-            try:
-                nav.switch_to_moments_page()
-                return True
-            except Exception:
-                pass
+        if _has_timeline():
+            return True
+
+        try:
+            btn = _find_descendant(root, lambda c: getattr(c, 'ControlTypeName', '') in ('ButtonControl', 'TabItemControl', 'ListItemControl')
+                                   and (getattr(c, 'Name', '') or '').strip() == '朋友圈')
+            if btn is not None:
+                btn.Click()
+                _t.sleep(1.0)
+                return _has_timeline()
+        except Exception:
+            pass
         return False
 
     @property
