@@ -17,7 +17,7 @@
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.2.2.1 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
+> **Current version:** 1.2.2.2 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -182,6 +182,15 @@ Runnable demo: `python -m wechatauto.demo_moments_interact [--like N | --unlike 
 - Performance: parallel export / first-scan, incremental memory-scan cache
 
 ## 📝 Changelog
+
+### v1.2.2.2 (2026-09-13)
+
+- **Key handling hardened: no more recurring failure after every WeChat update.** Three layers:
+  - **The cache can no longer be wiped**: `_save_keys()` never persists an empty result (atomic write + `.bak` kept). Previously a transient extraction failure (wrong account / permission) **overwrote a good cache with an empty file**, so every later start reported "0 keys" — that is exactly the `keys cached: 0` seen in the field.
+  - **Durable key copy**: a copy is kept at `%LOCALAPPDATA%\wechatauto_keys\<account>.json` (override the directory with the `WECHATAUTO_KEYS_DIR` env var, e.g. your project workspace), surviving TEMP cleanup and WeChat updates. On startup the caches are **merged from several locations** (durable copy → work cache → `.bak` → other accounts' caches) and every entry is verified against page-1 HMAC, keeping only working keys.
+  - **Account selection is now decided by key verification**, not by "most recently modified .db" (a WeChat update rewrites every .db, shifting mtimes and picking the wrong account → 0 keys). One memory scan now collects candidate key material and scores **every account directory** by page-1 HMAC, switching to the one that unlocks (log: `已按密钥校验选定账号目录: …`).
+- **cfg master-key warning**: on WeChat 4.1.13+ the cfg path returns an **untrustworthy master key** (demoted to a fallback since v1.1.9); it now logs an explicit warning when it cannot reproduce any database key instead of silently succeeding.
+- **Better diagnostics (`diagnose_keys`)**: now prints the WeChat client **FileVersion**, per-account "cache / derived" availability and a **master-key consistency check** (which tells you which account the keys belong to); the `_open` error text now lists the three classic causes (32-bit Python / permission mismatch / wrong account among several) plus the `account=` hint.
 
 ### v1.2.2.1 (2026-09-12)
 

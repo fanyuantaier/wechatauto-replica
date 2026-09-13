@@ -567,6 +567,90 @@ class WeChatDB:
     # ------------------------------------------------------------------
     KDF_ITER = 256000  # 主密钥→库密钥 PBKDF2 迭代(微信魔改 WCDB, 实测确认)
 
+    def _try_other_accounts(self) -> bool:
+        """账号自愈：当前账号目录解不开时，改用同一主密钥能解开的其它账号目录。
+
+        多账号机器上 `_pick_account()` 的“最近修改 .db”启发式可能选错账号：
+        内存里提取到的主密钥属于**当前登录账号**，拿去解另一个账号的库会全部
+        页1 HMAC 校验失败（表现为“已加载 0/N 个密钥”、`-N/N`）。
+        这里用同一主密钥对其余账号目录重新派生/校验，选可用库最多的那个并
+        切换过去。返回是否发生了切换。
+        """
+        try:
+            dirs = [d for d in _find_account_dirs(self.db_dir)
+                    if os.path.basename(d) != self.account]
+        except Exception:
+            return False
+        if not dirs:
+            return False
+
+        master = self.master_key
+        if not master:
+            try:
+                auto = self.extract_master_key()
+            except Exception:
+                auto = None
+            if auto:
+                master = auto[0]
+                self.master_key = master
+        if not master:
+            return False
+
+        def probe(acct: str):
+            """在不动全局状态的前提下，试算某账号可用库数。"""
+            acct_dir = os.path.join(self.db_dir, acct)
+            workdir = os.path.join(tempfile.gettempdir(), "wechatauto_db", acct)
+            keys_file = os.path.join(workdir, "keys.json")
+            saved = (self.account, self.account_dir, self._db_files, self.workdir,
+                     self.keys_file, self._keys)
+            try:
+                self.account, self.account_dir = acct, acct_dir
+                self._db_files = self._collect_db_files()
+                self.workdir, self.keys_file = workdir, keys_file
+                self._keys = {}
+                if os.path.exists(keys_file):     # 先用该账号已有缓存
+                    try:
+                        with open(keys_file, encoding="utf-8") as f:
+                            for rel, hexkey in json.load(f).items():
+                                try:
+                                    self._keys[rel] = bytes.fromhex(hexkey)
+                                except ValueError:
+                                    pass
+                    except Exception:
+                        pass
+                if not any(self._key_works(rel) for rel, _, _ in self._db_files):
+                    self._keys.update(self.derive_keys_from_master(master))
+                ok = sum(1 for rel, _, _ in self._db_files if self._key_works(rel))
+                return ok, dict(self._keys), list(self._db_files), workdir, keys_file
+            except Exception:
+                return 0, {}, [], workdir, keys_file
+            finally:
+                (self.account, self.account_dir, self._db_files, self.workdir,
+                 self.keys_file, self._keys) = saved
+
+        cur_ok = sum(1 for rel, _, _ in self._db_files if self._key_works(rel))
+        best = None
+        for d in dirs:
+            ok, keys, files, workdir, keys_file = probe(os.path.basename(d))
+            if ok and (best is None or ok > best[0]):
+                best = (ok, os.path.basename(d), keys, files, workdir, keys_file)
+        if best is None or best[0] <= cur_ok:
+            return False
+
+        ok, acct, keys, files, workdir, keys_file = best
+        self.account = acct
+        self.account_dir = os.path.join(self.db_dir, acct)
+        self._keys, self._db_files = keys, files
+        self.workdir, self.keys_file = workdir, keys_file
+        try:
+            os.makedirs(self.workdir, exist_ok=True)
+            self._save_keys()
+        except Exception:
+            pass
+        print("[wechatauto] 已自动切换账号目录: %s（%d 个库可用密钥）" % (acct, ok),
+              file=sys.stderr)
+        return True
+
     def _load_or_extract_keys(self, master_key: Optional[str] = None) -> None:
         """加载/提取密钥, 五层优先级:
 
@@ -587,18 +671,30 @@ class WeChatDB:
             self.master_key = None
             self.cfg_dword = None
             
-            # 优先级1: 尝试已保存的密钥
-            if os.path.exists(self.keys_file):
-                try:
-                    with open(self.keys_file, "r", encoding="utf-8") as f:
-                        saved = json.load(f)
-                    for rel, hexkey in saved.items():
-                        try:
-                            self._keys[rel] = bytes.fromhex(hexkey)
-                        except ValueError:
-                            pass
-                except (json.JSONDecodeError, OSError):
-                    pass
+            # 优先级1: 尝试已保存的密钥——多位置合并（稳定副本 > 工作缓存 > .bak >
+            # 其它账号缓存），全部经页1 HMAC 校验，只保留真能用的
+            cache_paths = []
+            sf = self._stable_key_file()
+            if sf:
+                cache_paths.append(sf)
+            cache_paths += [self.keys_file, self.keys_file + ".bak"]
+            try:
+                for other in _find_account_dirs(self.db_dir):
+                    oa = os.path.basename(other)
+                    if oa != self.account:
+                        cache_paths.append(os.path.join(
+                            tempfile.gettempdir(), "wechatauto_db", oa, "keys.json"))
+            except Exception:
+                pass
+            for cp in cache_paths:
+                if not os.path.exists(cp):
+                    continue
+                for rel, key in self._load_key_cache(cp).items():
+                    self._keys.setdefault(rel, key)
+            # 只保留能通过页1 校验的（丢弃错账号/陈旧条目）
+            if self._keys:
+                self._keys = {rel: k for rel, k in self._keys.items()
+                              if self._key_works(rel)}
             
             missing = [
                 rel for rel, path, _ in self._db_files
@@ -624,19 +720,48 @@ class WeChatDB:
             ]
             
             # 优先级3: cfg 自动提取(老版本回退)
+            # 注意：cfg 路径在微信 4.1.13+ 会返回**不可信的主密钥**（v1.1.9 起已把
+            # Config.Cipher 内存扫描提为主路径，此处仅作老版本回退）。若它一把库都
+            # 复现不出来，要明确告警，而不是静默当成成功。
             if missing:
                 auto = self.extract_master_key()
                 if auto:
                     master, cfg_dword, _ = auto
-                    self.master_key = master
+                    derived = self.derive_keys_from_master(master)
                     self.cfg_dword = cfg_dword
-                    self._keys.update(self.derive_keys_from_master(master))
-                    self._save_keys()
-        still = [
-            rel for rel, _, _ in self._db_files if not self._key_works(rel)
-        ]
+                    if derived:
+                        self.master_key = master
+                        self._keys.update(derived)
+                        self._save_keys()
+                    else:
+                        import sys as _sys
+                        print(
+                            "[wechatauto] 提示: cfg 主密钥无法复现任何库密钥"
+                            "（微信 4.1.13+ 已知问题，cfg 路径已不可信）。当前依赖 "
+                            "Config.Cipher 内存扫描；若扫描也失败，请运行 "
+                            "python -m wechatauto.diagnose_keys",
+                            file=_sys.stderr,
+                        )
+        def _still_now():
+            return [rel for rel, _, _ in self._db_files if not self._key_works(rel)]
+
+        still = _still_now()
+        # 账号自愈（第一步，便宜）：先试其它账号目录已有的缓存/主密钥派生
+        if still and self._try_other_accounts():
+            still = _still_now()
+        if still:
+            # 账号自愈（第二步，彻底）：一次内存扫描收集候选密钥材料，对**每个账号
+            # 目录**分别做 HMAC 打分，选能解开的那一个——不再依赖 mtime 启发式，
+            # 从根上解决“微信每次更新后重写 .db → 选错账号 → 0 密钥”。
+            try:
+                cands = self._all_key_candidates()
+            except Exception:
+                cands = set()
+            if cands and self._select_account_by_keys(cands):
+                still = _still_now()
         if still:
             import sys as _sys
+            total = len(self._db_files)
             print(
                 "[wechatauto] 警告: 以下库无可用密钥，无法解密: %s"
                 % ", ".join(still),
@@ -645,9 +770,21 @@ class WeChatDB:
             print(
                 "[wechatauto] 已加载 %d/%d 个密钥 (缓存: %s)。请确认微信已登录，"
                 "可运行 python -m wechatauto.diagnose_keys 排查"
-                % (len(self._keys) - len(still), len(self._db_files), self.keys_file),
+                % (total - len(still), total, self.keys_file),
                 file=_sys.stderr,
             )
+            try:
+                accounts = sorted(os.path.basename(d)
+                                  for d in _find_account_dirs(self.db_dir))
+            except Exception:
+                accounts = []
+            if len(accounts) > 1:
+                print(
+                    "[wechatauto]  >> 检测到多个微信账号目录: %s；当前使用: %s。"
+                    "若仍报错，请用 WeChatDB(account=\"当前登录账号\") 显式指定"
+                    % (", ".join(accounts), self.account),
+                    file=_sys.stderr,
+                )
         self.unkeyed = still
 
     def derive_keys_from_master(self, master_hex: str) -> Dict[str, bytes]:
@@ -719,6 +856,166 @@ class WeChatDB:
             if len(keys) >= len(self._db_files):
                 break
         return keys
+
+    def _collect_key_candidates(self, pid: int, seen: set) -> set:
+        """收集候选密钥材料（**不做账号校验**）：{(cand, salt_or_None), ...}
+
+        与 `_extract_keys_pid` 的区别：这里只负责“找出可能是密钥的 32 字节
+        （或 32+16 带显式 salt）”，校验交给调用方对**每个账号目录**分别做。
+        原因：内存里的密钥属于**当前登录账号**，只有对正确的账号目录才能通过
+        页1 HMAC；这样账号选择由密码学校验决定，不再依赖“最近修改 .db”启发式
+        （微信每次更新会重写 .db，mtime 全变 → 启发式会选错账号 → 0 密钥）。
+        """
+        h = _k32.OpenProcess(0x0010 | 0x0400, False, pid)
+        if not h:
+            return set()
+        out: set = set()
+        try:
+            def read(addr: int, n: int):
+                buf = ctypes.create_string_buffer(n)
+                br = ctypes.c_size_t(0)
+                if _k32.ReadProcessMemory(h, ctypes.c_void_p(addr), buf, n,
+                                          ctypes.byref(br)) and br.value:
+                    return buf.raw[: br.value]
+                return None
+
+            needles = self._find_bytes(h, read, CONFIG_CIPHER_NAME)
+            pairs = [
+                struct.pack("<Q", addr) + struct.pack("<Q", len(CONFIG_CIPHER_NAME))
+                for addr in needles
+            ]
+            for pair in pairs:
+                for qaddr in self._find_bytes(h, read, pair):
+                    node = read(qaddr - 0x10, 0x50)
+                    if not node or len(node) < 0x40:
+                        continue
+                    if struct.unpack_from("<Q", node, 0x10)[0] not in needles:
+                        continue
+                    if struct.unpack_from("<Q", node, 0x18)[0] != len(CONFIG_CIPHER_NAME):
+                        continue
+                    config_ptr = struct.unpack_from("<Q", node, 0x28)[0]
+                    if not (0x10000 <= config_ptr < 0x800000000000):
+                        continue
+                    obj = read(config_ptr + 0x88, 0x28)
+                    if not obj or len(obj) < 0x18:
+                        continue
+                    data_ptr = struct.unpack_from("<Q", obj, 0x8)[0]
+                    data_len = struct.unpack_from("<Q", obj, 0x10)[0]
+                    if not (0 < data_len <= 1024 and 0x10000 <= data_ptr < 0x800000000000):
+                        continue
+                    blob = read(data_ptr, int(data_len))
+                    if not blob or len(blob) != data_len:
+                        continue
+                    decoded = bytes(
+                        v ^ CONFIG_XOR_MASK[i % len(CONFIG_XOR_MASK)]
+                        for i, v in enumerate(blob)
+                    )
+                    for m in HEX_LITERAL_RE.finditer(decoded):
+                        run = m.group(1).decode().lower()
+                        starts = [0]
+                        if len(run) > 96:
+                            starts += list(range(0, len(run) - 63, 32))
+                            starts.append(len(run) - 64)
+                        for s in dict.fromkeys(starts):
+                            if s + 64 > len(run):
+                                continue
+                            cand = bytes.fromhex(run[s:s + 64])
+                            if cand in seen or not self._probable_key(cand):
+                                continue
+                            seen.add(cand)
+                            out.add((cand, None))
+                            if s + 96 <= len(run):
+                                out.add((cand, bytes.fromhex(run[s + 64: s + 96])))
+        finally:
+            _k32.CloseHandle(h)
+        return out
+
+    def _all_key_candidates(self) -> set:
+        """一次内存扫描，收集所有候选密钥材料（与账号无关）。"""
+        seen: set = set()
+        out: set = set()
+        for pid in self._find_weixin_pids():
+            try:
+                out |= self._collect_key_candidates(pid, seen)
+            except Exception:
+                continue
+        return out
+
+    def _keys_from_candidates(self, cands) -> Dict[str, bytes]:
+        """把候选材料对**当前 self._db_files** 逐个 HMAC 校验，返回可用密钥。"""
+        keys: Dict[str, bytes] = {}
+        for cand, salt in cands:
+            for rel, path, _ in self._db_files:
+                if rel in keys:
+                    continue
+                try:
+                    with open(path, "rb") as f:
+                        page1 = f.read(PAGE_SZ)
+                except OSError:
+                    continue
+                if _verify_enc_key(cand, page1, salt=salt):
+                    keys[rel] = cand + (salt or b"")
+                    break
+        return keys
+
+    def _select_account_by_keys(self, cands) -> bool:
+        """用候选密钥给每个账号目录打分，选可用库最多的那个并切换。
+
+        这是“微信更新后选错账号”的根除手段：不再看 mtime，而看**能不能解开**。
+        返回是否发生了切换/改善。
+        """
+        if not cands:
+            return False
+        best = None
+        try:
+            dirs = _find_account_dirs(self.db_dir)
+        except Exception:
+            return False
+        for d in dirs:
+            acct = os.path.basename(d)
+            saved = (self.account, self.account_dir, self._db_files, self.workdir,
+                     self.keys_file, self._keys)
+            try:
+                self.account, self.account_dir = acct, d
+                self.workdir = os.path.join(tempfile.gettempdir(), "wechatauto_db", acct)
+                self.keys_file = os.path.join(self.workdir, "keys.json")
+                self._db_files = self._collect_db_files()
+                if not self._db_files:
+                    continue
+                merged = {}
+                if self.master_key:
+                    try:
+                        merged.update(self.derive_keys_from_master(self.master_key))
+                    except Exception:
+                        pass
+                merged.update(self._keys_from_candidates(cands))
+                ok = len(merged)
+                if ok and (best is None or ok > best[0]):
+                    best = (ok, acct, merged, list(self._db_files))
+            except Exception:
+                continue
+            finally:
+                (self.account, self.account_dir, self._db_files, self.workdir,
+                 self.keys_file, self._keys) = saved
+        if best is None:
+            return False
+        cur = sum(1 for rel, _, _ in self._db_files if self._key_works(rel))
+        if best[0] <= cur:
+            return False
+        ok, acct, keys, files = best
+        self.account = acct
+        self.account_dir = os.path.join(self.db_dir, acct)
+        self._keys, self._db_files = keys, files
+        self.workdir = os.path.join(tempfile.gettempdir(), "wechatauto_db", acct)
+        self.keys_file = os.path.join(self.workdir, "keys.json")
+        try:
+            os.makedirs(self.workdir, exist_ok=True)
+            self._save_keys()
+        except Exception:
+            pass
+        print("[wechatauto] 已按密钥校验选定账号目录: %s（%d/%d 个库可用密钥）"
+              % (acct, ok, len(files)), file=sys.stderr)
+        return True
 
     def _find_weixin_pids(self) -> List[int]:
         import subprocess
@@ -854,10 +1151,77 @@ class WeChatDB:
             addr = (mbi.BaseAddress or 0) + mbi.RegionSize
         return hits
 
+    def _stable_key_dirs(self) -> List[str]:
+        """稳定密钥副本目录（不随 TEMP 清理而丢失）。
+
+        TEMP 被清理/重置后密钥缓存就没了，而微信更新**不会重新加密 DB**，
+        所以一份有效的缓存本可跨更新长期复用。优先用环境变量
+        ``WECHATAUTO_KEYS_DIR``，否则用 ``%LOCALAPPDATA%\\wechatauto_keys``。
+        """
+        dirs = []
+        env = os.environ.get("WECHATAUTO_KEYS_DIR")
+        if env:
+            dirs.append(env)
+        base = os.environ.get("LOCALAPPDATA") or os.environ.get("USERPROFILE")
+        if base:
+            dirs.append(os.path.join(base, "wechatauto_keys"))
+        return dirs
+
+    def _stable_key_file(self, account: Optional[str] = None) -> Optional[str]:
+        dirs = self._stable_key_dirs()
+        if not dirs:
+            return None
+        return os.path.join(dirs[0], (account or self.account) + ".json")
+
+    def _load_key_cache(self, path: str) -> Dict[str, bytes]:
+        """读一个 keys.json（只返回格式合法的条目）。"""
+        out: Dict[str, bytes] = {}
+        try:
+            with open(path, encoding="utf-8") as f:
+                for rel, hexkey in json.load(f).items():
+                    try:
+                        out[rel] = bytes.fromhex(hexkey)
+                    except (ValueError, TypeError):
+                        pass
+        except (OSError, json.JSONDecodeError):
+            pass
+        return out
+
     def _save_keys(self) -> None:
-        os.makedirs(os.path.dirname(self.keys_file), exist_ok=True)
-        with open(self.keys_file, "w", encoding="utf-8") as f:
-            json.dump({k: v.hex() for k, v in self._keys.items()}, f, indent=2)
+        """写密钥缓存。
+
+        两个保护：
+        1. **绝不把非空缓存覆盖成空缓存**——提取偶发失败（权限/版本/未登录）
+           不该毁掉已有的好缓存，否则下次再无回退可用；
+        2. 原子写入 + 保留 .bak，并同步一份到稳定目录（跨 TEMP 清理/微信更新）。
+        """
+        if not self._keys:
+            return
+        data = {k: v.hex() for k, v in self._keys.items()}
+        try:
+            os.makedirs(os.path.dirname(self.keys_file), exist_ok=True)
+            tmp = self.keys_file + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            if os.path.exists(self.keys_file):
+                try:
+                    with open(self.keys_file, "rb") as src, \
+                            open(self.keys_file + ".bak", "wb") as dst:
+                        dst.write(src.read())
+                except OSError:
+                    pass
+            os.replace(tmp, self.keys_file)
+        except OSError:
+            pass
+        # 稳定副本
+        sf = self._stable_key_file()
+        if sf:
+            try:
+                os.makedirs(os.path.dirname(sf), exist_ok=True)
+                with open(sf, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+            except OSError:
+                pass
 
     # ------------------------------------------------------------------
     # 解密与查询
@@ -934,8 +1298,11 @@ class WeChatDB:
         if rel not in self._keys:
             self._auto_diagnose_key_failure(rel)
             raise RuntimeError(
-                "数据库无可用密钥: %s。请确认微信已登录且保持窗口打开；"
-                "若仍复现，运行 python -m wechatauto.diagnose_keys 并把完整输出发给维护者。"
+                "数据库无可用密钥: %s。请确认微信已登录且保持窗口打开。"
+                "常见原因：① 32 位 Python 读不了 64 位微信内存；"
+                "② 本脚本权限低于微信（微信以管理员运行时，脚本也要以管理员运行）；"
+                "③ 多账号机器选错账号（用 WeChatDB(account=\"当前登录账号\") 指定）。"
+                "仍复现请运行 python -m wechatauto.diagnose_keys 并把完整输出发给维护者。"
                 "也可删除密钥缓存强制重新提取后重试: %s"
                 % (rel, self.keys_file)
             )

@@ -32,7 +32,7 @@
 本项目复刻上游 wxauto 项目，目标是实现对当前微信 4.x Windows 客户端的自动化
 （读取消息、发送消息、媒体下载、朋友圈），非网页版，直接操作本机客户端。
 
-> 当前版本：1.2.2.1
+> 当前版本：1.2.2.2
 >
 > **兼容范围**：Windows 10/11 ｜ Python 3.9+（已在 3.12 验证）｜ 微信 **4.1.12+**
 > （数据库读取路线对微信版本不敏感；坐标+OCR 发送路线依赖 4.1.12+ 自绘渲染
@@ -57,6 +57,15 @@
 ---
 
 ## 版本记录
+
+### v1.2.2.2（2026-09-13）
+
+- **密钥问题根除（不再“每次微信更新都复发”）**：三层修复。
+  - **缓存不再被写空**：`_save_keys()` 空结果不落盘（原子写 + 保留 `.bak`）。此前提取偶发失败（选错账号/权限）会把**好缓存覆盖成空文件**，之后每次启动都报“0 把密钥”——故障现场的 `keys cached: 0` 即由此而来。
+  - **稳定密钥副本**：自动在 `%LOCALAPPDATA%\wechatauto_keys\<账号>.json` 保留一份（可用环境变量 `WECHATAUTO_KEYS_DIR` 指定目录，例如项目工作区），跨 TEMP 清理与微信更新复用。启动时按「稳定副本 → 工作缓存 → `.bak` → 其它账号缓存」**多位置合并**，并逐条页1 HMAC 校验，只保留真能用的。
+  - **账号选择改由密钥校验决定**：不再按“最近修改的 .db”猜账号（微信每次更新会重写 .db，mtime 全变 → 选错账号 → 0 密钥）。现在一次内存扫描收集候选密钥，对**每个账号目录**分别做页1 HMAC 打分，选能解开的那一个并自动切换（日志：`已按密钥校验选定账号目录: …`）。
+- **cfg 主密钥告警**：cfg 路径在微信 4.1.13+ 会返回**不可信的主密钥**（v1.1.9 起已降级为回退路径）；现在它复现不出任何库密钥时会**明确告警**，不再静默当作成功。
+- **诊断增强（`diagnose_keys`）**：新增微信客户端 **FileVersion**、逐账号「缓存可用 / 主密钥派生」计数、**主密钥一致性检查**（判断“密钥属于哪个账号”）；`_open` 报错文本直接列出三条经典原因（32 位 Python / 权限与微信不一致 / 多账号选错）+ `account=` 提示。
 
 ### v1.2.2.1（2026-09-12）
 
@@ -736,7 +745,7 @@ quick_send_file(r'D:\资料\报告.pdf', '文件传输助手')
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.2.2.1 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
+> **Current version:** 1.2.2.2 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -896,6 +905,15 @@ Runnable demo: `python -m wechatauto.demo_moments_interact [--like N | --unlike 
 - Performance: parallel export / first-scan, incremental memory-scan cache
 
 ## 📝 Changelog
+
+### v1.2.2.2 (2026-09-13)
+
+- **Key handling hardened: no more recurring failure after every WeChat update.** Three layers:
+  - **The cache can no longer be wiped**: `_save_keys()` never persists an empty result (atomic write + `.bak` kept). Previously a transient extraction failure (wrong account / permission) **overwrote a good cache with an empty file**, so every later start reported "0 keys" — that is exactly the `keys cached: 0` seen in the field.
+  - **Durable key copy**: a copy is kept at `%LOCALAPPDATA%\wechatauto_keys\<account>.json` (override the directory with the `WECHATAUTO_KEYS_DIR` env var, e.g. your project workspace), surviving TEMP cleanup and WeChat updates. On startup the caches are **merged from several locations** (durable copy → work cache → `.bak` → other accounts' caches) and every entry is verified against page-1 HMAC, keeping only working keys.
+  - **Account selection is now decided by key verification**, not by "most recently modified .db" (a WeChat update rewrites every .db, shifting mtimes and picking the wrong account → 0 keys). One memory scan now collects candidate key material and scores **every account directory** by page-1 HMAC, switching to the one that unlocks (log: `已按密钥校验选定账号目录: …`).
+- **cfg master-key warning**: on WeChat 4.1.13+ the cfg path returns an **untrustworthy master key** (demoted to a fallback since v1.1.9); it now logs an explicit warning when it cannot reproduce any database key instead of silently succeeding.
+- **Better diagnostics (`diagnose_keys`)**: now prints the WeChat client **FileVersion**, per-account "cache / derived" availability and a **master-key consistency check** (which tells you which account the keys belong to); the `_open` error text now lists the three classic causes (32-bit Python / permission mismatch / wrong account among several) plus the `account=` hint.
 
 ### v1.2.2.1 (2026-09-12)
 

@@ -51,7 +51,7 @@ def make_callback(db, chat_name: str):
     def on_msg(msg: dict, lst: Listener):
         sender = sender_name(db, msg["sender_id"])
         t = fmt_time(msg["create_time"])
-        print(f"[{t}] {chat_name} | {sender} ({msg['type']}) {msg['content']}")
+        print(f"[{t}] {chat_name} | {sender} ({msg['type']}) {msg['content']}", flush=True)
         # 可在此扩展业务：msg['content'] 含关键字时自动回复等
     return on_msg
 
@@ -100,7 +100,7 @@ def main():
         print("  全局监听：已注册现有会话，运行中自动发现新会话")
     else:
         if not names:
-            names = ["送你挖银子"]
+            names = ["文件传输助手"]
         # 昵称/备注 → username 映射
         resolved = [resolve_name(db, sessions, n) for n in names]
         for raw, got in zip(names, resolved):
