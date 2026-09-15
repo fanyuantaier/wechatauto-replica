@@ -1117,16 +1117,23 @@ class WeChatDB:
             rel for rel, _, _ in self._db_files if not self._key_works(rel)
         ]
 
-    def _find_msg_table(self, user: str, conns: List[sqlite3.Connection]) -> Optional[Tuple[sqlite3.Connection, str]]:
+    def _find_msg_tables(self, user: str, conns: List[sqlite3.Connection]
+                         ) -> List[Tuple[sqlite3.Connection, str]]:
+        """定位用户消息表；同一会话可能分片在多个 message_*.db，返回全部命中。
+
+        微信 4.x 会把活跃会话拆到多个消息分片，不能假定只存在第一个分片中，
+        因此返回全部命中表，查询时按 (sort_seq, local_id) 跨库合并排序。
+        """
         target = "Msg_" + _md5_hex(user.encode())
+        found = []
         for conn in conns:
             row = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
                 (target,),
             ).fetchone()
             if row:
-                return conn, target
-        return None
+                found.append((conn, target))
+        return found
 
     def _invalidate_cache(self) -> None:
         """删除 workdir 中全部解密缓存(.db/.stamp)，key 缓存除外。
@@ -1148,12 +1155,13 @@ class WeChatDB:
         if removed:
             sys.stderr.write("[wechatauto] 已清 %d 个缓存文件等待重建\n" % removed)
 
-    def _msg_conn(self, user: str, _retry: bool = True) -> Optional[Tuple[sqlite3.Connection, str]]:
-        """打开消息库并定位用户消息表（调用方负责 close 连接）"""
+    def _msg_conn(self, user: str, _retry: bool = True
+                  ) -> Optional[List[Tuple[sqlite3.Connection, str]]]:
+        """打开消息库并定位用户消息表（跨分库返回全部命中连接，调用方负责关闭）"""
         conns = []
         try:
             conns = [self._open(rel) for rel in self._message_dbs()]
-            found = self._find_msg_table(user, conns)
+            found = self._find_msg_tables(user, conns)
         except sqlite3.DatabaseError as exc:
             for c in conns:
                 c.close()
@@ -1171,16 +1179,16 @@ class WeChatDB:
                 c.close()
             return None
         # 只保留命中的连接，其余分片库立即关闭，避免 Windows 下删除缓存被占用
-        target = found[0]
+        hit = {id(c) for c, _ in found}
         for c in conns:
-            if c is not target:
+            if id(c) not in hit:
                 c.close()
         return found
 
     def _run_msg_query(self, user: str, build):
         """对消息库执行只读查询；查询到库损坏时清缓存重建并重试一次。
 
-        build(conn, table) -> rows（同 _msg_conn 的 found 连接/表名）。
+        build(found) -> rows（found 为该会话跨分库的全部 (conn, table)）。
         _msg_conn 已处理 schema 损坏重建，本方法兜底数据页损坏。
         重试后仍失败则抛原始异常（Listener 捕获后跳过本轮，不阻断运行）。
         找不到该会话返回 None。
@@ -1189,9 +1197,8 @@ class WeChatDB:
             found = self._msg_conn(user)
             if found is None:
                 return None
-            conn, table = found
             try:
-                return build(conn, table)
+                return build(found)
             except sqlite3.DatabaseError as exc:
                 if attempt or not _is_malformed(exc):
                     raise
@@ -1200,34 +1207,43 @@ class WeChatDB:
                 )
                 self._invalidate_cache()
             finally:
-                conn.close()
+                for conn, _ in found:
+                    conn.close()
         return None
 
     def get_messages(self, user: str, limit: int = 20, offset: int = 0) -> List[dict]:
-        """读取指定会话（微信号/群号）的最近消息"""
+        """读取指定会话（微信号/群号）的最近消息（跨分库合并，按 sort_seq 降序）"""
+        cap = limit + offset
         return self._run_msg_query(
             user,
-            lambda conn, table: [
-                self._msg_row_to_dict(r) for r in conn.execute(
-                    "SELECT local_id, local_type, real_sender_id, create_time, "
-                    "message_content, source, packed_info_data, compress_content, sort_seq "
-                    "FROM %s ORDER BY sort_seq DESC LIMIT ? OFFSET ?" % table,
-                    (limit, offset),
-                ).fetchall()
+            lambda found: [
+                self._msg_row_to_dict(r) for r in sorted(
+                    [row for conn, table in found for row in conn.execute(
+                        "SELECT local_id, local_type, real_sender_id, create_time, "
+                        "message_content, source, packed_info_data, compress_content, sort_seq "
+                        "FROM %s ORDER BY sort_seq DESC, local_id DESC LIMIT ?" % table,
+                        (cap,),
+                    ).fetchall()],
+                    key=lambda r: (r["sort_seq"], r["local_id"]),
+                    reverse=True,
+                )[offset:offset + limit]
             ],
         ) or []
 
     def get_message_row(self, user: str, local_id: int) -> Optional[dict]:
         """按 local_id 读取一条消息的完整原始字段（媒体下载用，含 server_id/packed_info）"""
-        row = self._run_msg_query(
-            user,
-            lambda conn, table: conn.execute(
-                "SELECT local_id, local_type, server_id, real_sender_id, create_time, "
-                "message_content, source, packed_info_data, compress_content, sort_seq "
-                "FROM %s WHERE local_id=? LIMIT 1" % table,
-                (local_id,),
-            ).fetchone(),
-        )
+        def build(found):
+            for conn, table in found:
+                row = conn.execute(
+                    "SELECT local_id, local_type, server_id, real_sender_id, create_time, "
+                    "message_content, source, packed_info_data, compress_content, sort_seq "
+                    "FROM %s WHERE local_id=? LIMIT 1" % table,
+                    (local_id,),
+                ).fetchone()
+                if row:
+                    return row
+            return None
+        row = self._run_msg_query(user, build)
         if not row:
             return None
         sender_id = row["real_sender_id"]
@@ -1253,33 +1269,38 @@ class WeChatDB:
         }
 
     def _find_media_rows(self, user: str, types: set) -> List[int]:
-        """按 local_type 直接查该会话全部媒体 local_id（降序），不受总消息分页限制。
+        """按 local_type 直接查该会话全部媒体 local_id（降序，跨分库合并），不受总消息分页限制。
 
         供批量下载场景使用（如一次性拉取某群全部图片）。
         """
         placeholders = ",".join("?" * len(types))
-        rows = self._run_msg_query(
-            user,
-            lambda conn, table: conn.execute(
-                "SELECT local_id FROM %s WHERE local_type IN (%s) "
-                "ORDER BY sort_seq DESC" % (table, placeholders),
-                tuple(sorted(types)),
-            ).fetchall(),
-        )
-        return [r["local_id"] for r in rows] if rows else []
+        def build(found):
+            rows = []
+            for conn, table in found:
+                rows += conn.execute(
+                    "SELECT local_id, sort_seq FROM %s WHERE local_type IN (%s)"
+                    % (table, placeholders), tuple(sorted(types)),
+                ).fetchall()
+            rows.sort(key=lambda r: (r["sort_seq"], r["local_id"]), reverse=True)
+            return [r["local_id"] for r in rows]
+        rows = self._run_msg_query(user, build)
+        return list(rows) if rows else []
 
     def get_new_messages(self, user: str, since_seq: int = 0, limit: int = 200) -> List[dict]:
-        """返回 sort_seq > since_seq 的新消息（升序），供轮询监听使用"""
-        rows = self._run_msg_query(
-            user,
-            lambda conn, table: conn.execute(
-                "SELECT local_id, local_type, real_sender_id, create_time, "
-                "message_content, source, packed_info_data, compress_content, sort_seq "
-                "FROM %s WHERE sort_seq > ? ORDER BY sort_seq ASC LIMIT ?" % table,
-                (since_seq, limit),
-            ).fetchall(),
-        )
-        return [self._msg_row_to_dict(r) for r in rows] if rows else []
+        """返回跨分库合并后 sort_seq > since_seq 的新消息（升序），供轮询监听使用"""
+        def build(found):
+            rows = []
+            for conn, table in found:
+                rows += conn.execute(
+                    "SELECT local_id, local_type, real_sender_id, create_time, "
+                    "message_content, source, packed_info_data, compress_content, sort_seq "
+                    "FROM %s WHERE sort_seq > ? ORDER BY sort_seq ASC, local_id ASC LIMIT ?"
+                    % table,
+                    (since_seq, limit),
+                ).fetchall()
+            rows.sort(key=lambda r: (r["sort_seq"], r["local_id"]))
+            return [self._msg_row_to_dict(r) for r in rows[:limit]]
+        return self._run_msg_query(user, build) or []
 
     def _msg_row_to_dict(self, r) -> dict:
         content = r["message_content"]
