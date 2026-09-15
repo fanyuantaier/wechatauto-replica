@@ -15,6 +15,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import traceback
 
 print("=" * 60)
@@ -102,9 +103,17 @@ try:
     d = auto_detect_db_dir()
     print("auto_detect_db_dir:", d)
     if d and os.path.isdir(d):
-        for x in os.listdir(d):
-            if os.path.isdir(os.path.join(d, x, "db_storage")):
-                print("  account dir:", x)
+        import time as _t
+        for x in sorted(os.listdir(d)):
+            sub = os.path.join(d, x, "db_storage")
+            if not os.path.isdir(sub):
+                continue
+            newest = max((os.path.getmtime(os.path.join(r, f))
+                          for r, _, fs in os.walk(sub) for f in fs
+                          if f.endswith(".db")), default=0)
+            print("  account dir: %-34s 最近修改: %s"
+                  % (x, _t.strftime("%Y-%m-%d %H:%M", _t.localtime(newest))
+                     if newest else "?"))
 except Exception as e:
     print("dir detect error:", repr(e))
 
@@ -155,6 +164,123 @@ try:
         print("still missing:", missing2)
 except Exception as e:
     print("extract error:", repr(e))
+    traceback.print_exc()
+
+# 5b. WeChat client version（区分“新版微信/旧版微信”）
+print("\n--- WeChat client version ---")
+try:
+    import psutil
+    seen = set()
+    try:
+        import win32api
+    except Exception:
+        win32api = None
+    for proc in psutil.process_iter(["pid", "name", "exe"]):
+        try:
+            if (proc.info.get("name") or "").lower() != "weixin.exe":
+                continue
+            exe = proc.info.get("exe")
+            if not exe or exe in seen:
+                continue
+            seen.add(exe)
+            print("PID %s: %s" % (proc.info.get("pid"), exe))
+            if win32api is None:
+                continue
+            try:
+                info = win32api.GetFileVersionInfo(exe, "\\")
+                ms, ls = info["FileVersionMS"], info["FileVersionLS"]
+                print("   FileVersion: %d.%d.%d.%d"
+                      % (ms >> 16, ms & 0xFFFF, ls >> 16, ls & 0xFFFF))
+            except Exception as e:
+                print("   FileVersion: 读取失败", repr(e))
+        except Exception:
+            continue
+    if not seen:
+        print("(未找到 Weixin.exe)")
+except Exception as e:
+    print("version check error:", repr(e))
+
+# 5c. 主密钥 + 逐账号可用性（判定“密钥到底属于哪个账号”/“主密钥是否有效”）
+print("\n--- master key / per-account verification ---")
+try:
+    if db is None:
+        db = WeChatDB()
+    master = getattr(db, "master_key", None)
+    if master:
+        print("extract_master_key: 已由构造流程取得")
+    else:
+        got = None
+        try:
+            got = db.extract_master_key()
+        except Exception as e:
+            print("extract_master_key error:", repr(e))
+        if got:
+            master = got[0]
+            print("extract_master_key: OK (cfg_dword=%s, wxid=%s)" % (got[1], got[2]))
+        else:
+            print("extract_master_key: FAILED（微信未运行 / 权限不足 / 版本改动）")
+    print("主密钥: %s" % ("已取得（不打印内容）" if master else "无"))
+    print("各账号目录密钥可用性（缓存 / 主密钥现派生）:")
+    for d in _find_account_dirs(db.db_dir):
+        acct = os.path.basename(d)
+        saved = (db.account, db.account_dir, db._db_files, db._keys,
+                 db.workdir, db.keys_file)
+        try:
+            db.account, db.account_dir = acct, d
+            db.workdir = os.path.join(tempfile.gettempdir(), "wechatauto_db", acct)
+            db.keys_file = os.path.join(db.workdir, "keys.json")
+            db._db_files = db._collect_db_files()
+            db._keys = {}
+            if os.path.exists(db.keys_file):
+                try:
+                    with open(db.keys_file, encoding="utf-8") as f:
+                        for rel, hk in json.load(f).items():
+                            try:
+                                db._keys[rel] = bytes.fromhex(hk)
+                            except ValueError:
+                                pass
+                except Exception:
+                    pass
+            ok_cache = sum(1 for rel, _, _ in db._db_files if db._key_works(rel))
+            ok_derived = 0
+            if master:
+                db._keys = db.derive_keys_from_master(master)
+                ok_derived = sum(1 for rel, _, _ in db._db_files if db._key_works(rel))
+            print("   %-34s 库数 %2d  缓存可用 %2d  主密钥派生 %2d %s"
+                  % (acct, len(db._db_files), ok_cache, ok_derived,
+                     "<== 属于此账号" if (ok_cache or ok_derived) else ""))
+        finally:
+            (db.account, db.account_dir, db._db_files, db._keys,
+             db.workdir, db.keys_file) = saved
+    print("当前使用的账号: %s" % db.account)
+
+    # 一致性：cfg 主密钥能否复现缓存里的库密钥（判定主密钥是否有效）
+    try:
+        from wechatauto.db import _pbkdf2, PAGE_SZ
+        cf = os.path.join(tempfile.gettempdir(), "wechatauto_db", db.account, "keys.json")
+        cached = {}
+        if os.path.exists(cf):
+            with open(cf, encoding="utf-8") as f:
+                cached = json.load(f)
+        rel0 = next((r for r, _, _ in db._db_files if r in cached), None)
+        if master and rel0:
+            with open(db._db_path(rel0), "rb") as f:
+                p1 = f.read(PAGE_SZ)
+            cand = _pbkdf2(bytes.fromhex(master), p1[:16], WeChatDB.KDF_ITER)
+            same = cand.hex() == str(cached[rel0]).lower()
+            print("一致性: cfg 主密钥 %s 复现缓存密钥(%s)"
+                  % ("能" if same else "不能", rel0))
+            if not same:
+                print("         → 说明主密钥回退路径对该版本已失效（不影响内存扫描路径）")
+        else:
+            print("一致性: 缺少主密钥或缓存，跳过")
+    except Exception as e:
+        print("一致性检查失败:", repr(e))
+
+    if not master:
+        print("建议: 确认微信已登录且窗口打开；“以管理员运行”要与本脚本一致")
+except Exception as e:
+    print("master key check error:", repr(e))
     traceback.print_exc()
 
 # 6. verify cached keys actually work

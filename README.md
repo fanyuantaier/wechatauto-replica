@@ -17,7 +17,7 @@
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.2.1 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
+> **Current version:** 1.2.2.2 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -182,6 +182,36 @@ Runnable demo: `python -m wechatauto.demo_moments_interact [--like N | --unlike 
 - Performance: parallel export / first-scan, incremental memory-scan cache
 
 ## 📝 Changelog
+
+### v1.2.2.2 (2026-09-13)
+
+- **Key handling hardened: no more recurring failure after every WeChat update.** Three layers:
+  - **The cache can no longer be wiped**: `_save_keys()` never persists an empty result (atomic write + `.bak` kept). Previously a transient extraction failure (wrong account / permission) **overwrote a good cache with an empty file**, so every later start reported "0 keys" — that is exactly the `keys cached: 0` seen in the field.
+  - **Durable key copy**: a copy is kept at `%LOCALAPPDATA%\wechatauto_keys\<account>.json` (override the directory with the `WECHATAUTO_KEYS_DIR` env var, e.g. your project workspace), surviving TEMP cleanup and WeChat updates. On startup the caches are **merged from several locations** (durable copy → work cache → `.bak` → other accounts' caches) and every entry is verified against page-1 HMAC, keeping only working keys.
+  - **Account selection is now decided by key verification**, not by "most recently modified .db" (a WeChat update rewrites every .db, shifting mtimes and picking the wrong account → 0 keys). One memory scan now collects candidate key material and scores **every account directory** by page-1 HMAC, switching to the one that unlocks (log: `已按密钥校验选定账号目录: …`).
+- **cfg master-key warning**: on WeChat 4.1.13+ the cfg path returns an **untrustworthy master key** (demoted to a fallback since v1.1.9); it now logs an explicit warning when it cannot reproduce any database key instead of silently succeeding.
+- **Better diagnostics (`diagnose_keys`)**: now prints the WeChat client **FileVersion**, per-account "cache / derived" availability and a **master-key consistency check** (which tells you which account the keys belong to); the `_open` error text now lists the three classic causes (32-bit Python / permission mismatch / wrong account among several) plus the `account=` hint.
+
+### v1.2.2.1 (2026-09-12)
+
+- **Compatibility with the new WeChat UI (verified on 4.1.13.65)**: the new build changed `AutomationId` from short names into **dotted paths** (old `session_list` / `chat_input_field` → new `MainView.main_tabbar`, `MainView….main_window_sub_splitter_view…`), which broke exact-equality matching. AutomationIds are now matched as exact / dotted-segment / suffix (`_aid_hit()`), so both the old short names and the new paths resolve.
+- **Relaxed window-title matching**: the new main window title is `Weixin`, and becomes `微信(3)` when there are unread counts; `_title_is_main()` now matches by containment and still rejects unrelated titles such as `WeChat`.
+- **Anchor candidate lists + structural fallbacks**: the main window / login window / search box now match against candidate tuples (single-value constants kept for backward compatibility); the search box, chat input and search-result list each gained a structural fallback (an EditControl whose Name contains 搜索, an EditControl inside the chat area, attribute-based search from the root), so a renamed class or AID in a future build no longer breaks the whole path.
+- **New layout self-check `WeChatUIA.describe_layout()`**: one call returns the main class name, window title, layout kind (`merged` / `legacy` / `chat`) and the resolution result of every anchor (main_window, search_box, session_list, chat_input, main_tabbar, sns_list). Run it first when a new WeChat build changes the UI.
+- Note: the Moments anchors were already dual-layout (standalone `mmui::SNSWindow` / merged `mmui::SNSContentView`); 4.1.13.65 keeps those class names, so no change was needed there.
+
+### v1.2.2 (2026-09-12)
+
+- **Fix cross-shard message reads (missing messages / voice)**: a conversation's `Msg_<md5>` table actually spans several `message_*.db` shards, but `get_messages` only hit the first one — e.g. a chat with 8,904 real messages (24 voice notes) reported just 1. New `_find_msg_tables()` / `_msg_conns()` / `_shard_rows()` merge reads across all shards and sort by `sort_seq`; `get_messages`, `get_new_messages` and `_find_media_rows` now use the merged view. `get_message_row` gained a `local_type` filter (a `local_id` is **not** unique across shards) and new `get_message_rows_for_media()` returns every shard row; media downloaders pass their type code so the right shard row is selected.
+- **Reliable listener delivery (behavior change)**: the watermark now advances **only after callbacks succeed** (a new `_inflight` boundary prevents re-dispatching unconfirmed messages), callbacks are retried (`max_retries`, default 3) before being logged as dropped, and the watermark is persisted to `listener_watermark.json`. Messages that arrive while your process is down are delivered on the next start instead of being skipped. Pass `watermark_file=""` to disable persistence.
+- **Text restore no longer requires CJK**: pure English / digits / URLs / emoji container-format messages are decoded instead of degrading to `[文本]`.
+- **`Chat.GetNewMessage()` no longer drops backlog**: batches are pulled until caught up (>200 messages) and the watermark only moves to the last message actually returned, instead of jumping to the newest DB position.
+- **UIA materialization self-heal (no child controls after a WeChat restart/upgrade)**: after a WeChat restart or upgrade the Qt accessibility gate byte resets to 0 and the `mmui::` tree degrades to an empty Qt shell (`Qt51514QWindowIcon` + 2 nodes). The driver now hot-writes the gate, **verifies that `mmui::` controls actually materialized**, and retries other candidate RVAs on failure (the RVA that worked is cached per DLL identity). `_get_uia()` self-heals on a 30s throttle — no more "one failed wake and OCR forever", and no manual `refresh=True`. Fallback table gained `4.1.13.65 → 0x0AE2B0C8`.
+- **Moments scroll-positioning fixes**: bounded reversals (at most one per run, then downward-only) and stall detection (the top-cell fingerprint now includes geometry — merged-layout ListItems can share the same Name, which previously looked like a stall and aborted mid-scroll); skip "scroll to top" when the DB ruler says the target is below; the stop criterion is now **"the next moment's UIA control appeared"**; direction/distance fixes (clipped pixels → wheel notches) plus a bottom margin so the "…" button is reachable.
+- **Message type table**: 4.x composite `local_type` is decomposed by its low 32 bits; added `50 音视频通话` (VoIP bubble), `11000 动画表情`, `8594229559345 红包` (the library previously mislabeled it as an appmsg/file card via the low-byte mapping); empty bodies (stickers) now show `[动画表情]` instead of a blank line; `demo_group_messages` decodes zstd for every type and prints one-line summaries.
+- **`demo_listen.py --all`** now auto-discovers new sessions (previously limited to the 30 most recent at startup).
+- **New anti-recall listener `RecallGuard` (BETA)**: after `watch(listener)` every new message is mirrored into a local sqlite DB and attachments (image/voice/video/file) are backed up to `media/`; on a `revokemsg` it prints `[撤回] <revoker> → <original text>` and records it in `recall_events`. **Not fully field-tested — shipped as BETA.**
+- **New `MomentObserver` (BETA)**: observe-and-freeze snapshots of Moments cache keys via `snapshot()` / `diff()` (cache keys have no derivable mapping to feed md5 and the cache is evictable, so observing is the only way to keep them). **Not fully field-tested — shipped as BETA.**
 
 ### v1.2.1 (2026-09-06)
 

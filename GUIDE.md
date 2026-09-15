@@ -200,6 +200,26 @@ lst.stop()                                # 停止 / stop
 
 **watermark 持久化 / Watermark persistence**：监听器记录已消费的 `sort_seq`，下次启动可传入避免重复推送。
 
+**跨分片读取 / Cross-shard reads**：会话消息表 `Msg_<md5>` 横跨多个 `message_*.db` 分片，`get_messages` / `get_new_messages` 已合并全部分片并按 `sort_seq` 排序，增量监听无重放。注意 `local_id` 跨分片不唯一，精确取单条时给 `get_message_row(user, local_id, local_type=类型码)`。
+
+### 4.2 防撤回监听 / Anti-recall listener（`RecallGuard`）
+
+```python
+from wechatauto import WeChatDB, RecallGuard
+from wechatauto.db import Listener
+
+db = WeChatDB()
+guard = RecallGuard(db)                    # 镜像库 + 媒体备份目录自动创建
+lst = Listener(db, interval=1.0)
+guard.watch(lst, backfill=50)              # 挂到监听器：镜像+备份+撤回检测一体
+lst.start()
+```
+
+- 每收到一条**新消息**即写入独立镜像库（`mirror` 表），图片/语音/视频/文件附件增量备份到 `media/` 目录；
+- 检测到撤回系统消息（`revokemsg`）时，终端打印 `[撤回] 撤回者 撤回了一条消息` + 原文（镜像反查窗口内最近消息）+ 媒体备份路径；
+- 撤回事件记入 `recall_events` 表，事后用 `guard.get_recalled(chat=None, limit=50)` 查询；`watch(backfill=N)` 预回填当前库最近 N 条历史提升回溯成功率（历史原文常因微信本地删行已不在，能恢复多少取决于回填时机）；
+- 一行式示例：`python -m wechatauto.demo_recall`（`--backlog=N` 预回填 N 条，`--all` 监听全部会话）。
+
 ### 4.2 WeChat.AddListenChat（wxauto 风格 / wxauto-style）
 
 ```python
@@ -522,9 +542,10 @@ md.download_voice("群名", local_id)      # 自动搜索所有 media_*.db / sea
 | `get_sessions(limit)` | 会话列表 / session list |
 | `search_contact(kw)` | 搜索联系人 / search contacts |
 | `get_nickname(user)` | 反查昵称 / reverse nickname lookup |
-| `get_messages(user, limit, offset)` | 最近消息 / recent messages |
-| `get_message_row(user, local_id)` | 单条原始行 / single raw row |
-| `get_new_messages(user, since_seq)` | 增量消息 / incremental messages |
+| `get_messages(user, limit, offset)` | 最近消息（跨分片合并，sort_seq 降序）/ recent (cross-shard) |
+| `get_message_row(user, local_id, local_type=None)` | 单条原始行（跨分片；类型码定位分片）/ single row |
+| `get_message_rows_for_media(user, local_id)` | 该 id 全部 shard 行 / all shard rows for an id |
+| `get_new_messages(user, since_seq)` | 增量消息（跨分片，watermark 无重放）/ incremental |
 | `_find_media_rows(user, types)` | 按类型取全部媒体 ID / all media IDs by type |
 | `list_message_chats()` | 有消息的会话 / chats that have messages |
 | `export_history(...)` | 导出聊天记录 / export history |
@@ -550,6 +571,16 @@ md.download_voice("群名", local_id)      # 自动搜索所有 media_*.db / sea
 | `download_video(user, lid)` | 视频 .mp4 / video |
 | `download_file(user, lid)` | 原文件 / original file |
 | `download_media(user, lid)` | 按类型自动分发 / auto-dispatch by type |
+
+### RecallGuard（防撤回 / anti-recall）
+
+| 方法 / Method | 说明 / Description |
+|---|---|
+| `RecallGuard(db, mirror_dir, media_dir, window=120)` | 镜像库目录 / 媒体备份目录 / 回溯窗口 |
+| `watch(listener, users=None, backfill=50)` | 挂到 Listener（users=None 监听全部会话）/ attach |
+| `backfill(user, limit)` | 手动补镜像历史 / pre-fill mirror |
+| `get_recalled(chat=None, limit=50)` | 查询撤回事件 / query recall events |
+| `close()` | 关闭镜像库 / close |
 
 ### WeChat / Chat（发送，wxauto 风格 / sending）
 

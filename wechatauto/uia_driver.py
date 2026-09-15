@@ -63,6 +63,73 @@ SESSION_LIST_AID = "session_list"
 SEARCH_LIST_AID = "search_list"
 RESULT_AID_PREFIX = "search_item_"                 # 真实可打开结果的 aid 前缀
 CHAT_INPUT_AID = "chat_input_field"                # 输入框；其 .Name == 当前聊天对象
+
+# ---------------------------------------------------------------------------
+# 新旧版本兼容候选
+# 实测（4.1.13.65）：类名仍是上面这些，但 **AutomationId 变成了点分路径**
+# （例如 MainView.main_tabbar、MainView….main_window_sub_splitter_view），
+# 按短名精确等值匹配会失配。因此：单值锚点保留（兼容外部引用），
+# 新增候选元组 + 容错匹配（精确 / 点分段相等 / 结尾匹配）+ 结构兜底。
+# ---------------------------------------------------------------------------
+MAIN_CLASSES = ("mmui::MainWindow",)
+LOGIN_CLASSES = ("mmui::LoginWindow",)
+MAIN_NAME_HINTS = ("微信", "Weixin")               # 标题按“包含”匹配（新版可能带未读数）
+SEARCH_EDIT_CLASSES = ("mmui::XValidatorTextEdit",)
+SESSION_LIST_AIDS = ("session_list",)
+SEARCH_LIST_AIDS = ("search_list",)
+CHAT_INPUT_AIDS = ("chat_input_field",)
+SNS_LIST_CLASSES = ("mmui::TimeLineListView",)
+SNS_LIST_AIDS = ("sns_list",)
+
+
+def _title_is_main(title: str) -> bool:
+    """主窗口标题判定：兼容“微信/Weixin”及带后缀（未读数等）的新版标题。"""
+    if not title:
+        return False
+    if title in MAIN_NAMES:
+        return True
+    return any(hint in title for hint in MAIN_NAME_HINTS)
+
+
+def _aid_hit(aid: str, candidates) -> bool:
+    """AutomationId 容错匹配（新旧版通用）。
+
+    旧版 aid 是短名（session_list）；新版是点分路径
+    （MainView.main_tabbar…）。故：精确 / 点分段完全相等 / 结尾匹配 均算命中。
+    """
+    a = (aid or "").strip().lower()
+    if not a:
+        return False
+    segs = a.split(".")
+    for c in candidates:
+        cl = (c or "").lower()
+        if not cl:
+            continue
+        if a == cl or a.endswith("." + cl) or cl in segs:
+            return True
+    return False
+
+
+def _find_by(root, pred, max_depth: int = 40):
+    """子树里找第一个满足 pred 的控件（新旧版结构差异的兜底定位手段）。"""
+    if root is None:
+        return None
+    stack = [(root, 0)]
+    while stack:
+        el, d = stack.pop()
+        if d > max_depth:
+            continue
+        try:
+            if pred(el):
+                return el
+        except Exception:
+            pass
+        try:
+            for k in el.GetChildren():
+                stack.append((k, d + 1))
+        except Exception:
+            pass
+    return None
 DEFAULT_EXE = r"C:\Program Files\Tencent\Weixin\Weixin.exe"
 
 # 搜索结果分区标题（aid 为空且名字命中此集合的才算分区头，其余空 aid 视为建议项）
@@ -85,6 +152,7 @@ SPIF_SENDCHANGE = 0x02
 # 自动扫描该 byte 的 RVA，下面的版本表仅作扫描失败时的兜底。
 QACCESSIBLE_ACTIVE_RVA_BY_VERSION = {
     "4.1.11.22": 0x0A1E7DB8,
+    "4.1.13.65": 0x0AE2B0C8,   # 2026-09-12 实测：热写后 mmui 树立即物化
 }
 QACCESSIBLE_CORE_STRING = b"qt.accessibility.core"
 QACCESSIBLE_GATE_PATTERN = re.compile(
@@ -92,6 +160,20 @@ QACCESSIBLE_GATE_PATTERN = re.compile(
     rb"\x00\x0f\x84",
     re.DOTALL,
 )
+
+# 已验证的 gate RVA：按 Weixin.dll 身份（版本目录+大小+mtime）缓存。
+# 好处：换版本后优先使用上次真正生效过的地址；命中时无需重扫 198MB DLL。
+_VERIFIED_GATE_RVA: Dict[str, int] = {}
+
+
+def _dll_identity(dll_path: str) -> str:
+    """Weixin.dll 身份串：版本目录 + 文件大小 + mtime（升级/热更新可区分）。"""
+    try:
+        st = os.stat(dll_path)
+        ver = os.path.basename(os.path.dirname(dll_path))
+        return "%s|%d|%d" % (ver, st.st_size, int(st.st_mtime))
+    except OSError:
+        return dll_path
 IMAGE_SCN_MEM_EXECUTE = 0x20000000
 IMAGE_SCN_MEM_WRITE = 0x80000000
 PROCESS_VM_OPERATION = 0x0008
@@ -315,7 +397,12 @@ class WeChatUIA:
 
     @staticmethod
     @lru_cache(maxsize=8)
-    def _scan_qaccessible_active_rva(dll_path: str) -> Optional[int]:
+    def _scan_qaccessible_candidates(dll_path: str) -> Tuple[int, ...]:
+        """按可信度返回全部 gate RVA 候选（越靠前越可能是真 gate）。
+
+        单一候选在版本升级后会漂移，因此返回候选序列：调用方逐个热写并用
+        「mmui 树是否真的物化」判定，成功者记入 _VERIFIED_GATE_RVA。
+        """
         try:
             with open(dll_path, "rb") as f:
                 data = f.read()
@@ -350,26 +437,45 @@ class WeChatUIA:
 
             if core_xrefs:
                 distance = min(abs(match_rva - xref) for xref in core_xrefs)
-                # 真正的 QAccessible gate 与 qt.accessibility.core 日志分类
-                # 处于同一局部 Qt accessibility 代码岛内
-                if distance > 0x20000:
-                    continue
             else:
                 distance = 0x7FFFFFFF
             candidates.append((distance, target_rva))
 
         if not candidates:
-            return None
+            return ()
         candidates.sort(key=lambda item: item[0])
-        return candidates[0][1]
+        # 优先取与 qt.accessibility.core 同一代码岛（≤0x20000）的候选；
+        # 一个都没有时退化为全部候选，交给热写校验兜底
+        near = [rva for dist, rva in candidates if dist <= 0x20000]
+        ordered = near or [rva for _dist, rva in candidates]
+        return tuple(dict.fromkeys(ordered))
+
+    @staticmethod
+    def _scan_qaccessible_active_rva(dll_path: str) -> Optional[int]:
+        """兼容旧接口：返回最优候选（不含校验）。"""
+        cands = WeChatUIA._scan_qaccessible_candidates(dll_path)
+        return cands[0] if cands else None
+
+    @staticmethod
+    def _qaccessible_candidate_rvas(dll_path: str) -> List[int]:
+        """gate RVA 候选序列：已验证缓存 > 特征扫描 > 版本兜底表。"""
+        out: List[int] = []
+        cached = _VERIFIED_GATE_RVA.get(_dll_identity(dll_path))
+        if cached is not None:
+            out.append(int(cached))
+        for rva in WeChatUIA._scan_qaccessible_candidates(dll_path):
+            if int(rva) not in out:
+                out.append(int(rva))
+        version = os.path.basename(os.path.dirname(dll_path))
+        fallback = QACCESSIBLE_ACTIVE_RVA_BY_VERSION.get(version)
+        if fallback is not None and int(fallback) not in out:
+            out.append(int(fallback))
+        return out
 
     @staticmethod
     def _qaccessible_active_rva(dll_path: str) -> Optional[int]:
-        scanned = WeChatUIA._scan_qaccessible_active_rva(dll_path)
-        if scanned is not None:
-            return scanned
-        version = os.path.basename(os.path.dirname(dll_path))
-        return QACCESSIBLE_ACTIVE_RVA_BY_VERSION.get(version)
+        cands = WeChatUIA._qaccessible_candidate_rvas(dll_path)
+        return cands[0] if cands else None
 
     @staticmethod
     def _read_process_byte(handle, address: int) -> Optional[int]:
@@ -395,8 +501,37 @@ class WeChatUIA:
             handle, ctypes.c_void_p(address), buf, 1, ctypes.byref(written))
         return bool(ok and written.value == 1)
 
-    def _hot_activate_accessibility(self, hwnd: int) -> bool:
-        """运行中热激活 Qt accessibility gate，不重启微信进程。"""
+    @staticmethod
+    def _mmui_present(hwnd: int, timeout: float = 1.0) -> bool:
+        """校验窗口是否已物化出 mmui 控件（仍是 Qt 空壳时为 False）。"""
+        deadline = time.time() + max(0.1, timeout)
+        while True:
+            try:
+                c = auto.ControlFromHandle(hwnd)
+            except Exception:
+                c = None
+            if c is not None:
+                if (c.ClassName or "").startswith("mmui::"):
+                    return True
+                try:
+                    kids = c.GetChildren()
+                except Exception:
+                    kids = []
+                for k in kids:
+                    if (k.ClassName or "").startswith("mmui::"):
+                        return True
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.2)
+
+    def _hot_activate_accessibility(self, hwnd: int, verify: bool = True,
+                                    max_candidates: int = 4) -> bool:
+        """运行中热激活 Qt accessibility gate，不重启微信进程。
+
+        verify=True（默认）时对每个候选 RVA 写入后用「mmui 控件是否真的出现」
+        校验：版本升级后 gate RVA 会漂移，校验失败即回滚该字节并尝试下一个
+        候选；成功则按 DLL 身份记入 _VERIFIED_GATE_RVA（下次优先使用）。
+        """
         pid = self._pid_from_hwnd(hwnd)
         if not pid:
             return False
@@ -405,8 +540,8 @@ class WeChatUIA:
             wxlog.warning("热激活 UIA 失败：PID %s 未找到 Weixin.dll。", pid)
             return False
         base, _size, dll_path = mod
-        rva = self._qaccessible_active_rva(dll_path)
-        if rva is None:
+        candidates = self._qaccessible_candidate_rvas(dll_path)[:max_candidates]
+        if not candidates:
             wxlog.warning("热激活 UIA 失败：不支持的 Weixin.dll 版本路径 %s。", dll_path)
             return False
 
@@ -422,23 +557,37 @@ class WeChatUIA:
             wxlog.warning("热激活 UIA 失败：无法打开 Weixin.exe PID %s。", pid)
             return False
         try:
-            address = int(base) + int(rva)
-            current = self._read_process_byte(handle, address)
-            if current == 1:
-                return True
-            if current is None:
-                wxlog.warning("热激活 UIA 失败：无法读取 active byte。")
-                return False
-            if not self._write_process_byte(handle, address, 1):
-                wxlog.warning("热激活 UIA 失败：无法写入 active byte。")
-                return False
-            wxlog.info("已热激活微信 UIA 树：PID=%s Weixin.dll+0x%x: %s -> 1",
-                       pid, rva, current)
-            return True
+            for rva in candidates:
+                address = int(base) + int(rva)
+                current = self._read_process_byte(handle, address)
+                if current is None:
+                    continue
+                wrote = False
+                original = current
+                if current != 1:
+                    if not self._write_process_byte(handle, address, 1):
+                        continue
+                    wrote = True
+                    wxlog.info("热激活 UIA：PID=%s Weixin.dll+0x%x: %s -> 1",
+                               pid, rva, current)
+                if not verify:
+                    return True
+                if self._mmui_present(hwnd):
+                    _VERIFIED_GATE_RVA[_dll_identity(dll_path)] = int(rva)
+                    wxlog.info("UIA 树已物化，已记录 gate RVA：Weixin.dll+0x%x", rva)
+                    return True
+                # 候选不对：恢复原值，继续试下一个
+                if wrote:
+                    self._write_process_byte(handle, address, original)
+            wxlog.warning("热激活 UIA 失败：%d 个候选均未使 mmui 树物化（%s）。",
+                          len(candidates), os.path.basename(dll_path))
+            return False
         finally:
             kernel32.CloseHandle(handle)
 
     def _wake_accessibility(self) -> bool:
+        """确保 mmui 树物化：设系统读屏标志 + 逐窗口热写并校验（含候选重试）。"""
+        self._set_screen_reader_flag(True)
         ok = False
         for hwnd in self._wechat_hwnds():
             ok = self._hot_activate_accessibility(hwnd) or ok
@@ -455,7 +604,8 @@ class WeChatUIA:
 
         def cb(h, _):
             try:
-                if win32gui.IsWindowVisible(h) and win32gui.GetWindowText(h) in MAIN_NAMES:
+                title = win32gui.GetWindowText(h)
+                if win32gui.IsWindowVisible(h) and _title_is_main(title):
                     # 只保留加载了 Weixin.dll 的主进程窗口，过滤掉无 DLL 的
                     # 辅助进程窗口（其热激活必然失败，只会产生噪音警告）
                     pid = self._pid_from_hwnd(h)
@@ -481,14 +631,14 @@ class WeChatUIA:
     def _find_main(self):
         for h in self._wechat_hwnds():
             c = self._anchor(h)
-            if c is not None and (c.ClassName or "") == MAIN_CLASS:
+            if c is not None and (c.ClassName or "") in MAIN_CLASSES:
                 return c
         return None
 
     def _login_window(self):
         for h in self._wechat_hwnds():
             c = self._anchor(h)
-            if c is not None and (c.ClassName or "") == LOGIN_CLASS:
+            if c is not None and (c.ClassName or "") in LOGIN_CLASSES:
                 return c
         return None
 
@@ -546,8 +696,8 @@ class WeChatUIA:
     def _wait_main(self, timeout: float, allow_login: bool = True,
                    allow_accessibility_wake: bool = True):
         deadline = time.time() + max(timeout, 15)
-        last_wake = time.time()
-        accessibility_woke = False
+        last_wake = 0.0
+        last_pull = time.time()
         while time.time() < deadline:
             if allow_login:
                 self._auto_login()
@@ -556,18 +706,91 @@ class WeChatUIA:
                 self._win = w
                 self._activate(w)
                 return w
-            if (allow_accessibility_wake and not accessibility_woke
-                    and self._login_window() is None and self._wechat_hwnds()
-                    and time.time() - last_wake > 3):
+            if (allow_accessibility_wake and self._login_window() is None
+                    and self._wechat_hwnds() and time.time() - last_wake > 5):
+                # 周期性复写 gate：微信重启/重建窗口后该字节会归零，
+                # 需补写以免子控件「昨天能扫今天扫不到」（内部含校验与候选重试）
                 self._wake_accessibility()
-                accessibility_woke = True
                 last_wake = time.time()
                 continue
-            if self._login_window() is None and time.time() - last_wake > 6:
+            if self._login_window() is None and time.time() - last_pull > 6:
                 self.wake()
-                last_wake = time.time()
+                last_pull = time.time()
             time.sleep(0.8)
         raise UIATimeout("等待微信主窗口超时（客户端未就绪）。")
+
+    def is_materialized(self) -> bool:
+        """当前是否已物化出 mmui 树（即能扫到子控件）。"""
+        return self._find_main() is not None
+
+    def describe_layout(self) -> dict:
+        """诊断自检：报告当前微信布局与关键锚点解析情况（新旧版兼容排查）。
+
+        返回 dict：main_class / title / layout(merged|legacy|chat) /
+        anchors{main_window,search_box,session_list,chat_input,main_tabbar,sns_list}。
+        某个锚点为 None 即表示它在新版里失配——据此定位要适配的控件。
+        """
+        rep = {"main_class": None, "title": None, "layout": "unknown",
+               "anchors": {}, "wechat_hwnds": self._wechat_hwnds()}
+        w = self._find_main()
+        if w is None:
+            rep["layout"] = "not-materialized-or-not-running"
+            return rep
+        rep["main_class"] = w.ClassName
+        try:
+            rep["title"] = w.Name
+        except Exception:
+            pass
+        merged = _find_by(w, lambda c: (c.ClassName or "") in ("mmui::SNSContentView",
+                                                              "mmui::TimeLineListView"),
+                          max_depth=30)
+        legacy = _find_by(w, lambda c: (c.ClassName or "") == "mmui::SNSWindow",
+                          max_depth=10)
+        rep["layout"] = ("merged" if merged is not None
+                         else "legacy" if legacy is not None else "chat")
+
+        def _desc(el):
+            if el is None:
+                return None
+            return "%s|%s" % (getattr(el, "ClassName", "") or "",
+                              getattr(el, "AutomationId", "") or "")
+
+        checks = {
+            "main_window": lambda c: (c.ClassName or "") in MAIN_CLASSES,
+            "search_box": lambda c: (c.ControlTypeName == "EditControl"
+                                     and SEARCH_EDIT_NAME in (c.Name or "")),
+            "session_list": lambda c: _aid_hit(getattr(c, "AutomationId", ""),
+                                               SESSION_LIST_AIDS),
+            "chat_input": lambda c: _aid_hit(getattr(c, "AutomationId", ""),
+                                             CHAT_INPUT_AIDS),
+            "main_tabbar": lambda c: (c.ClassName or "") == "mmui::MainTabBar",
+            "sns_list": lambda c: (c.ClassName or "") in SNS_LIST_CLASSES
+                                  or _aid_hit(getattr(c, "AutomationId", ""), SNS_LIST_AIDS),
+        }
+        for name, pred in checks.items():
+            rep["anchors"][name] = _desc(_find_by(w, pred, max_depth=30))
+        return rep
+
+    def ensure_materialized(self, timeout: float = 6.0, force: bool = False) -> bool:
+        """确保 mmui 树物化：窗口在但子控件扫不到时热写 gate 并校验。
+
+        与 ensure_window 的分工：本方法不拉起/置前窗口，只修复「窗口存在、
+        但树退化成 Qt 空壳」的状态，供长驻进程按需自愈（微信重启/升级后
+        gate byte 归零导致子控件整片消失的场景）。force=True 时即使当前
+        已物化也重新走一遍热写校验。
+        """
+        if not force and self._find_main() is not None:
+            return True
+        if not self._wechat_hwnds():
+            return False
+        deadline = time.time() + max(1.0, timeout)
+        while True:
+            self._wake_accessibility()
+            if self._find_main() is not None:
+                return True
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.5)
 
     def ensure_window(self, wake: bool = True, timeout: Optional[float] = None) -> bool:
         """确保可访问的主窗口存在并置前，返回是否成功。
@@ -588,7 +811,8 @@ class WeChatUIA:
             if self._login_window() is not None:
                 self._auto_login()
             elif self._wechat_hwnds():
-                self._wake_accessibility()
+                # 窗口在但树可能是 Qt 空壳：热写 gate 并校验（候选自动重试）
+                self.ensure_materialized(timeout=min(6.0, max(2.0, timeout / 2)))
             else:
                 self._set_screen_reader_flag(True)
                 self.wake()
@@ -683,20 +907,34 @@ class WeChatUIA:
 
     # ------------------------------------------------------------------ 控件定位
     def _search_box(self, win):
-        for kw in (dict(ClassName=SEARCH_EDIT_CLASS, Name=SEARCH_EDIT_NAME),
-                   dict(Name=SEARCH_EDIT_NAME),
-                   dict(ClassName=SEARCH_EDIT_CLASS)):
-            e = win.EditControl(**kw)
-            if e.Exists(1.0, 0.2):
-                return e
-        return None
+        # 1) 已知锚点（类名+名称 / 名称 / 类名），遍历候选类名
+        for cls in SEARCH_EDIT_CLASSES:
+            for kw in (dict(ClassName=cls, Name=SEARCH_EDIT_NAME),
+                       dict(Name=SEARCH_EDIT_NAME),
+                       dict(ClassName=cls)):
+                e = win.EditControl(**kw)
+                if e.Exists(1.0, 0.2):
+                    return e
+        # 2) 新旧版兜底：Name 含“搜索”的编辑框（忽略类名变化）
+        return _find_by(win, lambda c: (c.ControlTypeName == "EditControl"
+                                        and SEARCH_EDIT_NAME in (c.Name or "")))
 
     def _chat_input(self, win=None):
         win = win or self._win
         if win is None:
             return None
+        # 1) 旧版：aid 短名精确匹配
         e = win.EditControl(AutomationId=CHAT_INPUT_AID)
-        return e if e.Exists(1.0, 0.2) else None
+        if e.Exists(1.0, 0.2):
+            return e
+        # 2) 新版：aid 点分路径 → 容错匹配
+        hit = _find_by(win, lambda c: _aid_hit(getattr(c, "AutomationId", ""),
+                                               CHAT_INPUT_AIDS))
+        if hit is not None:
+            return hit
+        # 3) 结构兜底：聊天区里可编辑的 Edit（排除搜索框）
+        return _find_by(win, lambda c: (c.ControlTypeName == "EditControl"
+                                        and SEARCH_EDIT_NAME not in (c.Name or "")))
 
     def current_chat(self) -> Optional[str]:
         e = self._chat_input()
@@ -705,9 +943,21 @@ class WeChatUIA:
     def _find_search_list(self, timeout: float = 3.0):
         deadline = time.time() + timeout
         while time.time() < deadline:
+            # 1) 旧版：aid 短名
             lst = auto.ListControl(searchDepth=0xFFFFFFFF, AutomationId=SEARCH_LIST_AID)
             if lst.Exists(0.2, 0.1):
                 return lst
+            # 2) 新版：aid 点分路径 → 从根节点按属性容错匹配
+            try:
+                root = auto.GetRootControl()
+            except Exception:
+                root = None
+            hit = _find_by(root, lambda c: (c.ControlTypeName == "ListControl"
+                                            and _aid_hit(getattr(c, "AutomationId", ""),
+                                                         SEARCH_LIST_AIDS)),
+                           max_depth=25)
+            if hit is not None:
+                return hit
             time.sleep(0.2)
         return None
 

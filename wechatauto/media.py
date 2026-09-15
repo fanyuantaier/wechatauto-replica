@@ -518,7 +518,7 @@ class MediaDownloader:
     def download_image(self, user: str, local_id: int, save_dir: Optional[str] = None,
                        aes_key: Optional[str] = None, xor_key: Optional[int] = None) -> Optional[str]:
         """下载图片消息并解密为 jpg/png/gif，返回落盘路径"""
-        row = self.db.get_message_row(user, local_id)
+        row = self.db.get_message_row(user, local_id, local_type=3)
         if not row or row["local_type"] != 3:
             return None
         md5 = self._img_md5(row)
@@ -565,7 +565,7 @@ class MediaDownloader:
 
         微信按账号/时间把语音分片存到多个 media_*.db，逐个搜索直到找到。
         """
-        row = self.db.get_message_row(user, local_id)
+        row = self.db.get_message_row(user, local_id, local_type=34)
         if not row or row["local_type"] != 34 or not row["server_id"]:
             return None
         for rel, path, _ in self.db._db_files:
@@ -595,7 +595,7 @@ class MediaDownloader:
 
     def download_video(self, user: str, local_id: int, save_dir: Optional[str] = None) -> Optional[str]:
         """视频：按 packed_info 中的 id 在 msg/video 下查找 <id>.mp4"""
-        row = self.db.get_message_row(user, local_id)
+        row = self.db.get_message_row(user, local_id, local_type=43)
         if not row or row["local_type"] != 43:
             return None
         pi = row.get("packed_info")
@@ -641,7 +641,7 @@ class MediaDownloader:
 
     def download_file(self, user: str, local_id: int, save_dir: Optional[str] = None) -> Optional[str]:
         """文件：msg/file/<YYYY-MM>/<原文件名>，原文件名来自 message_resource"""
-        row = self.db.get_message_row(user, local_id)
+        row = self.db.get_message_row(user, local_id, local_type=49)
         if not row or row["local_type"] != 49:
             return None
         name = self._file_name(row)
@@ -695,7 +695,7 @@ class MediaDownloader:
         Returns:
             解密后的原图文件路径，失败返回 None
         """
-        row = self.db.get_message_row(user, local_id)
+        row = self.db.get_message_row(user, local_id, local_type=3)
         if not row or row["local_type"] != 3:
             return None
         md5 = self._img_md5(row)
@@ -833,17 +833,19 @@ class MediaDownloader:
         return out
 
     def download_media(self, user: str, local_id: int, save_dir: Optional[str] = None) -> Optional[str]:
-        """按消息类型自动分发：3 图片 / 34 语音 / 43 视频 / 49 文件"""
-        row = self.db.get_message_row(user, local_id)
-        if not row:
-            return None
-        t = row["local_type"]
-        if t == 3:
-            return self.download_image(user, local_id, save_dir)
-        if t == 34:
-            return self.download_voice(user, local_id, save_dir)
-        if t == 43:
-            return self.download_video(user, local_id, save_dir)
-        if t == 49:
-            return self.download_file(user, local_id, save_dir)
+        """按消息类型自动分发：3 图片 / 34 语音 / 43 视频 / 49 文件。
+
+        跨分片下 local_id 可能对应多类型，逐个尝试下载直到成功。
+        """
+        rows = self.db.get_message_rows_for_media(user, local_id)
+        for row in rows:
+            t = row["local_type"]
+            if t == 3:
+                return self.download_image(user, local_id, save_dir)
+            if t == 34:
+                return self.download_voice(user, local_id, save_dir)
+            if t == 43:
+                return self.download_video(user, local_id, save_dir)
+            if t == 49:
+                return self.download_file(user, local_id, save_dir)
         return None

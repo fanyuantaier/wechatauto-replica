@@ -408,6 +408,7 @@ class WeChatGUI:
         self._last_input_box = None  # 最近一次成功发送的输入框位置，连续发送复用
         self._uia = None  # UIA 引擎（惰性创建，仅当可用时启用）
         self._uia_tried = False
+        self._uia_check_ts = 0.0  # 上次 UIA 自愈检查时间（节流用）
         # 布局校准：显式 calibrate=True 强制重校准；否则加载本机已校准配置，
         # 没有配置则自动校准一次（OCR 可用时），实现「跑一次永久兼容」。
         if not calibrate:
@@ -1157,14 +1158,36 @@ class WeChatGUI:
         """惰性创建并复用 UIA 引擎；不可用时返回 None（由调用方降级 OCR）。
 
         混合驱动：UIA 树需热激活（写 Weixin.dll 的 Qt accessibility byte）。
-        首次尝试失败则本次会话内不再重试（避免每条消息都等超时）。
+        首次尝试失败会缓存，但之后按节流窗口自愈：微信重启/升级/重建窗口后
+        gate byte 会归零、子控件整片消失（表现为“昨天能用今天不能”），检测到
+        退化会重新热激活并校验，仍失败才降级 OCR——既不每条消息等超时，也
+        不再需要人工传 refresh=True。
 
         Args:
             refresh: True 时跳过缓存**强制重新热激活**（写 accessibility gate
-                byte）并重建引擎。微信重启/重登后 gate byte 会失效、导致
-                “昨天能用今天不能”，此时传 True 可恢复 UIA 树。
+                byte）并重建引擎。
         """
-        if refresh or not self._uia_tried:
+        _UIA_REASSERT_INTERVAL = 30.0   # 秒：退化后的自愈检查节流窗口
+        now = time.time()
+        if (not refresh
+                and now - getattr(self, '_uia_check_ts', 0.0) < _UIA_REASSERT_INTERVAL):
+            return self._uia
+        self._uia_check_ts = now
+
+        if self._uia is not None and not refresh:
+            try:
+                if self._uia.is_materialized():
+                    return self._uia
+                wxlog.info('UIA 子控件不可见（gate byte 可能已归零），重新热激活…')
+                if self._uia.ensure_materialized(timeout=4.0):
+                    return self._uia
+            except Exception as e:
+                wxlog.debug('UIA 自愈失败：%s', e)
+            wxlog.info('UIA 树仍不可用，降级 OCR 驱动')
+            self._uia = None
+            self._uia_tried = False
+
+        if refresh or not self._uia_tried or self._uia is None:
             self._uia_tried = True
             try:
                 from wechatauto.uia_driver import WeChatUIA
