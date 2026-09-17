@@ -985,7 +985,17 @@ class WeChatUIA:
 
     def current_chat(self) -> Optional[str]:
         e = self._chat_input()
-        return (e.Name or None) if e else None
+        if not e:
+            return None
+        name = (e.Name or "").strip()
+        # 微信会在鼠标悬停语音输入入口时，把无障碍提示直接拼到输入框
+        # Name 末尾；前半段仍是实际会话名。若不剥离，open_chat/send_msg
+        # 会把已打开的正确会话误判成其他目标，再错误进入 OCR 兜底。
+        for suffix in ("按住鼠标 语音输入文字", "按住鼠标说话"):
+            if name.endswith(suffix):
+                name = name[:-len(suffix)].rstrip()
+                break
+        return name or None
 
     def _find_search_list(self, timeout: float = 3.0):
         deadline = time.time() + timeout
@@ -1138,13 +1148,51 @@ class WeChatUIA:
         e = self._chat_input()
         if e is None:
             return False
-        self._paste_into(e, text, clear=True)
-        time.sleep(0.2)
+        # Qt 输入框的 Ctrl+V 是异步的：繁忙时 0.2s 后内容仍为空，旧实现
+        # 会直接把 Enter 按在空输入框上，却仍返回 True。优先用 ValuePattern
+        # 等待实际文本出现；旧布局不支持该 pattern 时保留延时兼容路径。
+        value_supported = True
+
+        def _value():
+            nonlocal value_supported
+            try:
+                return (e.GetValuePattern().Value or "").replace("\r\n", "\n")
+            except Exception:
+                value_supported = False
+                return None
+
+        expected = text.replace("\r\n", "\n")
+        pasted = False
+        for _ in range(3):
+            self._paste_into(e, text, clear=True)
+            if not value_supported:
+                time.sleep(0.8)
+                pasted = True
+                break
+            deadline = time.time() + 1.5
+            while time.time() < deadline:
+                if _value() == expected:
+                    pasted = True
+                    break
+                time.sleep(0.1)
+            if pasted:
+                break
+        if not pasted:
+            return False
         try:
             e.SendKeys("{Enter}", waitTime=0.05)
         except Exception:
             return False
-        return True
+        if not value_supported:
+            return True
+        # 输入框清空是客户端接受发送动作的 UI 级确认；数据库确认由上层
+        # verify 继续完成。这里只防止“按键调用成功但实际没有发送”。
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            if _value() == "":
+                return True
+            time.sleep(0.1)
+        return False
 
     def send_text_to(self, text: str, who: str) -> bool:
         """打开会话并发送文本（组合动作）。"""
