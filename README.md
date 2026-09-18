@@ -17,7 +17,7 @@
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.2.2.3 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
+> **Current version:** 1.2.2.4 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -182,6 +182,15 @@ Runnable demo: `python -m wechatauto.demo_moments_interact [--like N | --unlike 
 - Performance: parallel export / first-scan, incremental memory-scan cache
 
 ## 📝 Changelog
+
+### v1.2.2.4 (2026-09-18)
+
+- **Fixed: a wrong key form could make an entire message shard unreadable.** A cached key could be stored as 48 bytes (32B key + 16B explicit salt), but decryption picks its branch by **key length** — 48 bytes takes the “plaintext header” branch and produces a file whose header is not SQLite (`file is not a database`), making that shard (a 96 MB `message_0.db` in practice) completely unreadable. Three guards now: **verify the standard form first when storing** (store a bare 32-byte key unless the DB really uses a plaintext header), **normalize on read**, and **auto-correct legacy entries when loading the cache**.
+- **Fixed: “database merge failed” was raised outright while WeChat keeps writing.** The old code wrote decrypt results straight onto the cache file and raised on failure, destroying the last usable copy. Now: build a **self-consistent main-DB snapshot** as a floor (verified with `quick_check`, re-read up to 4 times) → then try merging WAL frames on a copy (fall back to the main snapshot with a warning) → all intermediate files are written to a temp path and **atomically replaced only on success**, so a failure never destroys the previous usable copy.
+- **Fixed: leftover cache entries for databases that no longer exist crashed construction** (`KeyError`) — now fully tolerated.
+- **Layout: added a phone-style portrait profile** (dual profiles `wide` / `portrait`), auto-selected by window aspect ratio, each calibrated and stored independently (old flat files migrate automatically). Also fixed **session lookup in portrait mode** (the name-column filter discarded every session name as an “avatar area”, so `find_session` always returned None).
+- **Cleanup**: removed 10 unused imports; added debug logs to 8 silently-swallowing handlers (a probe failure must not masquerade as a normal result); `demo_send.py` no longer hardcodes another user’s path or a real wxid (default image auto-discovers RWTemp); real wxids in READMEs replaced with placeholders.
+- **New `tools/selftest.py`**: read-only self-check (layout / keys / sessions / messages), run in one command.
 
 ### v1.2.2.3 (2026-09-16)
 

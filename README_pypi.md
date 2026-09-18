@@ -32,7 +32,7 @@
 本项目复刻上游 wxauto 项目，目标是实现对当前微信 4.x Windows 客户端的自动化
 （读取消息、发送消息、媒体下载、朋友圈），非网页版，直接操作本机客户端。
 
-> 当前版本：1.2.2.3
+> 当前版本：1.2.2.4
 >
 > **兼容范围**：Windows 10/11 ｜ Python 3.9+（已在 3.12 验证）｜ 微信 **4.1.12+**
 > （数据库读取路线对微信版本不敏感；坐标+OCR 发送路线依赖 4.1.12+ 自绘渲染
@@ -57,6 +57,15 @@
 ---
 
 ## 版本记录
+
+### v1.2.2.4（2026-09-18）
+
+- **修复：密钥形式错误会让整个消息分片读不出来**。密钥缓存里可能存成 48 字节（32B key + 16B 显式 salt）形式，而解密按**密钥长度**选分支——48 字节会走「明文头库」分支，解出的文件头不是 SQLite（`file is not a database`），该分片（实测 96MB 的 `message_0.db`）整库不可读、读消息全部失败。现三重防护：**存储时先按标准形式校验**（通过即存 32 字节裸密钥，仅明文头库才存 48 字节）、**读取时归一化判定**、**缓存加载时自动纠正历史条目**。
+- **修复：微信持续写入时「数据库合并失败」直接报错**。原实现把解密结果直接写在缓存文件上，合并失败即抛 `RuntimeError`，且会毁掉上一份可用副本。现在：先做**主库自洽快照**当底线（解密后 `quick_check`，失败自动重读最多 4 次）→ 再在副本上尝试合并 WAL（失败降级为「仅主库快照」并告警）→ 全程写临时文件、**成功才原子替换**，任何失败都不破坏上一份可用副本。
+- **修复：缓存残留已不存在的库条目会让构造整体崩**（`KeyError`）——现已整体容错。
+- **布局：新增手机式竖屏（双档位 `wide` / `portrait`）**，按窗口长宽比自动选档、两档独立校准并存于布局文件（旧格式自动迁移）；同时修复**竖屏下会话定位失效**（名字列过滤把整列会话名当成头像区滤掉 → `find_session` 恒返回 None）。
+- **清理**：删除 10 处未使用 import；8 处「吞异常」补 debug 日志（不再把探测失败伪装成正常结果）；`demo_send.py` 去掉他人用户名与本机路径、默认图片改为自动探测 RWTemp；README 中真实 wxid 改占位。
+- **新增 `tools/selftest.py`**：只读自检（layout / keys / sessions / messages），`python tools/selftest.py` 一次跑完。
 
 ### v1.2.2.3（2026-09-16）
 
@@ -753,7 +762,7 @@ quick_send_file(r'D:\资料\报告.pdf', '文件传输助手')
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.2.2.3 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
+> **Current version:** 1.2.2.4 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -913,6 +922,15 @@ Runnable demo: `python -m wechatauto.demo_moments_interact [--like N | --unlike 
 - Performance: parallel export / first-scan, incremental memory-scan cache
 
 ## 📝 Changelog
+
+### v1.2.2.4 (2026-09-18)
+
+- **Fixed: a wrong key form could make an entire message shard unreadable.** A cached key could be stored as 48 bytes (32B key + 16B explicit salt), but decryption picks its branch by **key length** — 48 bytes takes the “plaintext header” branch and produces a file whose header is not SQLite (`file is not a database`), making that shard (a 96 MB `message_0.db` in practice) completely unreadable. Three guards now: **verify the standard form first when storing** (store a bare 32-byte key unless the DB really uses a plaintext header), **normalize on read**, and **auto-correct legacy entries when loading the cache**.
+- **Fixed: “database merge failed” was raised outright while WeChat keeps writing.** The old code wrote decrypt results straight onto the cache file and raised on failure, destroying the last usable copy. Now: build a **self-consistent main-DB snapshot** as a floor (verified with `quick_check`, re-read up to 4 times) → then try merging WAL frames on a copy (fall back to the main snapshot with a warning) → all intermediate files are written to a temp path and **atomically replaced only on success**, so a failure never destroys the previous usable copy.
+- **Fixed: leftover cache entries for databases that no longer exist crashed construction** (`KeyError`) — now fully tolerated.
+- **Layout: added a phone-style portrait profile** (dual profiles `wide` / `portrait`), auto-selected by window aspect ratio, each calibrated and stored independently (old flat files migrate automatically). Also fixed **session lookup in portrait mode** (the name-column filter discarded every session name as an “avatar area”, so `find_session` always returned None).
+- **Cleanup**: removed 10 unused imports; added debug logs to 8 silently-swallowing handlers (a probe failure must not masquerade as a normal result); `demo_send.py` no longer hardcodes another user’s path or a real wxid (default image auto-discovers RWTemp); real wxids in READMEs replaced with placeholders.
+- **New `tools/selftest.py`**: read-only self-check (layout / keys / sessions / messages), run in one command.
 
 ### v1.2.2.3 (2026-09-16)
 
