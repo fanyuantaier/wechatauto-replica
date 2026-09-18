@@ -21,7 +21,6 @@ from __future__ import annotations
 import os
 import sys
 import time
-import threading
 
 try:
     os.system("chcp 65001 >nul 2>&1")

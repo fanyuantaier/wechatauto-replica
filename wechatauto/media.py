@@ -42,6 +42,7 @@ import struct
 import tempfile
 import time
 from typing import List, Optional, Tuple
+from wechatauto.logger import wxlog
 
 V1_MAGIC = b"\x07\x08\x05\x56\x02\x05"
 V2_MAGIC = b"\x07\x08\x56\x32\x08\x07"
@@ -249,7 +250,8 @@ class MediaDownloader:
                 )
                 pt = Cipher(algorithms.AES(key16), modes.ECB()).decryptor()
                 out = pt.update(probe) + pt.finalize()
-            except Exception:
+            except Exception as exc:
+                wxlog.debug(f'图片密钥试解失败：{exc!r}')
                 return False
             return out[:3] == b"\xff\xd8\xff" or _jpeg_like(out)
 

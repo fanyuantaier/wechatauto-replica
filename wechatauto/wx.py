@@ -639,7 +639,8 @@ class WeChat(Chat, Listener):
             if not hwnd:
                 return False
             root = _uia.ControlFromHandle(hwnd)
-        except Exception:
+        except Exception as exc:
+            wxlog.debug(f'UIA 根控件获取失败：{exc!r}')
             return False
 
         def _has_timeline() -> bool:
@@ -649,7 +650,8 @@ class WeChat(Chat, Listener):
                     return True
                 sc = _find_descendant(root, lambda c: getattr(c, 'ClassName', '') == 'mmui::SNSContentView', max_depth=30)
                 return sc is not None
-            except Exception:
+            except Exception as exc:
+                wxlog.debug(f'朋友圈控件探测失败：{exc!r}')
                 return False
 
         if _has_timeline():

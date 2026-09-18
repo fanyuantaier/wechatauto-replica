@@ -8,7 +8,7 @@ from wechatauto.utils.win32 import (
     GetPathByHwnd,
     get_windows_by_pid
 )
-from wechatauto.param import WxParam, WxResponse, PROJECT_NAME
+from wechatauto.param import WxResponse, PROJECT_NAME
 from wechatauto.logger import wxlog
 from wechatauto import uia
 from typing import (
@@ -18,7 +18,6 @@ from typing import (
 )
 import os
 import re
-import sys
 
 
 def find_wechat_windows(ui_cls_name: str) -> List[uia.Control]:

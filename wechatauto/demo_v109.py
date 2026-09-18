@@ -31,7 +31,6 @@ except AttributeError:
     pass
 
 from wechatauto import WeChat
-from wechatauto.wx import WxResponse
 
 WHO_DEFAULT = "送你挖银子"
 EMOJI_SAVE_DIR = os.path.join(os.path.expanduser("~"), "emoji_capture")

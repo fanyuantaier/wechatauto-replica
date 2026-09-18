@@ -38,6 +38,7 @@ from ctypes import wintypes
 from typing import Dict, List, Optional, Tuple
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from wechatauto.logger import wxlog
 
 PAGE_SZ = 4096
 RESERVE_SZ = 80  # IV(16) + HMAC(64)
@@ -693,8 +694,29 @@ class WeChatDB:
                     self._keys.setdefault(rel, key)
             # 只保留能通过页1 校验的（丢弃错账号/陈旧条目）
             if self._keys:
-                self._keys = {rel: k for rel, k in self._keys.items()
-                              if self._key_works(rel)}
+                valid: Dict[str, bytes] = {}
+                for rel, k in self._keys.items():
+                    try:
+                        if self._key_works(rel):
+                            valid[rel] = k
+                    except Exception:
+                        continue          # 缓存里可能残留已不存在的库条目，忽略
+                self._keys = valid
+                # 规范化存储形式：48 字节（key+salt）只适用于「明文头」库；
+                # 若能以 32 字节裸密钥通过页1 校验，说明是标准库 → 截回 32 字节。
+                # （否则解密会走错分支，产出 file is not a database 的文件）
+                for rel in list(self._keys):
+                    k = self._keys[rel]
+                    if len(k) != 48:
+                        continue
+                    try:
+                        with open(self._db_path(rel), "rb") as f:
+                            _p1 = f.read(PAGE_SZ)
+                    except Exception:
+                        continue
+                    if _verify_enc_key(k[:32], _p1):
+                        self._keys[rel] = k[:32]
+                self._save_keys()
             
             missing = [
                 rel for rel, path, _ in self._db_files
@@ -827,14 +849,15 @@ class WeChatDB:
         return None
 
     def _key_works(self, rel: str) -> bool:
+        """该库密钥是否能通过页1 校验（rel 已不存在等异常一律 False）。"""
         key = self._keys.get(rel)
         if not key:
             return False
-        path = self._db_path(rel)
         try:
+            path = self._db_path(rel)
             with open(path, "rb") as f:
                 page1 = f.read(PAGE_SZ)
-        except OSError:
+        except Exception:
             return False
         return _verify_enc_key(key, page1)
 
@@ -942,7 +965,14 @@ class WeChatDB:
         return out
 
     def _keys_from_candidates(self, cands) -> Dict[str, bytes]:
-        """把候选材料对**当前 self._db_files** 逐个 HMAC 校验，返回可用密钥。"""
+        """把候选材料对**当前 self._db_files** 逐个 HMAC 校验，返回可用密钥。
+
+        存储形式按库的实际布局决定：**先按标准形式（文件头 salt）校验**，通过就
+        存 32 字节裸密钥；只有标准形式验不过时（明文头库）才用候选自带的显式
+        salt 并存成 48 字节 key+salt。
+        顺序很关键：若先试显式 salt，标准库也会被存成 48 字节，解密时就会走
+        「明文头」分支，产出非 SQLite 文件（实测踩过：file is not a database）。
+        """
         keys: Dict[str, bytes] = {}
         for cand, salt in cands:
             for rel, path, _ in self._db_files:
@@ -953,8 +983,11 @@ class WeChatDB:
                         page1 = f.read(PAGE_SZ)
                 except OSError:
                     continue
-                if _verify_enc_key(cand, page1, salt=salt):
-                    keys[rel] = cand + (salt or b"")
+                if _verify_enc_key(cand, page1):
+                    keys[rel] = cand                      # 标准库：32 字节
+                    break
+                if salt and _verify_enc_key(cand, page1, salt=salt):
+                    keys[rel] = cand + salt               # 明文头库：48 字节
                     break
         return keys
 
@@ -969,7 +1002,8 @@ class WeChatDB:
         best = None
         try:
             dirs = _find_account_dirs(self.db_dir)
-        except Exception:
+        except Exception as exc:
+            wxlog.debug(f'枚举账号目录失败，跳过账号自愈：{exc!r}')
             return False
         for d in dirs:
             acct = os.path.basename(d)
@@ -1312,6 +1346,18 @@ class WeChatDB:
         src = self._db_path(rel)
         dst = os.path.join(self.workdir, rel.replace(os.sep, "__"))
         key = self._keys[rel]
+        if len(key) == 48:
+            # 兼容历史上误存的形式：48 字节 = key+salt，仅适用于「明文头」库；
+            # 标准 SQLCipher 库若存成 48 字节，解密会保留文件头 16 字节、从
+            # offset 16 开始解 → 产出非 SQLite 文件（file is not a database）。
+            # 用页1 校验判定：文件头 salt 能验过 → 标准形式，截回 32 字节。
+            try:
+                with open(src, "rb") as _f:
+                    _p1 = _f.read(PAGE_SZ)
+                if _verify_enc_key(key[:32], _p1):
+                    key = key[:32]
+            except OSError:
+                pass
         src_mtime = os.path.getmtime(src)
         src_size = os.path.getsize(src)
         wal_path = self._wal_path(rel)
@@ -1337,30 +1383,59 @@ class WeChatDB:
                 old = None
         build = (not old or old["mtime"] != src_mtime or old["size"] != src_size
                  or old["wal_mtime"] != wal_mtime or old["wal_size"] != wal_size)
-        attempt = 0
-        while build:
-            attempt += 1
-            full = (not old or old["mtime"] != src_mtime or old["size"] != src_size
-                    or wal_size < old["wal_size"] or wal_size == 0)
-            if full:
-                self._decrypt_file(src, dst, key)
-                applied = 0
-            else:
-                applied = old["applied"]
-            if wal_path and wal_size > self.WAL_HEADER_SZ:
-                applied = self._merge_wal(dst, wal_path, key, applied)
-            else:
-                applied = 0
-            if self._check_merged(dst):
-                build = False
+        # 构建策略：**先做主库自洽快照当底线，再尝试合并 WAL**。
+        # 主库在上次 checkpoint 时是自洽的（SQLite 保证），所以「仅解密主库」
+        # 一定可读，代价是可能缺最近少量消息；WAL 合并成功则用更新的那份。
+        # 关键：任何中间产物都写在 tmp，**成功才原子替换** dst，失败不会毁掉
+        # 上一份已验证副本。
+        tmp = dst + ".tmp"
+        applied = 0
+        if build:
+            # 微信 checkpoint 会**就地改写主库页**：单次读取可能读到“撕裂”状态
+            # （页头与内容来自不同时刻）→ quick_check 会失败。故解密后必须校验，
+            # 失败就重读（每次重读都是一次新的快照）。
+            best = None
+            for attempt in range(1, 5):
+                self._decrypt_file(src, tmp, key)
+                if self._check_merged(tmp):
+                    best = tmp
+                    break
+                wxlog.debug('主库解密快照校验失败（第 %d/4 次）: %s' % (attempt, rel))
+                time.sleep(0.35)
+            if best is None:
+                if os.path.exists(dst) and self._check_merged(dst):
+                    wxlog.warning('主库持续处于撕裂状态，改用上一份可用副本（可能略旧）: %s'
+                                  % rel)
+                    build = False
+                else:
+                    raise RuntimeError("数据库解密结果校验失败(微信正在 checkpoint): %s" % rel)
+            if build:
+                best_applied = 0
+                if wal_path and wal_size > self.WAL_HEADER_SZ:
+                    merged = dst + ".wal"
+                    ok_wal = False
+                    for attempt in (1, 3):
+                        try:
+                            shutil.copyfile(best, merged)
+                            got = self._merge_wal(merged, wal_path, key, 0)
+                            if self._check_merged(merged):
+                                os.replace(merged, best)
+                                best_applied, ok_wal = got, True
+                                break
+                        except Exception as exc:
+                            wxlog.debug('WAL 合并第 %d 次失败：%r' % (attempt, exc))
+                        time.sleep(0.3)
+                    if not ok_wal:
+                        best_applied = -1          # 标记：本轮未合并 WAL
+                        wxlog.warning('WAL 合并失败（微信持续写入），改用仅主库快照'
+                                      '（可能缺少最近消息）: %s' % rel)
+                os.replace(best, dst)
+                applied = best_applied
                 os.makedirs(os.path.dirname(stamp), exist_ok=True)
                 with open(stamp, "w") as f:
                     f.write("%d,%r,%d,%r,%d,%d"
                             % (STAMP_VERSION, src_mtime, src_size, wal_mtime, wal_size, applied))
-            elif attempt >= 3:
-                raise RuntimeError("数据库合并失败(文件被微信并发改写): %s" % rel)
-            else:
-                old = None  # 合并结果损坏 → 全量重建重试
+            build = False
         conn = sqlite3.connect(f"file:{dst}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
         conn.text_factory = _sqlite_text_factory
@@ -1549,7 +1624,7 @@ class WeChatDB:
             return
         removed = 0
         for n in names:
-            if n.endswith(".db") or n.endswith(".stamp"):
+            if n.endswith(".db") or n.endswith(".stamp") or n.endswith(".tmp"):
                 try:
                     os.remove(os.path.join(self.workdir, n))
                     removed += 1
@@ -2149,6 +2224,8 @@ class WeChatDB:
                 continue
             conn = self._open(rel)
             try:
+                # 有意全表枚举（需全部 username 建 md5 反查表）：走游标逐行
+                # 迭代、不 fetchall，内存占用与表大小无关，故不加 LIMIT。
                 if base == "contact.db":
                     rows = conn.execute("SELECT username FROM contact")
                 else:

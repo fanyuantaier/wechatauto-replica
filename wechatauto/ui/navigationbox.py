@@ -1,6 +1,5 @@
 from wechatauto import uia
 from wechatauto.languages import WECHAT_NAVIGATION_BOX, get_lang
-from wechatauto.param import WxParam
 
 
 class NavigationBox:

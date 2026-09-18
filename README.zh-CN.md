@@ -206,7 +206,7 @@
   （系统账号），`open_chat` 传入 username 时自动通过本地 DB 映射为昵称/备注/
 - **感谢 [uiharukazari0105](https://github.com/uiharukazari0105)** 报告 v1.1.7 版本缺失 _derive_xor_key 方法的 bug。
   微信号再搜索（`_resolve_search_keyword`），并清空搜索框残留重试；
-  实测 `open_chat('wxid_sb9or2x9zxj012')` 成功。
+  实测 `open_chat('wxid_xxxxxxxxxxxx')` 成功。
 - **UIA 表情包精确读取**（`msgs/mtype.py` + `uia_driver.py`）：热激活后消息
   列表暴露 `mmui::RecyclerListView`，新增 `find_in_message_list()` 用鼠标滚轮
   驱动虚拟化列表滚动，按 ClassName/Name 定位表情行并取 BoundingRectangle

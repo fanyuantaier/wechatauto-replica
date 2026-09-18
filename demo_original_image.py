@@ -9,8 +9,6 @@
 """
 
 import argparse
-import sys
-import time
 
 from wechatauto import WeChatDB, MediaDownloader
 

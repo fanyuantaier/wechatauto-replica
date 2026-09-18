@@ -1,11 +1,8 @@
 from wechatauto import uia
 from wechatauto.param import PROJECT_NAME
-from wechatauto.logger import wxlog
 from wechatauto.utils.lock import uilock
 from abc import ABC, abstractmethod
 import win32gui
-from typing import Union
-import time
 
 
 class BaseUIWnd(ABC):

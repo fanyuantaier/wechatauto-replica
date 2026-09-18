@@ -32,7 +32,7 @@ from PIL import Image
 from wechatauto import uia
 from wechatauto.languages import MOMENTS, get_lang
 from wechatauto.logger import wxlog
-from wechatauto.param import WxParam, WxResponse
+from wechatauto.param import WxResponse
 from wechatauto.ui.base import BaseUISubWnd
 from wechatauto.utils.tools import find_all_windows_from_root
 from wechatauto.utils.win32 import SetClipboardText
@@ -497,7 +497,8 @@ class MomentList(BaseUISubWnd):
             return False
         try:
             return self.control.Exists(wait)
-        except Exception:
+        except Exception as exc:
+            wxlog.debug(f'朋友圈控件 Exists 探测失败：{exc!r}')
             return False
 
     def refresh(self) -> None:
@@ -2562,7 +2563,8 @@ class MomentActionMenu(BaseUISubWnd):
             return False
         try:
             return self.control.Exists(wait)
-        except Exception:
+        except Exception as exc:
+            wxlog.debug(f'朋友圈控件 Exists 探测失败：{exc!r}')
             return False
 
     def _find_button(self, names: Iterable[str]) -> Optional[uia.Control]:
@@ -2650,7 +2652,8 @@ class MomentCommentDialog(BaseUISubWnd):
             return False
         try:
             return self.control.Exists(wait)
-        except Exception:
+        except Exception as exc:
+            wxlog.debug(f'朋友圈控件 Exists 探测失败：{exc!r}')
             return False
 
     def send(self, content: str) -> WxResponse:

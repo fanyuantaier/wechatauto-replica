@@ -1239,7 +1239,8 @@ class WeChatGUI:
                     if g > r + 25 and g > b + 25 and g > 100:
                         green += 1
             return green > 20
-        except Exception:
+        except Exception as exc:
+            wxlog.debug(f'绿色像素探测失败：{exc!r}')
             return False
 
     def _get_uia(self, refresh: bool = False):
@@ -1375,7 +1376,8 @@ class WeChatGUI:
             non_white = sum(1 for y in range(0, h, 6) for x in range(0, w, 6)
                             if sum(px[x, y][:3]) / 3 <= 235)
             return non_white > 30
-        except Exception:
+        except Exception as exc:
+            wxlog.debug(f'非白像素探测失败：{exc!r}')
             return False
 
     def _chat_is_open(self, name: str) -> bool:
@@ -1396,7 +1398,8 @@ class WeChatGUI:
             else:
                 frags = (name,)
             return any(f and f in title for f in frags)
-        except Exception:
+        except Exception as exc:
+            wxlog.debug(f'标题片段匹配失败：{exc!r}')
             return False
 
     def _search_chat(self, name: str) -> bool:

@@ -12,7 +12,7 @@
     目标    要发送到的会话名（昵称/备注/搜索关键词），默认「文件传输助手」
     内容    文本消息内容；不填则生成带时间戳的测试消息
     --image 图片路径。不带路径时使用默认图片（RWTemp 最新截图）
-    --file  文件路径。默认 C:\\Users\\fxj13\\Documents\\Default Project\\README.md
+    --file  文件路径。默认当前目录下的 README.md
     --skip-text   跳过文本消息
     --skip-image  跳过图片
     --skip-file   跳过文件
@@ -51,27 +51,42 @@ except AttributeError:
 from wechatauto import WeChatGUI, WeChatDB, WxResponse
 
 # 默认图片：RWTemp 中最新的截图（微信收到的图片会缓存在这里）
-DEFAULT_IMAGE = (
-    r"D:\微信文件\xwechat_files\wxid_gzalsg6ockm822_236a\temp\RWTemp\2026-08"
-    r"\b0c56fafd84abdd055b91d47b1516550.png"
-)
+# 默认图片：留空则用 pick_default_image() 自动挑 RWTemp 里最新的截图；
+# 如需固定路径，请填自己的本地路径（勿提交真实 wxid/路径）
+DEFAULT_IMAGE = ""
 # 默认文件
-DEFAULT_FILE = r"C:\Users\fxj13\Documents\Default Project\README.md"
+DEFAULT_FILE = os.path.join(os.getcwd(), "README.md")   # 默认发当前目录的 README
 
 
 def pick_default_image() -> str:
-    """在 RWTemp 目录下找最新的一张图片；找不到则回退到 DEFAULT_IMAGE。"""
-    base = os.path.dirname(DEFAULT_IMAGE)
-    if os.path.isdir(base):
-        imgs = sorted(
-            glob.glob(os.path.join(base, "*.png"))
-            + glob.glob(os.path.join(base, "*.jpg"))
-            + glob.glob(os.path.join(base, "*.jpeg")),
-            key=os.path.getmtime,
-        )
-        if imgs:
-            return imgs[-1]
-    return DEFAULT_IMAGE
+    """在微信 RWTemp 目录里找最新的一张图片；找不到则回退 DEFAULT_IMAGE（可能为空）。
+
+    目录自动探测（不写死本机路径）：在「文档\xwechat_files\*\temp」下找
+    RWTemp 之类的缓存目录；也可用环境变量 WECHATAUTO_RWTEMP 显式指定。
+    """
+    cands = []
+    env = os.environ.get("WECHATAUTO_RWTEMP")
+    if env:
+        cands.append(env)
+    for base in (os.path.expanduser("~/Documents/xwechat_files"),
+                 os.path.expanduser("~/Documents/WeChat Files"),
+                 os.path.expanduser("~/Documents/WeChatFiles")):
+        cands += glob.glob(os.path.join(base, "*", "temp", "RWTemp"))
+        cands += glob.glob(os.path.join(base, "*", "temp"))
+    newest, newest_m = "", 0.0
+    for d in cands:
+        if not os.path.isdir(d):
+            continue
+        for p in glob.glob(os.path.join(d, "**", "*"), recursive=True):
+            if os.path.splitext(p)[1].lower() not in (".png", ".jpg", ".jpeg"):
+                continue
+            try:
+                m = os.path.getmtime(p)
+            except OSError:
+                continue
+            if m > newest_m:
+                newest, newest_m = p, m
+    return newest or DEFAULT_IMAGE
 
 
 def resolve_target(db: WeChatDB, raw: str) -> str:
