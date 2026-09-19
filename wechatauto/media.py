@@ -19,8 +19,11 @@ server_id、packed_info），本模块负责把媒体内容从本地取回/解�
 
     - AES 密钥: 16 字节 ASCII（字母/数字），仅在 Weixin.exe 进程内存中。
       通过 AES-ECB 解首块密文、校验 JPEG/PNG 魔数反推出（内存正则扫描）。
-    - XOR 密钥: 单字节，从同图缩略图 ``<md5>_t.dat`` 尾部 JPEG 结束标记
-      ``FF D9`` 反推（``key = tail[0] ^ 0xFF``）。
+    - XOR 密钥: 单字节，等于 cfgDword 低字节（本机 2026-09-19 实测
+      295/295 个 Sns 缓存容器与聊天 .dat 一致）；拿不到 cfg 时才退回
+      缩略图尾部统计反推（``key = tail[0] ^ 0xFF``）。
+    - 尾部页脚: Sns 缓存有 189/295 个容器在 ``FF D9`` 之后还追加 24 字节
+      页脚，所以「明文末尾 == FF D9」不能当硬判据，解密后按结束标记裁剪。
 
 用法::
 
@@ -61,6 +64,29 @@ def _jpeg_like(pt: bytes) -> bool:
 
 def aligned_aes_block_size(aes_size: int) -> int:
     return aes_size + (16 - aes_size % 16) if aes_size % 16 else aes_size + 16
+
+
+# Sns 缓存容器会在图片结束标记之后再追加一段页脚（实测 24 字节）。只按
+# 「明文末尾 == FF D9」判定密钥，会让这类容器退回错误密钥并留下坏尾。
+_FOOTER_MAX = 32
+
+_IMG_END_MARK = (
+    (b"\xff\xd8", b"\xff\xd9"),
+    (b"\x89PNG\r\n\x1a\n", b"\x49\x45\x4e\x44\xae\x42\x60\x82"),
+)
+
+
+def strip_container_footer(plain: bytes) -> Tuple[bytes, int]:
+    """按图片结束标记裁掉尾部页脚，返回 (明文, 被裁掉的字节数)。"""
+    for soi, end in _IMG_END_MARK:
+        if not plain.startswith(soi) or len(plain) <= len(end):
+            continue
+        if plain.endswith(end):
+            return plain, 0
+        i = plain.rfind(end)
+        if i > 0 and len(plain) - i - len(end) <= _FOOTER_MAX:
+            return plain[:i + len(end)], len(plain) - i - len(end)
+    return plain, 0
 
 
 class MediaDownloader:
@@ -192,7 +218,11 @@ class MediaDownloader:
         return None
 
     def _derive_xor_key(self, dat_path: str) -> int:
-        """从同图缩略图 <md5>_t.dat 尾部 FF D9 反推单字节 XOR 密钥"""
+        """从同图缩略图 <md5>_t.dat 尾部 FF D9 反推单字节 XOR 密钥。
+
+        结束标记允许出现在文件末尾之前（最多回看 ``_FOOTER_MAX`` 字节）——
+        Sns 缓存在 FF D9 之后还挂着页脚，只比对末两字节会退化成错误密钥。
+        """
         for cand in (
             dat_path[:-4] + "_t.dat",
             dat_path[:-4] + "_h.dat",
@@ -202,17 +232,35 @@ class MediaDownloader:
                 continue
             try:
                 with open(cand, "rb") as f:
-                    f.seek(-2, 2)
-                    tail = f.read(2)
+                    f.seek(0, 2)
+                    back = min(f.tell(), 2 + _FOOTER_MAX)
+                    f.seek(-back, 2)
+                    tail = f.read()
             except OSError:
                 continue
-
-            if len(tail) == 2:
-                key = tail[0] ^ 0xFF
-                if tail[1] ^ 0xD9 == key:
+            for off in range(len(tail) - 1):
+                key = tail[-2 - off] ^ 0xFF
+                if tail[-1 - off] ^ key == 0xD9:
                     return key
 
         return 0x88
+
+    def _install_xor_key(self) -> int:
+        """账号级单字节 XOR 密钥：cfgDword 低字节(权威) → 缩略图统计 → 0x88。
+
+        缓存到 ``self._xor_key``。逐文件猜尾部只作兜底，因为带页脚的容器
+        会让尾部判据失效。
+        """
+        if self._xor_key is not None:
+            return self._xor_key
+        derived = self._derive_cfg_key()
+        if derived:
+            self._xor_key = derived[1]
+        else:
+            self._xor_key = self._get_xor_key(self._collect_templates())
+        if self._xor_key is None:
+            self._xor_key = 0x88
+        return self._xor_key
 
     def _scan_aes_key(self, monitor: bool = False,
                       monitor_timeout: float = 120.0) -> Optional[str]:
@@ -332,7 +380,8 @@ class MediaDownloader:
         # 2) AES: cfgDword 派生优先
         derived = self._derive_cfg_key()
         if derived:
-            self._img_key = (derived[0], xor_key)
+            self._xor_key = xor_key = derived[1]
+            self._img_key = (derived[0], derived[1])
             return self._img_key
         aes_key = None
         if self._image_key and self._validate_key(self._image_key):
@@ -396,7 +445,7 @@ class MediaDownloader:
 
         aes_size, xor_size = struct.unpack_from("<LL", data, 6)
         if xor_key is None:
-            xor_key = self._derive_xor_key(dat_path)
+            xor_key = self._install_xor_key()
         if aes_key is None:
             aes_key = self._resolve_aes_key()
             if not aes_key:
@@ -416,7 +465,12 @@ class MediaDownloader:
         pad = pt[-1] if pt else 0
         if 1 <= pad <= 16 and all(b == pad for b in pt[-pad:]):
             pt = pt[:-pad]
-        return pt + raw_data + bytes(b ^ (xor_key & 0xFF) for b in xor_data)
+        out = pt + raw_data + bytes(b ^ (xor_key & 0xFF) for b in xor_data)
+        out, footer = strip_container_footer(out)
+        if footer:
+            wxlog.debug("V2 尾部 %d 字节页脚已按结束标记裁剪: %s"
+                        % (footer, dat_path))
+        return out
 
     # ------------------------------------------------------------------
     # 定位本地文件

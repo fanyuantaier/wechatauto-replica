@@ -17,7 +17,7 @@
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.2.2.4 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
+> **Current version:** 1.2.2.5 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -182,6 +182,14 @@ Runnable demo: `python -m wechatauto.demo_moments_interact [--like N | --unlike 
 - Performance: parallel export / first-scan, incremental memory-scan cache
 
 ## 📝 Changelog
+
+### v1.2.2.5 (2026-09-19)
+
+- **Fixed: cached Moments pictures decrypted into files nothing could decode.** Two independent causes on the same `.dat` v2 path:
+  1. **Wrong single-byte XOR key for cache containers.** That key is the low byte of the account's config dword, but the code derived it per file from the plaintext's last two bytes (`tail ^ 0xFF == FF D9`). WeChat appends a **24-byte footer after the image end marker** in Sns cache containers (189/295 measured here), so the check failed and it silently fell back to a wrong key — the whole tail segment came out garbled. Resolution order is now **config dword (authoritative) -> thumbnail statistics -> fallback**, resolved once per account.
+  2. **The footer was kept as image data.** Decrypted output is now trimmed at the JPEG/PNG end marker, so a strict decoder no longer rejects an otherwise valid picture over trailing bytes.
+  Measured: Sns cache containers passing `MediaDownloader.decrypt_image()` **118/295 -> 295/295**; the Moments cache index's decrypt failures **177 -> 0**; a 15,577-file chat-image sample **429 JPEG + 171 wxgf, 0 failures** (chat media unaffected, wxgf/WXAM containers untouched).
+- **Fixed: `MomentDB.find_local_media`'s size guard never ran on its most common path.** The "reject an impostor by size deviation" check only existed on the multi-candidate branch; with exactly one same-dimensions candidate the code returned without comparing anything, so a 66 KB mismatch passed silently. It now logs the deviation and deliberately still **does not** reject: the declared `totalSize` is the CDN original while the cache holds WeChat's re-encoded copy, so a large delta is normal and is not evidence of a wrong image (the multi-candidate rule is unchanged).
 
 ### v1.2.2.4 (2026-09-18)
 

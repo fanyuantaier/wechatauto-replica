@@ -3288,6 +3288,13 @@ class MomentDB:
         if dims_hit:
             # 宽高精确命中
             if len(dims_hit) == 1:
+                if size > 0:
+                    d = abs(dims_hit[0]["plain_size"] - size)
+                    if d > max(_MAX_SIZE_DEV, size * 0.10):
+                        # totalSize 是 CDN 声明值、缓存是微信重编码版，
+                        # 偏差大不等于认错图，所以只记录不否决
+                        wxlog.debug(f"唯一 dims 候选与声明 size 差 {d}B："
+                                    f"{dims_hit[0]['path']}")
                 return dims_hit[0]["path"]
             # 同尺寸多张图：用 size 消歧（唯一最小值才采纳，且偏差受限）
             if size > 0:
