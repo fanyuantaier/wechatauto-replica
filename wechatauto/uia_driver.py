@@ -81,6 +81,14 @@ CHAT_INPUT_AIDS = ("chat_input_field",)
 SNS_LIST_CLASSES = ("mmui::TimeLineListView",)
 SNS_LIST_AIDS = ("sns_list",)
 
+# 左侧导航栏（4.1.13 实测）：MainTabBar 下四个 XTabBarItem，顺序固定
+# 微信/通讯录/收藏/发现。tab 自己读不到选中态（ButtonControl，既不支持
+# SelectionItem 模式，LegacyIAccessible.State 也恒为 0），各页控件在树里又常驻，
+# 所以判不出当前页——只能无条件点一下，见 WeChatUIA.back_to_chat_tab。
+MAIN_TAB_BAR_CLS = "mmui::MainTabBar"
+TAB_ITEM_CLS = "mmui::XTabBarItem"
+CHAT_TAB_NAME = "微信"
+
 
 def _title_is_main(title: str) -> bool:
     """主窗口标题判定：兼容“微信/Weixin”及带后缀（未读数等）的新版标题。"""
@@ -952,6 +960,95 @@ class WeChatUIA:
         except Exception:
             pass
 
+    # ---------------------------------------------------------- 渲染层穿透
+    # 微信 4.x 的界面全画在 MMUIRenderSubWindowHW 上，该窗口带
+    # WS_EX_LAYERED|WS_EX_TRANSPARENT：mouse_event 的命中测试会跳过它，
+    # 点击落到后面的主窗口，界面上就是「点了没反应」。uiautomation 的
+    # Control.Click() 内部也是 mouse_event，所以同样打不中（实测：搜索下拉
+    # 结果点完界面纹丝不动）。guia 侧的 wx_click/wx_wheel 一直在处理这件事，
+    # UIA 驱动这边补齐——先临时摘掉鼠标所在那条窗口链的 WS_EX_TRANSPARENT。
+    GWL_EXSTYLE = -20
+    WS_EX_TRANSPARENT = 0x00000020
+
+    @staticmethod
+    def _win_chain(x: int, y: int) -> List[int]:
+        """(x,y) 这一点从最上层窗口开始、逐级向上的句柄列表。"""
+        try:
+            u = ctypes.windll.user32
+            cur = u.WindowFromPoint(wintypes.POINT(int(x), int(y)))
+        except Exception:
+            return []
+        out = []
+        for _ in range(6):
+            if not cur:
+                break
+            out.append(int(cur))
+            cur = u.GetParent(cur)
+        return out
+
+    def _clear_transparent(self, x: int, y: int) -> List[Tuple[int, int]]:
+        """摘掉该点窗口链上的 WS_EX_TRANSPARENT，返回待还原的 (句柄, 原样式)。"""
+        u = ctypes.windll.user32
+        saved = []
+        for h in self._win_chain(x, y):
+            try:
+                ex = ctypes.c_long(u.GetWindowLongW(h, self.GWL_EXSTYLE)).value & 0xFFFFFFFF
+            except Exception:
+                continue
+            if ex & self.WS_EX_TRANSPARENT:
+                try:
+                    u.SetWindowLongW(h, self.GWL_EXSTYLE,
+                                     ex & ~self.WS_EX_TRANSPARENT)
+                    saved.append((h, ex))
+                except Exception:
+                    pass
+        if saved:
+            time.sleep(0.05)
+        return saved
+
+    def _restore_transparent(self, saved: List[Tuple[int, int]]) -> None:
+        u = ctypes.windll.user32
+        for h, ex in saved:
+            try:
+                u.SetWindowLongW(h, self.GWL_EXSTYLE, ex)
+            except Exception:
+                pass
+        if saved:
+            time.sleep(0.05)
+
+    def _click_at(self, x: int, y: int, right: bool = False) -> None:
+        self._set_cursor(x, y)
+        time.sleep(0.12)
+        saved = self._clear_transparent(x, y)
+        try:
+            if right:
+                self._right_click()
+            else:
+                self._left_click()
+        finally:
+            self._restore_transparent(saved)
+        time.sleep(0.2)
+
+    def _click_ctrl(self, ctrl, right: bool = False) -> bool:
+        """按控件矩形的中心点一下（走 _click_at，不吃 WS_EX_TRANSPARENT 的亏）。"""
+        try:
+            r = ctrl.BoundingRectangle
+        except Exception:
+            return False
+        if not r or r.width() <= 0 or r.height() <= 0:
+            return False
+        self._click_at((r.left + r.right) // 2, (r.top + r.bottom) // 2, right=right)
+        return True
+
+    def _wheel_at(self, x: int, y: int, delta: int) -> None:
+        self._set_cursor(x, y)
+        time.sleep(0.1)
+        saved = self._clear_transparent(x, y)
+        try:
+            self._mouse_wheel(delta)
+        finally:
+            self._restore_transparent(saved)
+
     # ------------------------------------------------------------------ 控件定位
     def _search_box(self, win):
         # 1) 已知锚点（类名+名称 / 名称 / 类名），遍历候选类名
@@ -986,6 +1083,24 @@ class WeChatUIA:
     def current_chat(self) -> Optional[str]:
         e = self._chat_input()
         return (e.Name or None) if e else None
+
+    def search_box_rect(self) -> Optional[Tuple[int, int, int, int]]:
+        """搜索框的物理矩形 (left, top, right, bottom)，拿不到返回 None。
+
+        给 guia 的 OCR 兜底路径当点击锚点：那边的 ``SEARCH_BOX_RATIO`` 是按
+        窗高比例算的，窗口一改尺寸就飘（实测飘到聊天输入框里，搜索词被粘进
+        了别人的会话）。控件树里有精确矩形，没必要猜。
+        """
+        if self._win is None and not self.ensure_window():
+            return None
+        box = self._search_box(self._win)
+        if box is None:
+            return None
+        try:
+            r = box.BoundingRectangle
+            return (r.left, r.top, r.right, r.bottom)
+        except Exception:
+            return None
 
     def _find_search_list(self, timeout: float = 3.0):
         deadline = time.time() + timeout
@@ -1073,6 +1188,43 @@ class WeChatUIA:
             pass
         return candidates
 
+    def back_to_chat_tab(self, settle: float = 1.0) -> bool:
+        """点导航栏第一个 tab（「微信」栏），把主窗带回聊天页。
+
+        朋友圈相关接口（``WeChat.SwitchToMoments``）会把主窗留在朋友圈页，那里
+        会话列表和消息列表都不渲染，之后一切按搜索框/消息列表走的操作静默失败
+        （实测只剩一句 ``message_list is None``）。
+
+        这里**不做判页**：4.1.13 实测各页控件在 UIA 树里常驻——切到通讯录/收藏/
+        发现以后，``ChatSessionList``、``RecyclerListView``、搜索框照样报
+        ``offscreen=False``、rect 一个像素都不变，树根本读不出当前是哪一页。
+        所以只能无条件点一下：点已经选中的 tab 无害（顶多把会话列表滚回顶部）。
+        tab 名匹配不上（改版/语言包）就按导航栏第一个 item 兜底，顺序固定微信
+        在最前。找不到 MainTabBar 返回 False，不抛。
+        """
+        if self._win is None and not self.ensure_window():
+            return False
+        bar = _find_by(self._win, lambda c: (c.ClassName or "") == MAIN_TAB_BAR_CLS,
+                       max_depth=20)
+        if bar is None:
+            wxlog.debug("未找到 %s，跳不回聊天页", MAIN_TAB_BAR_CLS)
+            return False
+        item = _find_by(bar, lambda c: (c.ClassName or "") == TAB_ITEM_CLS
+                        and (c.Name or "").strip() == CHAT_TAB_NAME, max_depth=6)
+        if item is None:
+            item = _find_by(bar, lambda c: (c.ClassName or "") == TAB_ITEM_CLS,
+                            max_depth=6)
+        if item is None:
+            wxlog.debug("%s 下没有 %s，跳不回聊天页", MAIN_TAB_BAR_CLS, TAB_ITEM_CLS)
+            return False
+        wxlog.debug("点导航栏「%s」栏，确保主窗停在聊天页", CHAT_TAB_NAME)
+        # 走 _click_ctrl 而不是 Control.Click()：后者是裸 mouse_event，会被
+        # 渲染层的 WS_EX_TRANSPARENT 挡掉（见 _click_at 上方注释）。
+        if not self._click_ctrl(item):
+            return False
+        time.sleep(settle)
+        return True
+
     def open_chat(self, keyword: str, index: Optional[int] = None,
                   section: Optional[str] = None, retries: int = 2) -> bool:
         """搜索并打开联系人/群聊，成功后校验输入框 Name。返回是否成功。
@@ -1082,6 +1234,8 @@ class WeChatUIA:
         """
         if not self.ensure_window():
             return False
+        # 搜索框只在聊天页渲染：主窗停在朋友圈页时这里先无条件点回「微信」栏。
+        self.back_to_chat_tab()
         win = self._win
         box = self._search_box(win)
         if box is None:
@@ -1093,7 +1247,10 @@ class WeChatUIA:
         for kw in keywords:
             got = False
             for attempt in range(max(1, retries)):
-                self._paste_into(box, kw, clear=True)
+                # 搜索框优先 SetValue：点击一旦没抢到焦点，Ctrl+V 就会把词打进
+                # 当时聚焦的别的控件里（实测落进过聊天输入框）。
+                if not self._set_text(box, kw):
+                    self._paste_into(box, kw, clear=True)
                 time.sleep(0.8)
                 got = self._collect_results(kw)
                 if got:
@@ -1123,7 +1280,7 @@ class WeChatUIA:
                 results = exact
 
         chosen = results[0]
-        chosen["cell"].Click()
+        self._click_ctrl(chosen["cell"])
         time.sleep(0.7)
 
         name = self.current_chat()
@@ -1184,7 +1341,7 @@ class WeChatUIA:
         if not btn or not btn.Exists(0):
             return False
         try:
-            btn.Click()
+            self._click_ctrl(btn)
             time.sleep(0.8)
         except Exception:
             return False
@@ -1194,7 +1351,7 @@ class WeChatUIA:
             try:
                 item = win.MenuItemControl(AutomationId="XMenuItem", Name=target_name)
                 if item.Exists(0.5, 0.2):
-                    item.Click()
+                    self._click_ctrl(item)
                     time.sleep(0.5)
                     return True
             except Exception:
@@ -1451,8 +1608,26 @@ class WeChatUIA:
         return False
 
     # ------------------------------------------------------------------ 剪贴板粘贴
+    def _set_text(self, ctrl, text: str) -> bool:
+        """用 UIA ValuePattern 直接写文本：不动鼠标、不发按键，返回是否写成。
+
+        只给搜索框这类「填完就等它自己出结果」的控件用。聊天输入框不走这条
+        （见 :meth:`_paste_into`）：SetValue 不会让 Qt 控件获得焦点，而发送靠
+        的是回车键落到那个焦点上。
+        """
+        try:
+            vp = ctrl.GetValuePattern()
+            if vp is None or vp.IsReadOnly:
+                return False
+            vp.SetValue(text or "")
+        except Exception:
+            return False
+        time.sleep(0.1)
+        return True
+
     def _paste_into(self, ctrl, text: str, clear: bool = True) -> None:
-        ctrl.Click()
+        """点击控件拿焦点，再走剪贴板 Ctrl+V（发送类输入框用这条）。"""
+        self._click_ctrl(ctrl)
         time.sleep(0.1)
         if clear:
             try:

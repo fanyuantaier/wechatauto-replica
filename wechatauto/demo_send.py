@@ -59,7 +59,7 @@ DEFAULT_FILE = os.path.join(os.getcwd(), "README.md")   # 默认发当前目录�
 
 
 def pick_default_image() -> str:
-    """在微信 RWTemp 目录里找最新的一张图片；找不到则回退 DEFAULT_IMAGE（可能为空）。
+    r"""在微信 RWTemp 目录里找最新的一张图片；找不到则回退 DEFAULT_IMAGE（可能为空）。
 
     目录自动探测（不写死本机路径）：在「文档\xwechat_files\*\temp」下找
     RWTemp 之类的缓存目录；也可用环境变量 WECHATAUTO_RWTEMP 显式指定。

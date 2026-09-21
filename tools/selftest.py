@@ -68,6 +68,50 @@ def t_layout() -> None:
     check("档位=wide", s2.layout_profile == "wide")
     check("right_pane_left = sidebar_right", s2.right_pane_left == s2.sidebar_right)
 
+    print("[layout] 离线校准（假窗口，两档各跑一次真实 calibrate_layout）")
+    import wechatauto.guia as gm
+    from wechatauto.guia import SEND_BUTTON_RATIO, PORTRAIT_SIDEBAR_RATIO
+    # threading 缺失曾在 1.2.2.5 里把 NameError 伪装成「OCR 未命中」：wide 直接
+    # 返回 False 且不落布局文件，portrait 走默认比例照样返回 True，两者症状不同，
+    # 所以两档都要跑，断言的是「返回 True + 回落到哪个比例」。
+    check("guia 已导入 threading", hasattr(gm, "threading"))
+
+    class CalStub:
+        """只喂 calibrate_layout 用到的成员，OCR 一律返回空。"""
+        render_w, render_h = 1549, 925
+        _update_render_rect = lambda self: None
+        bring_to_front = lambda self: None
+        _detect_sidebar_ratio = lambda self: None
+        ocr = lambda self, region=None: []
+        _update_layout = WeChatGUI._update_layout
+        _apply_layout = WeChatGUI._apply_layout
+        _merge_layout_file = staticmethod(WeChatGUI._merge_layout_file)
+
+    wide = CalStub()
+    check("wide 校准成功（OCR 全空也要能回落默认）",
+          WeChatGUI.calibrate_layout(wide, save=False) is True)
+    check("wide 侧栏回落默认", abs(wide._sidebar_ratio - SIDEBAR_RATIO) < 1e-9,
+          "%s" % wide._sidebar_ratio)
+    check("wide 发送按钮回落默认",
+          tuple(wide._send_button_ratio) == SEND_BUTTON_RATIO,
+          str(wide._send_button_ratio))
+
+    hit = CalStub()
+    hit.ocr = lambda self, region=None: [("发送", 1300, 860, 90, 34)]
+    check("wide 识别到锚点时校准成功",
+          WeChatGUI.calibrate_layout(hit, save=False) is True)
+    check("wide 发送按钮比例按实测改写",
+          tuple(hit._send_button_ratio) != SEND_BUTTON_RATIO,
+          str([round(v, 3) for v in hit._send_button_ratio]))
+
+    port = CalStub()
+    port.render_w, port.render_h = 848, 1824
+    check("portrait 校准成功",
+          WeChatGUI.calibrate_layout(port, save=False) is True)
+    check("portrait 侧栏恒为整窗宽",
+          abs(port._portrait_sidebar_ratio - PORTRAIT_SIDEBAR_RATIO) < 1e-9,
+          "%s" % port._portrait_sidebar_ratio)
+
     print("[layout] 配置迁移（旧扁平 → v2 分档）")
     merged = WeChatGUI._merge_layout_file(
         "portrait", {"profile": "portrait", "sidebar_ratio": 1.0})
@@ -174,12 +218,101 @@ def t_messages() -> None:
           and db.get_messages(user, offset=-1) == [])
 
 
-TESTS = {"layout": t_layout, "keys": t_keys, "sessions": t_sessions,
-         "messages": t_messages}
+# ----------------------------------------------------------------------
+# 5. 发送回读校验（离线：假 DB，不碰微信也不落库）
+# ----------------------------------------------------------------------
+def t_verify() -> None:
+    """``_verify_sent`` 的正文口径与水位。
+
+    两条线上/推演缺陷各对应一组用例：草稿拼接让库里查得到但内容不对（子串匹配
+    照样返回成功），以及没有水位时旧消息能冒充这次发送。真实 sort_seq 大量并列，
+    所以水位必须带 (sort_seq, local_id) 身份而不只是 ``>``。
+    """
+    from wechatauto.guia import WeChatGUI
+
+    def row(content, seq, lid=1, sender=2):
+        return {"content": content, "sort_seq": seq, "local_id": lid,
+                "sender_id": sender, "type": "文本"}
+
+    class FakeDB:
+        uname = "wxid_target"
+
+        def __init__(self, rows):
+            self.rows = sorted(rows, key=lambda r: -r["sort_seq"])
+
+        def get_messages(self, username, limit=20, offset=0):
+            if username != self.uname:
+                return []          # 消息表按 username 键，错了静默返回空
+            return [dict(r) for r in self.rows][:limit]
+
+        def search_contact(self, keyword):
+            return [{"username": self.uname}] if keyword == "目标会话" else []
+
+        def get_self_info(self):
+            return {"username": self.uname}
+
+    class VStub:
+        _verify_sent = WeChatGUI._verify_sent
+        _send_watermark = WeChatGUI._send_watermark
+        _verify_usernames = WeChatGUI._verify_usernames
+
+        def __init__(self, rows):
+            self.db = FakeDB(rows)
+
+        def _get_db(self):
+            return self.db
+
+    print("[verify] 正文匹配口径")
+    v = VStub([row("校准wechatauto 部署自检 OK", 100)])
+    check("草稿拼接正文不算逐字成功（线上事故那种）",
+          v._verify_sent("wechatauto 部署自检 OK", "目标会话") is False)
+    check("同一正文在 contains 口径下会误判成功",
+          v._verify_sent("wechatauto 部署自检 OK", "目标会话",
+                         mode="contains") is True)
+    check("逐字相等才算成功",
+          v._verify_sent("校准wechatauto 部署自检 OK", "目标会话") is True)
+    check("空正文直接判不通过", v._verify_sent("", "目标会话") is False)
+    check("对方发的同样文字不算自己发出",
+          VStub([row("重复一句话", 100, 1, sender=1)])._verify_sent(
+              "重复一句话", "目标会话") is False)
+
+    print("[verify] 发送前水位")
+    v = VStub([row("重复一句话", 500, 7), row("别的", 400, 6)])
+    mark = v._send_watermark("目标会话")
+    check("水位取到最大 sort_seq", bool(mark) and mark["seq"] == 500, str(mark))
+    check("水位含 (sort_seq, local_id) 身份",
+          bool(mark) and mark["ids"] == {(500, 7), (400, 6)})
+    check("库里没有新行时，旧的同文本不被接受",
+          v._verify_sent("重复一句话", "目标会话", after=mark) is False)
+    v.db.rows = [row("重复一句话", 600, 9), row("重复一句话", 500, 7),
+                 row("别的", 400, 6)]
+    check("更晚的新行被接受",
+          v._verify_sent("重复一句话", "目标会话", after=mark) is True)
+
+    v2 = VStub([row("重复一句话", 500, 7), row("别的", 500, 8)])
+    m2 = v2._send_watermark("目标会话")
+    check("并列 sort_seq 全部进身份集合",
+          bool(m2) and m2["seq"] == 500 and len(m2["ids"]) == 2)
+    v2.db.rows = [row("重复一句话", 500, 9), row("重复一句话", 500, 7),
+                  row("别的", 500, 8)]
+    check("sort_seq 并列但 local_id 更新 → 接受（只比 > 会误判）",
+          v2._verify_sent("重复一句话", "目标会话", after=m2) is True)
+
+    print("[verify] 会话解析")
+    check("显示名解析成 username 后回读",
+          VStub([row("hi", 10)])._verify_sent("hi", "目标会话") is True)
+    check("解析不到时兜底用原名，不抛异常",
+          VStub([row("hi", 10)])._verify_sent("hi", "不存在的会话") is False)
+    check("who 为空按自己的会话",
+          bool(VStub([row("hi", 10)])._send_watermark(None)))
+
+
+TESTS = {"layout": t_layout, "verify": t_verify, "keys": t_keys,
+         "sessions": t_sessions, "messages": t_messages}
 
 
 def main() -> int:
-    want = sys.argv[1:] or ["layout", "keys", "sessions", "messages"]
+    want = sys.argv[1:] or ["layout", "verify", "keys", "sessions", "messages"]
     for name in want:
         fn = TESTS.get(name)
         if not fn:

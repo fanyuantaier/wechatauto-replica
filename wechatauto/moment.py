@@ -1691,9 +1691,12 @@ class Moment:
         if rect:
             left, top, right, bottom = rect
             rl = left
-            rt = max(0, int(bottom) + 8)
+            # 评论框贴在时间线视口**底边内侧**（4.1.13 实测「发送」中心 y≈bottom-61），
+            # 不是悬在视口下方；只找 bottom+8 以下会落到任务栏上，永远匹配不到。
+            # 从底边往上 320 找到下方 88，新旧两种布局都能覆盖。
+            rt = max(0, int(bottom) - 320)
             rw = (right - left)
-            rh = 80
+            rh = 320 + 88
             region = (rl, rt, rw, rh)
         try:
             import numpy as np
@@ -1826,8 +1829,10 @@ class Moment:
                     as_tree: bool = False) -> WxResponse:
         """定位指定朋友圈并读取其全部可见评论（含回复）。
 
-        评论直接取目标可见 cell 的 UIA 文本解析；单条评论若带“回复”，
-        解析结果中 ``reply_to`` 记录被回复者昵称。
+        评论先按目标可见 cell 的 UIA 文本解析；单条评论若带“回复”，
+        解析结果中 ``reply_to`` 记录被回复者昵称。4.1.13 合并布局下点赞与
+        评论落在兄弟 cell ``mmui::TimelineCommentCell`` 且不进 UIA 树，
+        此时自动兜底为「评论区矩形 + 截图 OCR」（见 :meth:`_read_comment_cell_ocr`）。
 
         Args:
             publisher: 发布者昵称。
@@ -1860,6 +1865,7 @@ class Moment:
             item = full
         try:
             item._ensure_parsed()
+            likes = list(item.likes)
             comments = [
                 {
                     'author': c.author,
@@ -1869,22 +1875,90 @@ class Moment:
                 }
                 for c in item.comments
             ]
+            source = 'uia'
+            if not likes and not comments:
+                # 4.1.13 合并布局：赞/评在兄弟 cell 里，正文 cell 解析必然为空，
+                # 交给 OCR 路线兜底（见 _read_comment_cell_ocr）。
+                got = self._read_comment_cell_ocr(item)
+                if got is not None:
+                    likes = list(got[0])
+                    comments = [
+                        {
+                            'author': c.author,
+                            'content': c.content,
+                            'reply_to': c.reply_to,
+                            'raw': c.raw,
+                        }
+                        for c in got[1]
+                    ]
+                    source = 'uia+ocr'
         except Exception as e:
             return WxResponse.failure(f'解析评论失败：{e}')
         data = {
-            'source': 'uia',
+            'source': source,
             'publisher': item.publisher,
             'content': item.text,
             'time': item.timestamp,
-            'likes': list(item.likes),
+            'likes': likes,
             'comment_count': len(comments),
             'comments': comments,
         }
         if as_tree:
             data['tree'] = self._comments_tree(comments)
-        if not comments:
-            return WxResponse.failure('该朋友圈当前可见区无评论（可能被折叠）')
-        return WxResponse.success(message=f'获取到 {len(comments)} 条评论', data=data)
+        if not comments and not likes:
+            return WxResponse.failure('该朋友圈当前可见区无赞无评（可能被折叠）')
+        return WxResponse.success(
+            message=f'获取到 {len(comments)} 条评论 / {len(likes)} 个点赞',
+            data=data)
+
+    def _read_comment_cell_ocr(self, item: MomentItem, retries: int = 3):
+        """用「评论区 cell 矩形 + 内置 OCR」读点赞与评论。
+
+        微信 4.1.13 合并布局下，点赞人和评论**不在**正文 cell 里，而在紧随其后
+        的兄弟 cell ``mmui::TimelineCommentCell``；该 cell 的 Name 只有字面量
+        「评论区」、零子节点，文字压根不进 UIA 树，只能截图识别（与
+        :meth:`ReplyComment` 同一条已验证的路子）。
+
+        行内判定：含冒号的是评论（渲染格式 ``昵称：内容``）；不含冒号的是点赞行
+        —— 爱心图标 OCR 不出来，剩下的就是点赞人列表。
+
+        Returns:
+            ``(likes, comments)``；cell 定位不到或滚完仍识别不出任何行时返回
+            ``None``，交由上层按“可见区无赞无评”处理。
+        """
+        box = self._locate_comment_cell(item)
+        if box is None:
+            return None
+        lines = []
+        for _ in range(max(1, retries)):
+            try:
+                from PIL import ImageGrab
+                from wechatauto.guia import ScreenOCR
+                lines = ScreenOCR.recognize(ImageGrab.grab(bbox=box))
+            except Exception as e:
+                wxlog.debug(f'评论区 OCR 失败：{e}')
+                return None
+            if lines:
+                break
+            # 评论区常压在视口下沿之外，滚到能看见下一条动态再读
+            if not self._scroll_comments_down(item, box, max_tries=4):
+                break
+            box = self._locate_comment_cell(item) or box
+            time.sleep(0.3)
+        if not lines:
+            return None
+        likes: List[str] = []
+        comments: List[MomentComment] = []
+        for t, *_ in sorted(lines, key=lambda r: r[2]):
+            s = (t or '').strip()
+            if not s:
+                continue
+            if '：' in s or ':' in s:
+                comments.append(MomentComment.from_text(s))
+            else:
+                likes.extend(_split_like_names(s))
+        wxlog.debug(f'评论区 OCR：赞{len(likes)} 评{len(comments)} box={box}')
+        return likes, comments
 
     def _get_comments_db(self, publisher: Optional[str],
                          keyword: Optional[str], db,

@@ -767,15 +767,17 @@ class MediaDownloader:
             return None
         time.sleep(1.0)
 
+        opened = False
         for _retry in range(3):
             try:
                 from .wx import WeChat
                 wx = WeChat()
-                wx.ChatWith(chat_name or user)
+                opened = wx.ChatWith(chat_name or user)
                 time.sleep(2.0)
                 break
             except Exception as e:
-                print("[DBG] ChatWith retry", _retry, "err:", type(e).__name__, str(e)[:100])
+                wxlog.debug("ChatWith 第 %d 次抛错：%s: %s",
+                            _retry, type(e).__name__, str(e)[:100])
                 time.sleep(1.0)
 
         clicked = False
@@ -783,12 +785,17 @@ class MediaDownloader:
             time.sleep(1.0)
             lst = _uia._message_list()
             if lst is None:
-                print("[DBG] message_list is None")
+                wxlog.warning(
+                    "消息列表没渲染出来，原图取不到：会话 %r 大概率没打开"
+                    "（主窗停在发现/朋友圈页，或 user 传成了显示名导致搜索不命中）"
+                    % (chat_name or user,))
                 return None
             inp = WinInput()
 
             lst_rect = lst.BoundingRectangle
-            print("[DBG] list rect:", lst_rect.left, lst_rect.top, lst_rect.right, lst_rect.bottom)
+            wxlog.debug("消息列表 rect=(%d,%d,%d,%d) ChatWith=%s",
+                        lst_rect.left, lst_rect.top, lst_rect.right,
+                        lst_rect.bottom, opened)
             images = []
             for ch in lst.GetChildren():
                 try:
@@ -800,13 +807,18 @@ class MediaDownloader:
                         cy = int((r.top + r.bottom) / 2)
                         in_lst = (lst_rect.left <= cx <= lst_rect.right and
                                   lst_rect.top <= cy <= lst_rect.bottom)
-                        print("[DBG] img:", r.left, r.top, r.right, r.bottom, "in=", in_lst)
+                        wxlog.debug("图片气泡 rect=(%d,%d,%d,%d) 在列表内=%s",
+                                    r.left, r.top, r.right, r.bottom, in_lst)
                         if in_lst:
                             images.append(ch)
                 except Exception as e:
-                    print("[DBG] img err:", e)
+                    wxlog.debug("读列表子节点失败：%s", e)
                     continue
-            print("[DBG] images:", len(images))
+            wxlog.debug("列表内图片气泡：%d 个", len(images))
+            if not images:
+                # RecyclerListView 是虚拟化的，只实例化可视区那十来行；目标
+                # 那条图没在视野里就扫不到，这里只报不猜（滚动定位另说）。
+                wxlog.warning("可视区里没有图片气泡：消息表有这条图，但它没渲染出来")
 
             for img_ch in images:
                 r = img_ch.BoundingRectangle
@@ -815,7 +827,7 @@ class MediaDownloader:
                 # 用相对偏移（而非固定像素），窗口宽度/DPI 变化时可自适应。
                 cx = r.left + int((r.right - r.left) * 0.12)
                 cy = int((r.top + r.bottom) / 2)
-                print(f"[DBG] real_click image at ({cx},{cy})")
+                wxlog.debug("点击图缩略图 (%d,%d)", cx, cy)
 
                 inp.real_click(cx, cy)
                 time.sleep(3.0)
@@ -824,7 +836,7 @@ class MediaDownloader:
                 root = auto.GetRootControl()
                 candidates = [w for w in root.GetChildren()
                               if "PreviewWindow" in (w.ClassName or "")]
-                print(f"[DBG] after click, preview windows found: {len(candidates)}")
+                wxlog.debug("点击后预览窗：%d 个", len(candidates))
                 # 优先选包含"图片原始大小"按钮的预览窗口
                 for w in candidates:
                     if self._find_preview_button(w, "图片原始大小"):
@@ -836,11 +848,11 @@ class MediaDownloader:
                                                     (w.BoundingRectangle.bottom - w.BoundingRectangle.top))
 
                 if not preview_win:
-                    print("[DBG] NO preview window after click")
+                    wxlog.debug("点击后没有出现预览窗，换下一个气泡")
                     continue
 
                 btn = self._find_preview_button(preview_win, "图片原始大小")
-                print(f"[DBG] 图片原始大小 btn found: {btn is not None}")
+                wxlog.debug("「图片原始大小」按钮命中=%s", btn is not None)
                 if btn:
                     # 按钮是完整 UIA 控件，用 UIA 原生 Click（不依赖全局 SetCursorPos 坐标映射）
                     try:
@@ -853,12 +865,13 @@ class MediaDownloader:
                     time.sleep(3.0)
 
                 h_dat = self._find_h_dat(user, md5)
-                print(f"[DBG] h_dat after click: {h_dat} size={os.path.getsize(h_dat) if h_dat else None}")
+                wxlog.debug("点击后 h_dat=%s size=%s",
+                            h_dat, os.path.getsize(h_dat) if h_dat else None)
                 if h_dat and os.path.getsize(h_dat) > 102400:
                     clicked = True
                     break
         except Exception as e:
-            print("[DBG] outer err:", type(e).__name__, str(e)[:200])
+            wxlog.debug("原图流程抛错：%s: %s", type(e).__name__, str(e)[:200])
             pass
 
         if not clicked:

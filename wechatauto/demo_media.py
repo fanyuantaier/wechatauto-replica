@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 import time
 
@@ -66,6 +67,48 @@ def fmt_size(n: int) -> str:
     if n >= 1024:
         return f"{n / 1024:.1f}KB"
     return f"{n}B"
+
+
+def _xml_attr(content: str, name: str) -> str:
+    i = content.find(' %s="' % name)
+    if i < 0:
+        return ""
+    j = content.find('"', i + len(name) + 3)
+    return content[i + len(name) + 3:j] if j > 0 else ""
+
+
+def _xml_text(content: str, tag: str) -> str:
+    m = re.search(r"<%s>(.*?)</%s>" % (tag, tag), content, re.S)
+    return m.group(1).strip() if m else ""
+
+
+def media_label(mtype: str, content: str) -> str:
+    """媒体消息的 content 是 XML，只取能看懂的那几个字段。
+
+    图片/视频的 XML 里带 aeskey、md5、CDN 链接，原样打印既占屏又把密钥类
+    字段显示出来，所以这里一律只回尺寸/字节数/时长/文件名。
+    """
+    c = content or ""
+    if mtype == "图片":
+        n = _xml_attr(c, "length")
+        hd = _xml_attr(c, "hdlength")
+        txt = "图片 " + (fmt_size(int(n)) if n.isdigit() else "?")
+        if hd.isdigit() and int(hd) > 0:
+            txt += f"（原图 {fmt_size(int(hd))}）"
+        return txt
+    if mtype == "视频":
+        n = _xml_attr(c, "playlength")
+        size = _xml_attr(c, "length")
+        txt = "视频 " + (f"{int(n) // 60}:{int(n) % 60:02d}" if n.isdigit() else "?")
+        if size.isdigit():
+            txt += f" {fmt_size(int(size))}"
+        return txt
+    if mtype == "语音":
+        ms = _xml_attr(c, "voicelength")
+        return "语音 " + (f"{int(ms) / 1000:.0f}s" if ms.isdigit() else "?")
+    if mtype == "文件":
+        return "文件 " + (_xml_text(c, "title") or "?")[:40]
+    return mtype
 
 
 def media_failure_reason(md, who: str, local_id: int) -> str:
@@ -176,7 +219,8 @@ def main():
         t = time.strftime("%m-%d %H:%M", time.localtime(m["create_time"]))
         sender = "我" if m["sender_id"] == 2 else "对方"
         media_msgs.append(m)
-        print(f"  {m['local_id']:<6} {t} {sender} {m.get('type')}  {m.get('content', '')[:40]}")
+        label = media_label(m.get("type"), m.get("content", ""))
+        print(f"  {m['local_id']:<6} {t} {sender} {label}")
 
     if args.list:
         print(f"\n共 {len(media_msgs)} 条媒体消息（用 --ids 或 --filter 配合下载）。")

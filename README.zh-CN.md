@@ -19,7 +19,7 @@
 本项目复刻上游 wxauto 项目，目标是实现对当前微信 4.x Windows 客户端的自动化
 （读取消息、发送消息、媒体下载、朋友圈），非网页版，直接操作本机客户端。
 
-> 当前版本：1.2.2.5
+> 当前版本：1.2.2.6
 >
 > **兼容范围**：Windows 10/11 ｜ Python 3.9+（已在 3.12 验证）｜ 微信 **4.1.12+**
 > （数据库读取路线对微信版本不敏感；坐标+OCR 发送路线依赖 4.1.12+ 自绘渲染
@@ -40,10 +40,29 @@
 > 感谢 [maozhitao12450](https://github.com/maozhitao12450) 报告 WXAM (wxgf) 图片下载问题（v1.1.3 修复）。
 >
 > 感谢 [uiharukazari0105](https://github.com/uiharukazari0105) 发现语音数据分片存储（`media_1.db` 等）从未被搜索的问题（v1.1.4 修复）。
+>
+> 感谢 [wenjiavv](https://github.com/wenjiavv) 报告 [issue #28](https://github.com/fanyuantaier/wechatauto-replica/issues/28)（1.2.2.5 缺失 `import threading`，布局校准必抛 `NameError`）与 [issue #29](https://github.com/fanyuantaier/wechatauto-replica/issues/29)（发送回读校验接受包含额外正文的历史消息），两份都附了复现步骤、宽屏/竖屏的不同症状和修复建议（v1.2.2.6 修复）。
 
 ---
 
 ## 版本记录
+
+### v1.2.2.6（2026-09-21）
+
+- **修复：`calibrate_layout()` 在已发布的 1.2.2.5 里必抛 `NameError`**。`guia.py` 的超时包装 `_run_with_timeout` 用了 `threading.Thread`，模块顶部却没有 `import threading`（对照 1.2.2.5 的 wheel 实测：`threading.Thread` 在、`import threading` 不在）。布局校准是 UIA 路线的入口路径，pip 安装的用户第一次校准就会撞上；本机开发副本因为单独同步过，所以看不出来。**两档的症状并不相同**（这也是为什么必须报两次）：`wide` 下校准直接返回 `False` 且不生成布局文件，`portrait` 下发送按钮探针把同一个异常吞掉，照样返回 `True` 并用默认比例。把已同步副本里的模块属性删掉后，两种症状都复现了。现在探针内部出错会留一行日志，外层 `except` 把「代码缺陷」（`NameError`/`UnboundLocalError`/`AttributeError`/`TypeError`/`ImportError` → `wxlog.error`，控制台可见）和「这次没测出来」（OCR 没认到锚点 → debug，按设计回落默认比例）分开——补上 import 并不保证 OCR 能认到锚点，那是回落而不是失败。
+- **修复：发送回读校验可以确认一条其实没发出去的消息**（`_verify_sent`）。两个独立缺口：一是**子串匹配**，聊天输入框里留着草稿时实际发出去的正文是 `校准wechatauto 部署自检 OK`，而调用参数是 `wechatauto 部署自检 OK`，库里查得到、内容却是错的；二是**没有水位**，只要最近几条里存在一条含目标文字的旧消息就能通过——UI 返回成功只会转入轮询、不会重发，所以旧消息在第一次检查就被接受。现在普通文本要求**逐字相等**（`strip()` 不等于逐字一致），引用/回复/@ 保留包含匹配（微信会把正文包装，只能包含匹配），并且每个调用点都显式写明口径；每次校验发送前先给目标会话拍一个**落库水位**：最大 `sort_seq` **加上**顶部若干行的 `(sort_seq, local_id)` 身份集合——真实 `sort_seq` 大量并列（同会话实测最多 8 行同值），只比 `>` 会把刚发出去那条判成旧消息。回读还会先把显示名解析成 `username`：消息表按 `username` 键，名字错了**静默返回空**，群聊的校验此前是以错误的理由失败。拍不到水位（新会话、DB 不可用）时退回不带水位的检查，宁可不加门槛也不误报失败。
+- **回归覆盖**：`tools/selftest.py` 新增离线 `verify` 组（假 DB，14 项）和离线两档 `calibrate_layout` 组（假窗口，含锚点命中路径，8 项），离线合计 36 项通过、整套 gate 55 通过 0 失败；校验口径另外在**真实解密库上只读**复跑过（未发送任何消息），端到端实机发送镜头仍待补。
+- **感谢 [wenjiavv](https://github.com/wenjiavv)** 报告上述两条（[#28](https://github.com/fanyuantaier/wechatauto-replica/issues/28)、[#29](https://github.com/fanyuantaier/wechatauto-replica/issues/29)），并给出了复现、宽屏/竖屏症状区分和修复建议。
+- **修复：`RecallGuard` 一条撤回都抓不到 —— 两层独立故障**。
+  1. **撤回行永远不会被投递**。微信撤回是**原地改写**原文那一行（本机 208 个会话里的 64 条 `revokemsg`：`revoketime - create_time` 落在 1-30s 的 10 条、31-300s 的 54 条、等于 0 的 0 条），改写后 `local_id` 和 `create_time` 都还是原文的；而 `Listener` 的增量判据是 `sort_seq > watermark`，`sort_seq` 没变，撤回事件根本不下发。现在 `watch()` 自带一条 `wxrecall-scan` 守护线程，每 `scan_interval`（默认 2.0s）重读各会话最近 `scan_limit`（默认 30）条，拿 `local_id` 跟镜像比对：镜像里是正常消息、现库已是 `revokemsg`，即一次撤回；另有 `scan_now()` 供脚本手动触发。
+  2. **就算投递了也查不到原文**。`_find_original` 的条件是 `create_time < revoke_time`，而 `revoke_time` 取的正是这条撤回行自己的 `create_time`（= 原文时间），严格小于把自己排除了。现在先按 `(chat, local_id)` 精确取（被改写的就是这一行，同 `local_id` 的镜像行必然是原文），时间窗只作兜底且放宽成 `<=`。
+  3. `on_msg` 遇到撤回行**不再写镜像**，否则一存就把要救的原文覆盖掉。
+  4. 撤回时刻改为解析 `<revoketime>`（原来打出来的是原文的发送时间）；`(chat, revoke_time)` 同时作去重键，Listener 路径与轮询路径不会各记一笔，重启也不会把历史撤回再报一遍。
+  5. `close()` 现在会停掉轮询线程。
+  实测：离线 3/3 条真实撤回行（local_id 62/64/88）还原出原文，二次 `scan_now()` 返回 0 条（去重生效），`close()` 后只剩 `MainThread`；活体链路（发送 → 镜像 20→21 条 → 撤回 → 还原）同样跑通。
+- **安全修复：`demo_media.py --list` 会把媒体消息的 XML 原样打到屏上**，其中含 `aeskey`、`cdnthumbaeskey`、`cdnthumburl`、`md5` 等密钥与 CDN 取回字段。现在只输出尺寸、字节数、时长和文件名。
+- **新增：微信 4.1.13 合并布局下朋友圈点赞/评论的 OCR 兜底**（`Moment._read_comment_cell_ocr`）。该版本的点赞与评论落在兄弟 cell `mmui::TimelineCommentCell` 且不进 UIA 树，正文 cell 的 UIA 解析必然为空；现在检测到空结果时自动兜底为「评论区矩形截图 + OCR」。同时把评论框的检索区按新布局改为从视口底边往上 320px（旧代码找 `bottom+8` 以下，在 4.1.13 上落到任务栏、永远匹配不到）。
+- **清理**：`demo_send.py` 的 `pick_default_image` docstring 改为 raw string，消除 `\W` 转义告警。
 
 ### v1.2.2.5（2026-09-19）
 

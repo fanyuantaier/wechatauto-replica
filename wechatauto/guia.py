@@ -48,6 +48,7 @@ import os
 import platform
 import re
 import tempfile
+import threading
 import time
 from ctypes import wintypes
 from typing import Dict, List, Optional, Tuple
@@ -149,6 +150,24 @@ SIDEBAR_RATIO = 0.22                     # 侧栏宽度 / 窗口宽度
 SIDEBAR_TOP = 0.05                       # 会话列表顶部起始（相对窗口高）
 SEARCH_BOX_RATIO = (0.18, 0.041, 0.86, 0.079)  # (x0,y0,x1,y1)，x 相对侧栏宽、y 相对窗口高
 SEND_BUTTON_RATIO = (0.78, 0.92, 0.995, 0.99)  # 「发送」按钮检索区（相对窗口）
+
+# 「代码本身坏了」和「这次没测出来」不是一回事：前者必须上屏，后者可以静默回落。
+# 少了这层区分时，一个缺 import 的 NameError 会被宽 except 伪装成 OCR 未命中。
+CODE_DEFECT_ERRORS = (NameError, UnboundLocalError, AttributeError,
+                      TypeError, ImportError)
+
+
+def _log_swallowed(where: str, e: BaseException) -> None:
+    """宽 ``except Exception`` 吞掉异常时按性质分级记录。
+
+    控制台默认 INFO，所以 debug 等于只进日志文件：「DB 这次查不到」这类可恢复
+    失败不该刷屏，代码缺陷则必须上屏——否则又能藏成一个版本。
+    """
+    if isinstance(e, CODE_DEFECT_ERRORS):
+        wxlog.error(f'{where}：代码缺陷，不是这次没测出来 —— '
+                    f'{type(e).__name__}: {e}')
+    else:
+        wxlog.debug(f'{where}：{type(e).__name__}: {e}')
 
 # 竖屏（手机式窄窗口）布局：微信新版支持把窗口缩到手机比例，界面切换为
 # 单列布局——会话列表占满窗口宽度，打开会话后聊天区同样占满窗口宽度。
@@ -660,8 +679,12 @@ class WeChatGUI:
             def _target():
                 try:
                     result[0] = fn()
-                except Exception:
-                    pass
+                except Exception as ex:
+                    # 探针内部出错只说明这一项测不出来（回落默认比例是对的），
+                    # 但必须留痕：这里静默 pass 过一次，缺 import 的 NameError
+                    # 一路伪装成「OCR 未命中」，藏了整整一个版本。
+                    wxlog.debug(f'校准探针 {getattr(fn, "__name__", fn)} 异常：'
+                                f'{type(ex).__name__}: {ex}')
             t = threading.Thread(target=_target, daemon=True)
             t.start()
             t.join(timeout)
@@ -732,7 +755,13 @@ class WeChatGUI:
                 f'send_button_ratio={entry["send_button_ratio"]}')
             return True
         except Exception as e:
-            wxlog.debug(f'布局校准失败：{e}')
+            # 编程错误和「OCR 没认到锚点」不是一回事：前者说明这段代码本身坏了，
+            # 落到默认比例只是碰巧没炸，必须上屏；后者是可恢复的，静默回落即可。
+            if isinstance(e, CODE_DEFECT_ERRORS):
+                wxlog.error(f'布局校准异常（代码缺陷，不是识别失败）：'
+                            f'{type(e).__name__}: {e}')
+            else:
+                wxlog.warning(f'布局校准失败，回落默认比例：{type(e).__name__}: {e}')
             return False
 
     @staticmethod
@@ -1402,6 +1431,27 @@ class WeChatGUI:
             wxlog.debug(f'标题片段匹配失败：{exc!r}')
             return False
 
+    def _typed_into_chat_input(self, expect: str) -> bool:
+        """自检：兜底粘贴有没有落进聊天输入框（点击没抢到焦点时就会这样）。
+
+        落进去等于在别人会话的发送区里挂了一颗雷——下一次回车就发出去了。
+        发现就立刻用 UIA ValuePattern 清空（不发按键）并让调用方放弃。
+        """
+        uia = self._get_uia()
+        if uia is None:
+            return False
+        try:
+            e = uia._chat_input()
+            vp = e.GetValuePattern() if e is not None else None
+            if vp is None or (vp.Value or '').strip() != (expect or '').strip():
+                return False
+            vp.SetValue('')
+            wxlog.warning(f'搜索词 {expect!r} 被粘进了聊天输入框，已清空并放弃搜索兜底')
+            return True
+        except Exception as ex:
+            wxlog.debug(f'聊天输入框自检失败：{type(ex).__name__}: {ex}')
+            return False
+
     def _search_chat(self, name: str) -> bool:
         """退路：搜索框 + 剪贴板粘贴搜索，点选名称匹配的第一条联系人。
 
@@ -1414,15 +1464,24 @@ class WeChatGUI:
         含「包含」的成员预览行直接跳过。
         """
         frag = name[:2]
+        uia = self._get_uia()
+        anchor = uia.search_box_rect() if uia is not None else None
         for _ in range(3):
-            sb = self._rel_to_screen(self.search_box)
-            self.wx_click((sb[0] + sb[2]) // 2, (sb[1] + sb[3]) // 2)
+            if anchor:
+                # 树里有精确矩形，别拿比例猜（猜偏就会粘进别的控件）
+                cx, cy = (anchor[0] + anchor[2]) // 2, (anchor[1] + anchor[3]) // 2
+            else:
+                sb = self._rel_to_screen(self.search_box)
+                cx, cy = (sb[0] + sb[2]) // 2, (sb[1] + sb[3]) // 2
+            self.wx_click(cx, cy)
             time.sleep(0.3)
             self._input.key(VK_A, ctrl=True)
             self._input.key(VK_DELETE)
             self.set_clipboard(name)
             self._input.key(VK_V, ctrl=True)
             time.sleep(0.8)
+            if self._typed_into_chat_input(name):
+                return False
             res = self.ocr_zoomed((SIDEBAR_LEFT, int(self.render_h * 0.08),
                                    self.sidebar_right, self.render_h), scale=2)
             rows = sorted(res, key=lambda r: (r[2], r[1]))
@@ -1730,6 +1789,8 @@ class WeChatGUI:
                 and self.input_text(text, box=self._last_input_box, fast=True)
                 and self.click_send(fast=True)):
             return WxResponse.success(f'消息已发送：{text}', data={'content': text})
+        # 水位必须在任何 UI 动作之前拍：一旦发出去，DB 顶部就已经包含新行了。
+        mark = self._send_watermark(who) if verify else None
         # UIA 路径：热激活后可直接输入+回车发送，无 OCR 抖动，最快。
         uia = self._get_uia()
         if uia is not None:
@@ -1737,12 +1798,12 @@ class WeChatGUI:
                 if uia.send_text(text):
                     if not verify:
                         return WxResponse.success(f'消息已发送：{text}', data={'content': text})
-                    if self._verify_sent(text, who):
+                    if self._verify_sent(text, who, after=mark):
                         return WxResponse.success(f'消息已发送并确认：{text}', data={'content': text})
                     wait_until = time.time() + 8
                     while time.time() < wait_until:
                         time.sleep(1.0)
-                        if self._verify_sent(text, who):
+                        if self._verify_sent(text, who, after=mark):
                             return WxResponse.success(f'消息已发送并确认：{text}', data={'content': text})
                     return WxResponse.failure('消息已操作发送，但数据库未确认', data={'content': text})
         if not self.ensure_visible():
@@ -1772,13 +1833,13 @@ class WeChatGUI:
                 continue
             if not verify:
                 return WxResponse.success(f'消息已发送：{text}', data={'content': text})
-            if self._verify_sent(text, who):
+            if self._verify_sent(text, who, after=mark):
                 return WxResponse.success(f'消息已发送并确认：{text}', data={'content': text})
             # 可能已发送但 DB 异步落库，轮询确认，不重发避免重复
             wait_until = time.time() + 8
             while time.time() < wait_until:
                 time.sleep(1.0)
-                if self._verify_sent(text, who):
+                if self._verify_sent(text, who, after=mark):
                     return WxResponse.success(f'消息已发送并确认：{text}', data={'content': text})
             return WxResponse.failure('消息已操作发送，但数据库未确认', data={'content': text})
         return WxResponse.failure('发送失败：多次重试未完成')
@@ -1790,21 +1851,91 @@ class WeChatGUI:
             self._cached_db = WeChatDB()
         return self._cached_db
 
-    def _verify_sent(self, text: str, who: Optional[str]) -> bool:
+    def _verify_usernames(self, who: Optional[str]) -> List[str]:
+        """把 ``who`` 解析成候选 username 列表（消息表按 username 键）。
+
+        直接拿显示名查消息表是**静默失败**的：查不到就返回空列表，看起来像
+        「没发出去」。所以先按通讯录解析一遍，再把原名留在后面兜底。
+        水位和回读必须走同一个口径，否则两边量的不是同一个会话。
+        """
         try:
             db = self._get_db()
             if not who:
-                who = db.get_self_info()['username']
-            else:
-                hits = db.search_contact(who)
-                if hits:
-                    who = hits[0]["username"]
-            msgs = db.get_messages(who, limit=3)
-            for m in msgs:
-                if m.get('sender_id') == 2 and text in (m.get('content') or ''):
-                    return True
+                return [db.get_self_info()['username']]
+            names = [h['username'] for h in db.search_contact(who)
+                     if h.get('username')]
+            names.append(who)
+            seen, out = set(), []
+            for n in names:
+                if n not in seen:
+                    seen.add(n)
+                    out.append(n)
+            return out
         except Exception as e:
-            wxlog.debug(f'发送校验失败：{e}')
+            _log_swallowed('发送校验解析会话', e)
+            return [who] if who else []
+
+    def _send_watermark(self, who: Optional[str]) -> Optional[dict]:
+        """发送**前**拍一个落库水位，交给 :meth:`_verify_sent` 当门槛。
+
+        没有水位时「最近几条里有一条含目标文本」会被旧消息满足：同一段话昨天
+        发过、今天这次其实没发出去，校验照样返回成功。取顶部若干行的
+        ``(sort_seq, local_id)`` 身份集合 + 最大 sort_seq：真实 sort_seq 大量
+        并列（同会话实测最多 8 行同值），只比 ``>`` 会把刚发出去那条判成旧消息，
+        所以并列时再按身份排除。拍不到（新会话、DB 不可用）返回 None，
+        校验退回不带水位的旧行为——宁可不加门槛，不能因为门槛误判成失败。
+        """
+        try:
+            db = self._get_db()
+            for uname in self._verify_usernames(who):
+                rows = db.get_messages(uname, limit=5)
+                if rows:
+                    return {
+                        'username': uname,
+                        'seq': max(int(r.get('sort_seq') or 0) for r in rows),
+                        'ids': {(int(r.get('sort_seq') or 0),
+                                 int(r.get('local_id') or 0)) for r in rows},
+                    }
+        except Exception as e:
+            _log_swallowed('发送水位读取', e)
+        return None
+
+    def _verify_sent(self, text: str, who: Optional[str], mode: str = 'exact',
+                     after: Optional[dict] = None) -> bool:
+        """回读数据库确认这条消息真的发出去了。
+
+        Args:
+            text: 期望的正文
+            who: 目标会话（空=当前会话按「自己」解析，与旧行为一致）
+            mode: ``exact`` 正文逐字相等（普通文本）；``contains`` 包含匹配
+                （引用/回复/@ 的正文会被微信包进 XML 或加前缀，只能包含匹配）
+            after: 发送前 :meth:`_send_watermark` 拍的水位，只认比它新的行
+
+        普通文本为什么不能是子串匹配：输入框里留着草稿时，粘贴会接在草稿后面，
+        实际发出去的是「校准wechatauto 部署自检 OK」这类拼接正文——库里查得到、
+        内容却是错的，子串匹配照样返回成功。逐字相等才拦得住。
+        """
+        if not text:
+            return False
+        try:
+            db = self._get_db()
+            marked = (after or {}).get('username')
+            names = [marked] if marked else self._verify_usernames(who)
+            for uname in names:
+                for m in db.get_messages(uname, limit=5):
+                    seq = int(m.get('sort_seq') or 0)
+                    if after:
+                        if seq < after['seq']:
+                            continue   # 比水位旧的一定不是这次发的
+                        if (seq, int(m.get('local_id') or 0)) in after['ids']:
+                            continue
+                    if m.get('sender_id') != 2:
+                        continue
+                    content = m.get('content') or ''
+                    if content == text if mode == 'exact' else text in content:
+                        return True
+        except Exception as e:
+            _log_swallowed('发送回读校验', e)
         return False
 
     # ------------------------------------------------------------------
@@ -2065,6 +2196,9 @@ class WeChatGUI:
 
         target_text 用于在 OCR 结果中匹配目标消息（可选）。
         """
+        # 回复落库的正文带有被回复消息的包装，逐字相等判不了，用包含匹配；
+        # 水位保证「上一次发过的同一句话」不会被当成这一次的确认。
+        mark = self._send_watermark(who) if verify else None
         if not self.ensure_visible():
             return WxResponse.failure('微信窗口不可见（可能锁屏/会话断开）')
         if who:
@@ -2103,7 +2237,7 @@ class WeChatGUI:
             return WxResponse.failure('输入回复内容失败')
         self.click_send()
         if verify:
-            ok = self._verify_sent(text, who)
+            ok = self._verify_sent(text, who, mode='contains', after=mark)
             return (WxResponse.success(f'回复已发送并确认：{text}', data={'content': text})
                     if ok else WxResponse.failure('回复已操作发送，但数据库未确认', data={'content': text}))
         return WxResponse.success(f'回复已发送：{text}', data={'content': text})
@@ -2137,6 +2271,8 @@ class WeChatGUI:
 
         target_text 用于 OCR 定位要引用的消息文案（可选）；省略时引用最近一条。
         """
+        # 引用消息落库的正文里还包着被引用那条，只能包含匹配；水位见 _send_watermark。
+        mark = self._send_watermark(who) if verify else None
         if not self.ensure_visible():
             return WxResponse.failure('微信窗口不可见（可能锁屏/会话断开）')
         if who:
@@ -2180,7 +2316,7 @@ class WeChatGUI:
             return WxResponse.failure('输入引用内容失败')
         self.click_send()
         if verify:
-            ok = self._verify_sent(text, who)
+            ok = self._verify_sent(text, who, mode='contains', after=mark)
             return (WxResponse.success(f'引用已发送并确认：{text}', data={'content': text})
                     if ok else WxResponse.failure('引用已操作发送，但数据库未确认', data={'content': text}))
         return WxResponse.success(f'引用已发送：{text}', data={'content': text})
@@ -2194,6 +2330,8 @@ class WeChatGUI:
 
         流程：输入框键入 '@' → OCR 成员选择弹层定位成员 → 点击 → 输入正文 → 发送。
         """
+        # @ 消息落库正文带有「@昵称」包装，只能包含匹配；水位见 _send_watermark。
+        mark = self._send_watermark(who) if verify else None
         if not self.ensure_visible():
             return WxResponse.failure('微信窗口不可见（可能锁屏/会话断开）')
         if who:
@@ -2220,7 +2358,7 @@ class WeChatGUI:
             return WxResponse.failure('输入消息正文失败')
         self.click_send()
         if verify:
-            ok = self._verify_sent(text, who)
+            ok = self._verify_sent(text, who, mode='contains', after=mark)
             return (WxResponse.success(f'@成员消息已发送并确认', data={'member': member, 'content': text})
                     if ok else WxResponse.failure('@消息已操作发送，但数据库未确认', data={'member': member}))
         return WxResponse.success(f'@成员消息已发送', data={'member': member, 'content': text})

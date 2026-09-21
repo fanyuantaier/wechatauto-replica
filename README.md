@@ -17,7 +17,7 @@
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.2.2.5 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
+> **Current version:** 1.2.2.6 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+**
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -183,6 +183,23 @@ Runnable demo: `python -m wechatauto.demo_moments_interact [--like N | --unlike 
 
 ## 📝 Changelog
 
+### v1.2.2.6 (2026-09-21)
+
+- **Fixed: `calibrate_layout()` always raised `NameError` in the published 1.2.2.5.** The timeout wrapper `_run_with_timeout` in `guia.py` uses `threading.Thread`, but the module never imported `threading` (checked against the 1.2.2.5 wheel: `threading.Thread` present, `import threading` absent). Layout calibration is the entry path of the UIA driver, so every pip-installed user hit it on the first calibration; local checkouts were synced separately and hid it. The two layout profiles failed **differently**, which is why one report was not enough: on `wide` calibration returned `False` and wrote no layout file at all, while on `portrait` the send-button probe swallowed the same error and calibration returned `True` on default ratios. Both shapes were reproduced by deleting the module attribute from a synced copy. A probe that errors inside the timeout wrapper now leaves a log line, and the outer handler separates code defects (`NameError`/`UnboundLocalError`/`AttributeError`/`TypeError`/`ImportError` → `wxlog.error`, reaches the console) from recoverable misses (OCR anchor simply not found → debug, falls back to defaults by design). Adding the import does not make OCR find the anchor — that stays a fallback, not a failure.
+- **Fixed: send verification could confirm a message that was never actually sent** (`_verify_sent`). Two independent holes: it matched on **substring**, so a draft left in the chat input (the body that actually went out read `校准wechatauto 部署自检 OK`) still verified a call for `wechatauto 部署自检 OK`; and with **no watermark**, an older self-message containing the target text among the last rows validated even when this send produced no row at all — the UI returning success only leads to polling, never to a resend, so a stale row is accepted on the first check. Plain-text sends now require a **verbatim** body match (`strip()` is not verbatim); reply / quote / `at_member` keep substring matching because WeChat wraps those bodies, and that rule is now explicit per call site. Every verified send first takes a **pre-send watermark** of the target chat: the max `sort_seq` *plus* the `(sort_seq, local_id)` identity set of the top rows, because real `sort_seq` values tie heavily (up to 8 rows in one chat) and a bare `>` would reject a genuine send. Verification also resolves the display name to a `username` before reading: message tables are keyed by `username` and a wrong one returns `[]` **silently**, so group-chat verification had been failing closed for the wrong reason. When no watermark can be taken (fresh chat, DB unavailable) verification falls back to the unwatermarked check rather than reporting failure.
+- **Regression coverage**: `tools/selftest.py` gained an offline `verify` group (14 checks against a fake DB) and an offline `calibrate_layout` group covering both profiles and the anchor-hit path (8 checks against a fake window) — 36 offline checks, full gate 55 pass / 0 fail. The verifier's rules were additionally replayed read-only against the live decrypted database (no message was sent); the end-to-end send path still needs a real take.
+- **Thanks to [wenjiavv](https://github.com/wenjiavv)** for reporting both of the above with reproductions, a per-profile symptom split and fix proposals ([#28](https://github.com/fanyuantaier/wechatauto-replica/issues/28), [#29](https://github.com/fanyuantaier/wechatauto-replica/issues/29)).
+- **Fixed: `RecallGuard` could not see a single revoke — two independent faults.**
+  1. **Revoke rows were never delivered.** WeChat rewrites the original row in place (across 208 local sessions, 64 `revokemsg` rows: `revoketime - create_time` lands in 1-30 s for 10 of them, 31-300 s for 54, and zero for none), and `local_id` / `create_time` stay those of the original message. `Listener` increments by `sort_seq > watermark`, which never changes on a rewrite, so no revoke event is emitted. `watch()` now runs a `wxrecall-scan` daemon thread that re-reads the last `scan_limit` (default 30) rows per session every `scan_interval` (default 2.0 s) and diffs `local_id` against the mirror: normal in the mirror, `revokemsg` in the live DB = one revoke. `scan_now()` is exposed for scripts.
+  2. **Even when delivered, the original was never found.** `_find_original` used `create_time < revoke_time`, where `revoke_time` is the revoke row's own `create_time` (= the original's timestamp) — the strict `<` excluded the only matching row. Lookup is now exact by `(chat, local_id)` first (the rewritten row keeps its `local_id`, so the mirror row with that id is necessarily the original), with the time window only as a fallback and relaxed to `<=`.
+  3. `on_msg` no longer mirrors revoke rows — storing one would overwrite the original it is meant to rescue.
+  4. The revoke timestamp now parses `<revoketime>` (it used to print the original send time); `(chat, revoke_time)` is the dedup key, so the Listener and polling paths cannot double-report and a restart cannot re-report history.
+  5. `close()` now stops the polling thread.
+  Measured: offline 3/3 real revoke rows (local_id 62/64/88) restored, a second `scan_now()` returns 0 rows (dedup works), only `MainThread` left after `close()`; the live path (send → mirror 20→21 → revoke → restore) passes too.
+- **Security fix: `demo_media.py --list` printed media XML verbatim**, exposing `aeskey`, `cdnthumbaeskey`, `cdnthumburl` and `md5`. It now prints only dimensions, byte size, duration and file name.
+- **Added: OCR fallback for Moments likes/comments under WeChat 4.1.13's merged layout** (`Moment._read_comment_cell_ocr`). Likes and comments now live in a sibling `mmui::TimelineCommentCell` that never enters the UIA tree, so parsing the text cell always came back empty; an empty UIA result now falls back to "comment-box region screenshot + OCR". The comment-box search area also moved to 320 px above the viewport bottom (the old `bottom+8` band landed on the taskbar and never matched on 4.1.13).
+- **Cleanup**: `demo_send.py`'s `pick_default_image` docstring is now a raw string, silencing a `\W` escape warning.
+
 ### v1.2.2.5 (2026-09-19)
 
 - **Fixed: cached Moments pictures decrypted into files nothing could decode.** Two independent causes on the same `.dat` v2 path:
@@ -335,6 +352,8 @@ Thanks to [nanshanjack](https://github.com/nanshanjack) for finding the UI-lock 
 Thanks to [maozhitao12450](https://github.com/maozhitao12450) for reporting the WXAM (wxgf) image download issue (fixed in v1.1.3).
 
 Thanks to [uiharukazari0105](https://github.com/uiharukazari0105) for finding that voice data stored in `media_1.db` (and later) was never searched (fixed in v1.1.4).
+
+Thanks to [wenjiavv](https://github.com/wenjiavv) for reporting the missing `threading` import that broke layout calibration in the published 1.2.2.5 ([#28](https://github.com/fanyuantaier/wechatauto-replica/issues/28)) and the substring/no-watermark hole in send verification ([#29](https://github.com/fanyuantaier/wechatauto-replica/issues/29)), both with reproductions and fix proposals (fixed in v1.2.2.6).
 
 ## 📄 License & Disclaimer
 
