@@ -55,6 +55,7 @@ from typing import Dict, List, Optional, Tuple
 
 from PIL import Image
 
+from wechatauto import rhythm
 from wechatauto.logger import wxlog
 from wechatauto.param import WxResponse
 
@@ -257,7 +258,12 @@ def _restore_keep_maximize(user32, hwnd: int):
 # ---------------------------------------------------------------------------
 
 class WinInput:
-    """基于 Win32 的真实鼠标/键盘输入（DPI 感知）。"""
+    """基于 Win32 的真实鼠标/键盘输入（DPI 感知）。
+
+    所有停顿/光标移动都过 :mod:`wechatauto.rhythm`：真人不会两次点同一个像素、
+    也不会每 0.15s 动一次。档位用 ``rhythm.set_profile('natural'|'calm'|'fast')``
+    或环境变量 ``WECHATAUTO_RHYTHM`` 调。
+    """
 
     def __init__(self):
         user32 = ctypes.windll.user32
@@ -277,13 +283,13 @@ class WinInput:
         物理像素，两者在同一坐标系，无需额外缩放。
         """
         u = self._user32
-        u.SetCursorPos(int(x), int(y))
-        time.sleep(0.15)
+        rhythm.move_to(u, int(x), int(y))
+        rhythm.nap(0.15)
         down = MOUSEEVENTF_RIGHTDOWN if right else MOUSEEVENTF_LEFTDOWN
         up = MOUSEEVENTF_RIGHTUP if right else MOUSEEVENTF_LEFTUP
         u.mouse_event(down, 0, 0, 0, 0)
         u.mouse_event(up, 0, 0, 0, 0)
-        time.sleep(0.3)
+        rhythm.nap(0.3)
 
     def send_input_click(self, x: int, y: int, right: bool = False):
         """SendInput 绝对坐标点击（按真实屏幕尺寸缩放）。
@@ -294,8 +300,8 @@ class WinInput:
         同因改用 SendInput），SendInput 可直接命中弹出右键菜单。
         """
         u = self._user32
-        u.SetCursorPos(int(x), int(y))
-        time.sleep(0.15)
+        rhythm.move_to(u, int(x), int(y))
+        rhythm.nap(0.15)
         n = int(x * 65535 // self.screen_w)
         m = int(y * 65535 // self.screen_h)
         down = MOUSEEVENTF_ABSOLUTE | (MOUSEEVENTF_RIGHTDOWN if right else MOUSEEVENTF_LEFTDOWN)
@@ -307,14 +313,14 @@ class WinInput:
             inp.u.mi.dy = m
             inp.u.mi.dwFlags = flags
             u.SendInput(1, ctypes.byref(inp), ctypes.sizeof(MOUSE_INPUT))
-            time.sleep(0.06)
-        time.sleep(0.3)
+            rhythm.nap(0.06)
+        rhythm.nap(0.3)
 
     def wheel(self, delta: int = -300):
         """滚轮滚动（delta 为正向上，负向下）。"""
         u = self._user32
         u.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta, 0)
-        time.sleep(0.4)
+        rhythm.nap(0.4)
 
     # -- 键盘 ----------------------------------------------------------
     def key(self, vk: int, ctrl: bool = False, shift: bool = False):
@@ -338,7 +344,7 @@ class WinInput:
         """
         flags = KEYEVENTF_KEYUP if not down else 0
         ctypes.windll.user32.keybd_event(vk & 0xFFFF, 0, flags, 0)
-        time.sleep(0.05)
+        rhythm.key_hold()
 
     def type_unicode(self, text: str):
         """以 SendInput Unicode 方式键入文本（绕开键盘布局/大小写问题）。"""
@@ -353,9 +359,9 @@ class WinInput:
             up.u.ki.wScan = ord(ch)
             up.u.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
             u.SendInput(1, ctypes.byref(down), ctypes.sizeof(INPUT))
-            time.sleep(0.02)
+            rhythm.key_hold()
             u.SendInput(1, ctypes.byref(up), ctypes.sizeof(INPUT))
-            time.sleep(0.04)
+            rhythm.type_gap()
 
     def type_pinyin(self, pinyin: str):
         """以虚拟键逐字母输入拼音（供中文输入法组合，如 ``ceshi`` → 测试）。"""
@@ -364,7 +370,7 @@ class WinInput:
                 self.key(ord(ch) - 32)
             elif ch == ' ':
                 self.key(VK_SPACE)
-            time.sleep(0.05)
+            rhythm.type_gap()
 
 
 # ---------------------------------------------------------------------------
@@ -1733,12 +1739,13 @@ class WeChatGUI:
         fast=True 时仅回车 + 短等待（分段连续发送用），失败返回 False
         由 send_msg 回退到完整流程。
         """
+        rhythm.gate('send')
         box = getattr(self, '_last_input_box', None)
         if fast:
             if not self._input_box_has_text(box):
                 return False
             self._input.key(VK_RETURN)
-            time.sleep(0.5)
+            rhythm.nap(0.5)
             if not self._input_box_has_text(box):
                 return True
             return False
@@ -1747,7 +1754,7 @@ class WeChatGUI:
                 wxlog.debug('发送前输入框无文字，跳过空发')
                 return False
             self._input.key(VK_RETURN)
-            time.sleep(1.0)
+            rhythm.nap(1.0)
             if not self._input_box_has_text(box):
                 return True
             wxlog.debug(f'回车发送未生效（attempt={attempt}），改用「发送」按钮')
@@ -1755,13 +1762,15 @@ class WeChatGUI:
             clicked = False
             for text, x, y, w, h in res:
                 if '发送' in text:
-                    self.wx_click(self.origin_x + x + w // 2,
-                                           self.origin_y + y + h // 2)
+                    px, py = rhythm.point((self.origin_x + x, self.origin_y + y,
+                                           self.origin_x + x + w,
+                                           self.origin_y + y + h))
+                    self.wx_click(px, py)
                     clicked = True
                     break
             if not clicked:
                 return False
-            time.sleep(1.0)
+            rhythm.nap(1.0)
             if not self._input_box_has_text(box):
                 return True
         return False
@@ -2027,8 +2036,9 @@ class WeChatGUI:
                 break
         else:
             wxlog.debug('多次粘贴仍未检测到图片草稿，仍尝试回车')
+        rhythm.gate('send-file')
         self._input.key(VK_RETURN)
-        time.sleep(1.5)
+        rhythm.nap(1.5)
         return True
 
     def _input_box_has_color_draft(self, box: Optional[Tuple[int, int, int, int]] = None,

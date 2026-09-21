@@ -307,12 +307,152 @@ def t_verify() -> None:
           bool(VStub([row("hi", 10)])._send_watermark(None)))
 
 
-TESTS = {"layout": t_layout, "verify": t_verify, "keys": t_keys,
-         "sessions": t_sessions, "messages": t_messages}
+# ----------------------------------------------------------------------
+# 6. 拟人节奏（纯离线：时间被接管，不碰微信）
+# ----------------------------------------------------------------------
+def t_rhythm() -> None:
+    """``wechatauto.rhythm``：抖动只加长、落点随机不越界、写动作按盘上状态节流。"""
+    import json
+    import time as _t
+
+    from wechatauto import rhythm
+
+    slept = []
+    real = _t.sleep
+    rhythm.time.sleep = lambda s: slept.append(s)
+    try:
+        print("[rhythm] 抖动")
+        base = rhythm.profile()
+        check("默认档=natural", base.name == "natural", base.name)
+        vals = [rhythm.nap(0.5) for _ in range(40)]
+        check("nap 不缩短既有等待（倍率下限 1.0）", min(vals) >= 0.5)
+        check("nap 取值发散", len({round(v, 4) for v in vals}) > 8,
+              "%.3f~%.3f" % (min(vals), max(vals)))
+        for name, p in rhythm.PROFILES.items():
+            check("%s 档 nap 下限 >=1.0" % name, p.nap[0] >= 1.0)
+            check("%s 档 gap 上限 >= 下限" % name, p.gap[1] >= p.gap[0])
+
+        print("[rhythm] 光标落点与轨迹")
+        rect = (100, 200, 400, 260)
+        pts = {rhythm.point(rect) for _ in range(120)}
+        check("落点全部在矩形内",
+              all(100 <= x < 400 and 200 <= y < 260 for x, y in pts))
+        check("内缩后不贴边",
+              all(145 <= x < 355 and 209 <= y < 251 for x, y in pts))
+        check("落点不再固定（>50 个不同像素）", len(pts) > 50, "%d 个" % len(pts))
+        check("不再每次都点正中心", (250, 230) not in pts)
+        check("退化矩形（宽<=2）回中心不越界",
+              rhythm.point((100, 100, 101, 100)) == (100, 100))
+        spread = {round(rhythm.spread(62, 80), 1) for _ in range(60)}
+        check("spread 落在区间内且发散", 62 <= min(spread) and max(spread) <= 80
+              and len(spread) > 8, "%d 个" % len(spread))
+        check("spread 区间退化时取下限", rhythm.spread(7, 7) == 7)
+
+        class FakeU32:
+            def __init__(self):
+                self.moves = []
+
+            def GetCursorPos(self, _byref):
+                raise OSError("取不到光标")      # 异常路径必须不抛到外面
+
+            def SetCursorPos(self, x, y):
+                self.moves.append((x, y))
+
+        u = FakeU32()
+        steps = rhythm.move_to(u, 900, 700)
+        check("取不到光标时退化为直达（不虚构轨迹）",
+              u.moves == [(900, 700)] and steps == 1, "%d 步" % steps)
+        u2 = FakeU32()
+        steps2 = rhythm.move_to(u2, 900, 700, start=(300, 400))
+        lo_step, hi_step = rhythm.profile().steps
+        check("已知起点时走曲线（多步 + 精确落点）",
+              steps2 >= lo_step + 1 and u2.moves[-1] == (900, 700)
+              and len(u2.moves) == steps2, "%d 步" % steps2)
+        check("轨迹不离起终点连线太远（弓形 <=20%）",
+              all(200 <= x <= 1000 and 300 <= y <= 800 for x, y in u2.moves[:-1]))
+        arc = {tuple(m) for m in u2.moves}
+        u3 = FakeU32()
+        rhythm.move_to(u3, 900, 700, start=(300, 400))
+        check("两次移动的轨迹不重合", arc != {tuple(m) for m in u3.moves})
+        u4 = FakeU32()
+        check("目标已在脚下时不绕路",
+              rhythm.move_to(u4, 300, 400, start=(301, 401)) == 1
+              and u4.moves == [(300, 400)])
+
+        print("[rhythm] 写动作节流")
+        rhythm.reset()
+        slept.clear()
+        w0 = rhythm.gate("send")
+        check("冷启动第一次不等待", w0 == 0.0, "%.2f" % w0)
+        w1 = rhythm.gate("send")
+        lo, hi = rhythm.profile().gap
+        check("第二次按 gap 等待", lo - 0.05 <= w1 <= hi, "%.2fs" % w1)
+        check("等待真的作用在 sleep 上", bool(slept) and max(slept) >= lo - 0.05)
+        st = {}
+        if os.path.isfile(rhythm.STATE_FILE):
+            with open(rhythm.STATE_FILE, encoding="utf-8") as f:
+                st = json.load(f)
+        check("节流状态落盘（跨进程可见）",
+              len(st.get("stamps", [])) == 2 and "last" in st, "%s" % list(st))
+
+        rhythm.configure(gap=(0.0, 0.0), burst=3, window=120.0,
+                        cooloff=(30.0, 40.0))
+        rhythm.reset()
+        slept.clear()
+        for _ in range(3):
+            rhythm.gate("x")
+        slept.clear()
+        w = rhythm.gate("x")          # 第 4 次撞突发上限
+        check("撞突发上限后进入冷却", 30.0 <= w <= 40.0, "%.1fs" % w)
+        check("冷却后突发计数重新从 1 开始",
+              rhythm.snapshot()["recent_writes"] == 1,
+              "%d" % rhythm.snapshot()["recent_writes"])
+        rhythm.configure(gap=base.gap, burst=base.burst,
+                         cooloff=base.cooloff, window=base.window)
+
+        print("[rhythm] off 档 = 这层之前的行为")
+        rhythm.reset()
+        rhythm.set_profile("off")
+        slept.clear()
+        check("off 档 gate 不等待", rhythm.gate("send") == 0.0)
+        check("off 档 nap 精确还原", abs(rhythm.nap(0.3) - 0.3) < 1e-9)
+        check("off 档落点回中心", rhythm.point(rect) == (250, 230))
+        check("off 档 spread 取下限", rhythm.spread(62, 80) == 62)
+        u5 = FakeU32()
+        check("off 档光标直接传送",
+              rhythm.move_to(u5, 900, 700, start=(300, 400)) == 1
+              and u5.moves == [(900, 700)])
+        check("未知档位不改当前档", rhythm.set_profile("nope").name == "off")
+        rhythm.set_profile("natural")
+        check("档位能切回 natural", rhythm.profile().name == "natural")
+
+        print("[rhythm] 只节流「对外可见」的动作")
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        src = open(os.path.join(here, "wechatauto", "guia.py"),
+                   encoding="utf-8").read()
+        check("guia 的读路径（截图/OCR）里没有 gate",
+              "rhythm.gate" not in src[src.index("    def ocr("):
+                                       src.index("    def click_send(")])
+        check("发送提交点 click_send 有 gate",
+              "rhythm.gate('send')" in src[src.index("    def click_send("):
+                                          src.index("    def send_msg(")])
+        sdc = open(os.path.join(here, "wechatauto", "sender.py"),
+                   encoding="utf-8").read()
+        check("遗留坐标发送器 sender.send 同样有 gate",
+              "rhythm.gate('send')" in sdc[sdc.index("    def send(self"):
+                                          sdc.index("    def send_to(")])
+    finally:
+        rhythm.time.sleep = real
+        rhythm.reset()
+
+
+TESTS = {"layout": t_layout, "verify": t_verify, "rhythm": t_rhythm,
+         "keys": t_keys, "sessions": t_sessions, "messages": t_messages}
 
 
 def main() -> int:
-    want = sys.argv[1:] or ["layout", "verify", "keys", "sessions", "messages"]
+    want = sys.argv[1:] or ["layout", "verify", "rhythm",
+                            "keys", "sessions", "messages"]
     for name in want:
         fn = TESTS.get(name)
         if not fn:

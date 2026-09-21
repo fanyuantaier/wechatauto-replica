@@ -15,6 +15,8 @@ import ctypes
 import time
 from ctypes import wintypes
 
+from wechatauto import rhythm
+
 _user32 = ctypes.WinDLL("user32", use_last_error=True)
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
@@ -127,11 +129,15 @@ def _send_input(scan: int = 0, unicode_char: str = "", flags: int = 0):
 
 
 def type_text(text: str, delay: float = 0.01):
-    """用 Unicode 输入事件键入文本（含中文）"""
+    """用 Unicode 输入事件键入文本（含中文）
+
+    逐字间隔取 ``max(delay, rhythm.type_gap())``：调用方给的固定值是下限，
+    拟人档只会把打字放慢，不会比原先更快。
+    """
     for ch in text:
         _send_input(unicode_char=ch, flags=0)
         _send_input(unicode_char=ch, flags=KEYEVENTF_KEYUP)
-        time.sleep(delay)
+        time.sleep(max(delay, rhythm.type_gap()))
 
 
 def press_enter():
@@ -140,8 +146,8 @@ def press_enter():
 
 
 def click(x: int, y: int):
-    _user32.SetCursorPos(x, y)
-    time.sleep(0.08)
+    rhythm.move_to(_user32, x, y)
+    rhythm.nap(0.08)
     _user32.mouse_event(0x0002, 0, 0, 0, 0)  # LEFTDOWN
     _user32.mouse_event(0x0004, 0, 0, 0, 0)  # LEFTUP
 
@@ -208,11 +214,12 @@ class WeChatUI:
         self.activate()
         x, y = self._pt(*self.INPUT_BOX)
         click(x, y)
-        time.sleep(0.4)
+        rhythm.nap(0.4)
         type_text(text)
-        time.sleep(0.2)
+        rhythm.gate('send')
+        rhythm.nap(0.2)
         press_enter()
-        time.sleep(0.6)
+        rhythm.nap(0.6)
 
     def send_to(self, keyword: str, text: str):
         """搜索并打开会话后发送"""

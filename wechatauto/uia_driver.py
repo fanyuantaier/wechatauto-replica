@@ -47,6 +47,7 @@ try:
 except Exception:                                   # pragma: no cover
     _HAS_WIN32 = False
 
+from wechatauto import rhythm
 from wechatauto.logger import wxlog
 
 # ---------------------------------------------------------------------------
@@ -926,9 +927,10 @@ class WeChatUIA:
 
     @staticmethod
     def _set_cursor(x: int, y: int) -> None:
+        """把光标走到目标点（轨迹与步数见 :mod:`wechatauto.rhythm`）。"""
         try:
             import ctypes
-            ctypes.windll.user32.SetCursorPos(int(x), int(y))
+            rhythm.move_to(ctypes.windll.user32, int(x), int(y))
         except Exception:
             pass
 
@@ -945,7 +947,7 @@ class WeChatUIA:
         try:
             import ctypes
             ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)  # down
-            time.sleep(0.05)
+            rhythm.nap(0.05)
             ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)  # up
         except Exception:
             pass
@@ -955,7 +957,7 @@ class WeChatUIA:
         try:
             import ctypes
             ctypes.windll.user32.mouse_event(0x0008, 0, 0, 0, 0)  # down
-            time.sleep(0.05)
+            rhythm.nap(0.05)
             ctypes.windll.user32.mouse_event(0x0010, 0, 0, 0, 0)  # up
         except Exception:
             pass
@@ -1018,7 +1020,7 @@ class WeChatUIA:
 
     def _click_at(self, x: int, y: int, right: bool = False) -> None:
         self._set_cursor(x, y)
-        time.sleep(0.12)
+        rhythm.nap(0.12)
         saved = self._clear_transparent(x, y)
         try:
             if right:
@@ -1027,22 +1029,27 @@ class WeChatUIA:
                 self._left_click()
         finally:
             self._restore_transparent(saved)
-        time.sleep(0.2)
+        rhythm.nap(0.2)
 
     def _click_ctrl(self, ctrl, right: bool = False) -> bool:
-        """按控件矩形的中心点一下（走 _click_at，不吃 WS_EX_TRANSPARENT 的亏）。"""
+        """点一下控件矩形**内部的随机点**（走 _click_at，不吃 WS_EX_TRANSPARENT 的亏）。
+
+        故意不点正中：每次都命中同一个像素是脚本最明显的特征，而人手落在
+        控件内任意处。``rhythm.point`` 保证四边内缩后再取点。
+        """
         try:
             r = ctrl.BoundingRectangle
         except Exception:
             return False
         if not r or r.width() <= 0 or r.height() <= 0:
             return False
-        self._click_at((r.left + r.right) // 2, (r.top + r.bottom) // 2, right=right)
+        x, y = rhythm.point((r.left, r.top, r.right, r.bottom))
+        self._click_at(x, y, right=right)
         return True
 
     def _wheel_at(self, x: int, y: int, delta: int) -> None:
         self._set_cursor(x, y)
-        time.sleep(0.1)
+        rhythm.nap(0.1)
         saved = self._clear_transparent(x, y)
         try:
             self._mouse_wheel(delta)
@@ -1222,7 +1229,7 @@ class WeChatUIA:
         # 渲染层的 WS_EX_TRANSPARENT 挡掉（见 _click_at 上方注释）。
         if not self._click_ctrl(item):
             return False
-        time.sleep(settle)
+        rhythm.nap(settle)
         return True
 
     def open_chat(self, keyword: str, index: Optional[int] = None,
@@ -1251,11 +1258,11 @@ class WeChatUIA:
                 # 当时聚焦的别的控件里（实测落进过聊天输入框）。
                 if not self._set_text(box, kw):
                     self._paste_into(box, kw, clear=True)
-                time.sleep(0.8)
+                rhythm.nap(0.8)
                 got = self._collect_results(kw)
                 if got:
                     break
-                time.sleep(0.4)
+                rhythm.nap(0.4)
             if got:
                 results = got
                 used_kw = kw
@@ -1296,7 +1303,8 @@ class WeChatUIA:
         if e is None:
             return False
         self._paste_into(e, text, clear=True)
-        time.sleep(0.2)
+        rhythm.gate('send')
+        rhythm.nap(0.2)
         try:
             e.SendKeys("{Enter}", waitTime=0.05)
         except Exception:
@@ -1340,9 +1348,10 @@ class WeChatUIA:
             time.sleep(0.5)
         if not btn or not btn.Exists(0):
             return False
+        rhythm.gate('call')
         try:
             self._click_ctrl(btn)
-            time.sleep(0.8)
+            rhythm.nap(0.8)
         except Exception:
             return False
         # 菜单里选择 语音/视频 通话项
@@ -1426,30 +1435,31 @@ class WeChatUIA:
         except Exception:
             return False
         # 头像位于消息行最左侧约 40-50px 处
-        ax = r.left + 70
-        ay = (r.top + r.bottom) // 2
+        ax = int(r.left + rhythm.spread(62, 80))
+        ay = int(rhythm.spread(r.top + r.height() * 0.35,
+                               r.top + r.height() * 0.65))
         try:
             from wechatauto.guia import ScreenOCR
             import PIL.ImageGrab as IG
         except Exception:
             return False
+        rhythm.gate('poke')
         for attempt in range(2):
             self._set_cursor(ax, ay)
-            time.sleep(0.2)
+            rhythm.nap(0.2)
             self._right_click()
-            time.sleep(1.0)
+            rhythm.nap(1.0)
             img = IG.grab()
             res = ScreenOCR.recognize(img)
             for text, x, y, w, h in res:
                 t = (text or "").replace(" ", "")
                 if "拍一拍" in t or t == "拍一" or t.startswith("拍一"):
-                    # 点击该文字中心
-                    cx = x + w // 2
-                    cy = y + h // 2
+                    # 点在该菜单项矩形内部的一个随机点
+                    cx, cy = rhythm.point((x, y, x + w, y + h))
                     self._set_cursor(cx, cy)
-                    time.sleep(0.2)
+                    rhythm.nap(0.2)
                     self._left_click()
-                    time.sleep(0.5)
+                    rhythm.nap(0.5)
                     return True
         return False
 
@@ -1484,7 +1494,7 @@ class WeChatUIA:
         # 最新消息在可视区底部（消息列表打开即定位在最新），取 bottom 最大者
         target = max(candidates, key=lambda t: t[1].bottom)
         ch, r = target
-        # 消息行内取内容重心 x（self 靠右、friend 靠左），y 取行垂直中心
+        # 消息行内取内容重心 x（self 靠右、friend 靠左），y 在行的中段随机取
         try:
             from PIL import ImageGrab as IG
             img = IG.grab(bbox=(r.left, r.top, r.right, r.bottom))
@@ -1500,11 +1510,12 @@ class WeChatUIA:
                 cx = (r.left + r.right) // 2
         except Exception:
             cx = (r.left + r.right) // 2
-        cy = (r.top + r.bottom) // 2
+        cy = int(rhythm.spread(r.top + r.height() * 0.35,
+                               r.top + r.height() * 0.65))
         self._set_cursor(cx, cy)
-        time.sleep(0.2)
+        rhythm.nap(0.2)
         self._right_click()
-        time.sleep(1.0)
+        rhythm.nap(1.0)
         return (cx, cy)
 
     def _uia_find_menu_item(self, name_sub: str, max_depth: int = 6):
@@ -1554,12 +1565,11 @@ class WeChatUIA:
                 continue
         try:
             r = ctrl.BoundingRectangle
-            cx = (r.left + r.right) // 2
-            cy = (r.top + r.bottom) // 2
+            cx, cy = rhythm.point((r.left, r.top, r.right, r.bottom))
             self._set_cursor(cx, cy)
-            time.sleep(0.2)
+            rhythm.nap(0.2)
             self._left_click()
-            time.sleep(0.3)
+            rhythm.nap(0.3)
             return True
         except Exception:
             return False
@@ -1572,6 +1582,7 @@ class WeChatUIA:
         超过 2 分钟撤回时限）则返回失败。UIA 不可用/未命中时降级到 OCR
         （全屏识别「撤回」文字定位点击）。两者都失败返回 False。
         """
+        rhythm.gate('recall')
         pos = self._right_click_latest_row(who)
         if pos is None:
             return False
@@ -1590,20 +1601,19 @@ class WeChatUIA:
             if attempt > 0:
                 cx, cy = pos
                 self._set_cursor(cx, cy)
-                time.sleep(0.2)
+                rhythm.nap(0.2)
                 self._right_click()
-                time.sleep(1.0)
+                rhythm.nap(1.0)
             img = IG.grab()
             res = ScreenOCR.recognize(img)
             for text, x, y, w, h in res:
                 t = (text or "").replace(" ", "")
                 if "撤回" in t or t == "撤回":
-                    cxx = x + w // 2
-                    cyy = y + h // 2
+                    cxx, cyy = rhythm.point((x, y, x + w, y + h))
                     self._set_cursor(cxx, cyy)
-                    time.sleep(0.2)
+                    rhythm.nap(0.2)
                     self._left_click()
-                    time.sleep(0.5)
+                    rhythm.nap(0.5)
                     return True
         return False
 
@@ -1628,7 +1638,7 @@ class WeChatUIA:
     def _paste_into(self, ctrl, text: str, clear: bool = True) -> None:
         """点击控件拿焦点，再走剪贴板 Ctrl+V（发送类输入框用这条）。"""
         self._click_ctrl(ctrl)
-        time.sleep(0.1)
+        rhythm.nap(0.1)
         if clear:
             try:
                 ctrl.SendKeys("{Ctrl}a{Delete}", waitTime=0.05)

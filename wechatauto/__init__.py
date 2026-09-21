@@ -9,6 +9,7 @@ from __future__ import annotations
 from .wx import WeChat, Chat, Listener
 from .param import WxParam, WxResponse, PROJECT_NAME
 from .logger import wxlog
+from . import rhythm
 from .moment import Moment, MomentDB
 from .moment_observer import MomentObserver
 from .db import WeChatDB, GroupMemberWatcher, auto_detect_db_dir, list_accounts
@@ -76,6 +77,7 @@ __all__ = [
     "Moment",
     "MomentDB",
     "MomentObserver",
+    "rhythm",
     "LockManager",
     "uilock",
     "WechatautoError",

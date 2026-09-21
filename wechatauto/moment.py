@@ -30,6 +30,7 @@ from typing import Dict, Iterable, List, Optional, Union
 from PIL import Image
 
 from wechatauto import uia
+from wechatauto import rhythm
 from wechatauto.languages import MOMENTS, get_lang
 from wechatauto.logger import wxlog
 from wechatauto.param import WxResponse
@@ -1544,13 +1545,13 @@ class Moment:
             return False
         try:
             r = btn.BoundingRectangle
-            x, y = int((r.left + r.right) // 2), int((r.top + r.bottom) // 2)
+            x, y = rhythm.point((r.left, r.top, r.right, r.bottom))
         except Exception:
             return False
         try:
             import pyautogui
             pyautogui.click(x, y)
-            time.sleep(0.5)
+            rhythm.nap(0.5)
             return True
         except Exception as e:
             wxlog.debug(f'点击浮层按钮 {name} 失败：{e}')
@@ -1558,6 +1559,7 @@ class Moment:
 
     def _like_open(self) -> bool:
         """在 “…” 浮层已弹出的前提下，点击「赞」。"""
+        rhythm.gate('like')
         return self._click_float_button('赞', timeout=2.5)
 
     def LikeMoment(self, publisher: Optional[str] = None,
@@ -1610,13 +1612,13 @@ class Moment:
                 wxlog.debug('未找到评论输入框 EditControl（可能为自绘控件）')
                 return False
             r = hit.BoundingRectangle
-            cx, cy = int((r.left + r.right) // 2), int((r.top + r.bottom) // 2)
-            if cx == 0 and cy == 0:
+            if (r.left + r.right) // 2 == 0 and (r.top + r.bottom) // 2 == 0:
                 wxlog.debug('评论输入框 EditControl 坐标为零，跳过手动聚焦')
                 return False
+            cx, cy = rhythm.point((r.left, r.top, r.right, r.bottom))
             import pyautogui
             pyautogui.click(cx, cy)
-            time.sleep(0.3)
+            rhythm.nap(0.3)
             return True
         except Exception:
             return False
@@ -1677,6 +1679,7 @@ class Moment:
             import pyautogui
         except Exception as e:
             return WxResponse.failure(f'pyautogui 不可用：{e}')
+        rhythm.gate('comment')
 
         try:
             theme = self._comment_box_theme()
@@ -2665,6 +2668,7 @@ class MomentActionMenu(BaseUISubWnd):
         button = self._find_button(target_names)
         if not button:
             return WxResponse.failure('未找到点赞按钮')
+        rhythm.gate('like')
         button.Click()
         return WxResponse.success('操作成功')
 
