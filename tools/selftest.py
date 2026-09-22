@@ -446,12 +446,180 @@ def t_rhythm() -> None:
         rhythm.reset()
 
 
+# ----------------------------------------------------------------------
+# 7. UIA gate 扫描（纯离线：合成 PE 片段 + 临时缓存文件，不碰微信）
+# ----------------------------------------------------------------------
+def t_gate() -> None:
+    """``_rip_xrefs_to_rva`` 向量化后与逐字节实现等价；扫描失败/异常不得打断调用方。"""
+    import random
+    import struct as st
+    import tempfile
+
+    import wechatauto.uia_driver as ud
+    from wechatauto.uia_driver import IMAGE_SCN_MEM_EXECUTE, WeChatUIA
+
+    EXEC = IMAGE_SCN_MEM_EXECUTE | 0x40000000      # +INITIALIZED_DATA
+    WRITE = 0x80000000 | IMAGE_SCN_MEM_EXECUTE     # 可写 + 可执行：仍该参与匹配
+    _gate_entry = lambda p: ud._gate_cache().get(_dll_identity(p), {})
+
+    def build(n=4096, seed=7):
+        """一段可执行 section 覆盖整个 buffer，尾部留 16 字节给边界用例。"""
+        rnd = random.Random(seed)
+        data = bytearray(rnd.randrange(256) for _ in range(n))
+        for i in range(0, n - 16, 37):
+            data[i] = 0x8D                          # 大量 0x8D 噪声，制造假匹配
+        return data
+
+    secs = lambda n, chars=EXEC: [{"name": ".text", "rva": 0x1000, "vsize": n,
+                                   "raw_size": n, "raw_ptr": 0, "chars": chars}]
+    SEC_RVA = 0x1000
+    TGT_HI = 0x9AB000        # disp 为正：引用远处的可写段
+    TGT_LO = 0x0ABC          # disp 为负：引用指令之前的地址（真实代码里更常见）
+
+    def plant_plain(d, i, tgt):
+        """在 i 处放 8D 05 disp32（无 REX），返回应有的 xref RVA。"""
+        d[i], d[i + 1] = 0x8D, 0x05
+        d[i + 2:i + 6] = st.pack("<i", tgt - (SEC_RVA + i) - 6)
+        return SEC_RVA + i
+
+    def plant_rex(d, i, tgt):
+        """同上但前面补一个 REX 前缀：指令起点是 i-1，长度 7。"""
+        d[i - 1] = 0x4C
+        return plant_plain(d, i, tgt) - 1
+
+    print("[gate] 向量化 vs 逐字节参考实现")
+    for seed in (7, 11, 23):
+        data = build(4096, seed)
+        sections = secs(len(data))
+        want_hi = {plant_rex(data, 100, TGT_HI), plant_plain(data, 250, TGT_HI),
+                   plant_plain(data, len(data) - 8, TGT_HI)}   # 段尾最后可用位
+        want_lo = {plant_rex(data, 130, TGT_LO), plant_plain(data, 300, TGT_LO),
+                   plant_plain(data, len(data) - 24, TGT_LO)}
+        data = bytes(data)
+        for label, tgt, want in (("正位移", TGT_HI, want_hi),
+                                 ("负位移", TGT_LO, want_lo)):
+            ref = WeChatUIA._rip_xrefs_to_rva_ref(data, sections, tgt)
+            new = WeChatUIA._rip_xrefs_to_rva(data, sections, tgt)
+            check("seed=%d %s：两种实现结果一致" % (seed, label),
+                  sorted(ref) == sorted(new), "%d 个" % len(new))
+            check("seed=%d %s：植入的三条（含带 REX）都命中" % (seed, label),
+                  want <= set(new), "%d/%d" % (len(want & set(new)), len(want)))
+        new = WeChatUIA._rip_xrefs_to_rva(data, sections, TGT_HI)
+        check("seed=%d 可写段按原逻辑同样参与（未改变语义）" % seed,
+              WeChatUIA._rip_xrefs_to_rva(
+                  data, secs(len(data), chars=WRITE), TGT_HI) == new)
+        check("seed=%d 非可执行段返回空" % seed,
+              WeChatUIA._rip_xrefs_to_rva(
+                  data, secs(len(data), chars=0x40000000), TGT_HI) == [])
+        check("seed=%d 目标不存在时返回空" % seed,
+              WeChatUIA._rip_xrefs_to_rva(data, sections, 0x0F0F0F0F) == [])
+
+    data = build(64, 5)
+    plant_plain(data, len(data) - 7, TGT_HI)   # 原实现循环上界 len-8，这条在界外
+    data[63 - 7] = 0x00                        # 别让前一个字节被当成 REX 前缀
+    data = bytes(data)
+    sections = secs(64)
+    check("段尾界外那条两种实现都不命中（边界与原实现一致）",
+          not WeChatUIA._rip_xrefs_to_rva(data, sections, TGT_HI)
+          and not WeChatUIA._rip_xrefs_to_rva_ref(data, sections, TGT_HI))
+    check("空/超短 buffer 不抛",
+          WeChatUIA._rip_xrefs_to_rva(b"", [], TGT_HI) == []
+          and WeChatUIA._rip_xrefs_to_rva(b"\x8d\x05" * 3, secs(6), TGT_HI) == [])
+
+    data = build(4096, 7)
+    plant_plain(data, 250, TGT_HI)
+    data = bytes(data)
+    sections = secs(4096)
+    saved_np = sys.modules.get("numpy")
+    sys.modules["numpy"] = None                   # 让 import numpy 抛 ImportError
+    try:
+        fb = WeChatUIA._rip_xrefs_to_rva(data, sections, TGT_HI)
+        check("缺 numpy 时自动退回逐字节实现，结果不变且非空",
+              fb == WeChatUIA._rip_xrefs_to_rva_ref(data, sections, TGT_HI)
+              and fb != [], "%d 个" % len(fb))
+    finally:
+        if saved_np is None:
+            sys.modules.pop("numpy", None)
+        else:
+            sys.modules["numpy"] = saved_np
+
+    print("[gate] 扫描失败要返回空序列，不是 None；结果按 DLL 身份落盘")
+    from wechatauto.uia_driver import _dll_identity
+
+    scan = WeChatUIA._scan_qaccessible_candidates
+    with tempfile.TemporaryDirectory() as td:
+        cache_file = os.path.join(td, "gate_cache.json")
+        old_file = ud.GATE_CACHE_FILE
+        old_verified = dict(ud._VERIFIED_GATE_RVA)
+        ud.GATE_CACHE_FILE, ud._GATE_CACHE = cache_file, None
+        try:
+            missing = os.path.join(td, "nope.dll")
+            junk = os.path.join(td, "junk.dll")
+            with open(junk, "wb") as f:
+                f.write(b"MZ\x90\x00" + bytes(4096))
+            check("文件读不到 → ()", scan(missing) == ())
+            check("不是 PE → ()", scan(junk) == ())
+            check("返回值可直接迭代（旧版返回 None 会 TypeError）",
+                  list(scan(junk)) == [])
+            check("读不到/不是 PE 属于瞬时失败，不落盘",
+                  not os.path.isfile(cache_file))
+
+            tiny = r"C:\Windows\System32\win32u.dll"
+            if os.path.isfile(tiny):
+                check("是 PE 但没有 gate 特征 → ()，且负结果落盘",
+                      scan(tiny) == () and _gate_entry(tiny).get("candidates") == [],
+                      "%s" % _gate_entry(tiny))
+
+            fake = os.path.join(td, "fake-9.9.9", "Weixin.dll")
+            ud._gate_cache_put(_dll_identity(fake), candidates=[0x1234, 0x5678])
+            scan.cache_clear()
+            check("盘上缓存命中即返回，不再读 198MB 文件（该路径根本不存在）",
+                  scan(fake) == (0x1234, 0x5678))
+            ud._gate_cache_put(_dll_identity(fake), verified=0x9999)
+            ud._VERIFIED_GATE_RVA.clear()
+            check("已验证 RVA 从盘上恢复并顶到候选序列首位",
+                  WeChatUIA._qaccessible_candidate_rvas(fake)[0] == 0x9999)
+            with open(cache_file, "w", encoding="utf-8") as f:
+                f.write("{ 坏掉的 json")
+            ud._GATE_CACHE = None
+            scan.cache_clear()
+            check("缓存文件损坏 → 不抛，按未命中重扫", scan(fake) == ())
+        finally:
+            ud.GATE_CACHE_FILE, ud._GATE_CACHE = old_file, None
+            ud._VERIFIED_GATE_RVA.clear()
+            ud._VERIFIED_GATE_RVA.update(old_verified)
+            scan.cache_clear()
+
+    print("[gate] 热激活异常只降级，不打断发送")
+
+    class Stub:
+        _set_screen_reader_flag = lambda self, on: None
+        _wechat_hwnds = lambda self: [1, 2]
+
+        def __init__(self, boom):
+            self.boom, self.n = boom, 0
+
+        def _hot_activate_accessibility(self, hwnd):
+            self.n += 1
+            if self.boom:
+                raise RuntimeError("扫描炸了")
+            return True
+
+    s = Stub(boom=True)
+    check("_hot_activate_accessibility 抛异常时 _wake_accessibility 返回 False",
+          WeChatUIA._wake_accessibility(s) is False)
+    check("两个窗口都试过（异常被逐个吞掉）", s.n == 2, "%d 次" % s.n)
+    s2 = Stub(boom=False)
+    check("正常路径仍然返回 True", WeChatUIA._wake_accessibility(s2) is True)
+
+
 TESTS = {"layout": t_layout, "verify": t_verify, "rhythm": t_rhythm,
+         "gate": t_gate,
          "keys": t_keys, "sessions": t_sessions, "messages": t_messages}
 
 
 def main() -> int:
-    want = sys.argv[1:] or ["layout", "verify", "rhythm",
+    want = sys.argv[1:] or ["layout", "verify", "rhythm", "gate",
                             "keys", "sessions", "messages"]
     for name in want:
         fn = TESTS.get(name)

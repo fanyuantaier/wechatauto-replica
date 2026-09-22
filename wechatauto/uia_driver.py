@@ -31,13 +31,14 @@ UIA 树会立即物化为 ``mmui::MainWindow``，其中：
 from __future__ import annotations
 
 import ctypes
+import json
 import os
 import re
 import struct
 import time
 from ctypes import wintypes
 from functools import lru_cache
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import uiautomation as auto
 
@@ -172,6 +173,7 @@ QACCESSIBLE_GATE_PATTERN = re.compile(
 
 # 已验证的 gate RVA：按 Weixin.dll 身份（版本目录+大小+mtime）缓存。
 # 好处：换版本后优先使用上次真正生效过的地址；命中时无需重扫 198MB DLL。
+# 这份表同时落盘（见下），否则每个新进程都要重付扫描成本。
 _VERIFIED_GATE_RVA: Dict[str, int] = {}
 
 
@@ -183,6 +185,46 @@ def _dll_identity(dll_path: str) -> str:
         return "%s|%d|%d" % (ver, st.st_size, int(st.st_mtime))
     except OSError:
         return dll_path
+
+
+# gate 扫描结果按 DLL 身份落盘。必须落盘而不是只留 lru_cache：本库的典型用法
+# 是一个脚本一个新 Python 进程，进程内缓存在这种用法下等于没有——每次启动都
+# 重扫一遍 198MB 的 Weixin.dll（实测 8 秒，慢机上更像卡死）。
+GATE_CACHE_FILE = os.path.join(os.path.expanduser('~'), '.wechatauto',
+                               'gate_cache.json')
+_GATE_CACHE: Optional[Dict[str, dict]] = None
+
+
+def _gate_cache() -> Dict[str, dict]:
+    """读落盘的 gate 缓存（损坏/不存在都按空表处理，不抛）。"""
+    global _GATE_CACHE
+    if _GATE_CACHE is None:
+        data: Dict[str, dict] = {}
+        try:
+            with open(GATE_CACHE_FILE, encoding='utf-8') as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                data = {k: v for k, v in raw.items() if isinstance(v, dict)}
+        except (OSError, ValueError):
+            pass
+        _GATE_CACHE = data
+    return _GATE_CACHE
+
+
+def _gate_cache_put(identity: str, **fields) -> None:
+    """合并写回一条 gate 缓存。写失败只留 debug：缓存丢了不过是重扫一次。"""
+    entry = _gate_cache().setdefault(identity, {})
+    entry.update(fields)
+    try:
+        os.makedirs(os.path.dirname(GATE_CACHE_FILE), exist_ok=True)
+        tmp = GATE_CACHE_FILE + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(_gate_cache(), f, ensure_ascii=False, sort_keys=True)
+        os.replace(tmp, GATE_CACHE_FILE)
+    except OSError as e:
+        wxlog.debug(f'gate 缓存写盘失败（不影响功能）：{e}')
+
+
 IMAGE_SCN_MEM_EXECUTE = 0x20000000
 IMAGE_SCN_MEM_WRITE = 0x80000000
 PROCESS_VM_OPERATION = 0x0008
@@ -431,6 +473,64 @@ class WeChatUIA:
 
     @staticmethod
     def _rip_xrefs_to_rva(data: bytes, sections, target_rva: int) -> List[int]:
+        """可执行段里以 RIP 相对寻址引用 ``target_rva`` 的 LEA 指令 RVA。
+
+        匹配的是 ``[REX] 8D <modrm>``，modrm 满足 ``(b & 0xC7) == 0x05``
+        （mod=00、r/m=101 → RIP 相对），disp32 紧跟其后。
+
+        用 numpy 向量化而不是逐字节 Python 循环：Weixin.dll 有 198MB，老实现
+        扫一次 8 秒，在用户端看起来就是卡死（真有人在这一步按了停止）。两种
+        形态的判定式化简后是同一个 ``file_off + disp == 常数``，因为带 REX 时
+        指令起点前移一字节、长度却多一字节。
+        """
+        try:
+            import numpy as np
+        except ImportError:
+            # numpy 随 opencv-python 一起来，正常装包不会走到这里；真缺了也
+            # 只是退回慢二十多倍的老实现，不能让 UIA 整条路因此消失。
+            return WeChatUIA._rip_xrefs_to_rva_ref(data, sections, target_rva)
+
+        a = np.frombuffer(data, dtype=np.uint8)
+        n = a.size
+        if n < 16:
+            return []
+        # 全局边界 p8d <= n-7：无 REX 形态最晚只能到 end-8，带 REX 的起点是
+        # p8d-1，最晚到 end-8 时 p8d == end-7；disp32 落在 p8d+2..p8d+5。
+        p8d = np.flatnonzero(a == 0x8D)
+        p8d = p8d[(p8d >= 1) & (p8d <= n - 7)]
+        if p8d.size == 0:
+            return []
+        modrm = np.zeros(256, dtype=bool)
+        modrm[[0x05, 0x0D, 0x15, 0x1D, 0x25, 0x2D, 0x35, 0x3D]] = True
+        p8d = p8d[modrm[a[p8d + 1]]]
+        if p8d.size == 0:
+            return []
+        rex = (a[p8d - 1] >= 0x40) & (a[p8d - 1] <= 0x4F)
+        b = a[p8d[:, None] + np.arange(2, 6)].astype(np.int64)
+        disp = b[:, 0] | (b[:, 1] << 8) | (b[:, 2] << 16) | (b[:, 3] << 24)
+        disp -= (disp >= 0x80000000) << 32          # 无符号 32 位 → 有符号
+        total = p8d + disp
+
+        xrefs: List[int] = []
+        for sec in sections:
+            if not (sec["chars"] & IMAGE_SCN_MEM_EXECUTE):
+                continue
+            start = sec["raw_ptr"]
+            end = min(n, start + sec["raw_size"])
+            if end - start < 8:
+                continue
+            k = target_rva - sec["rva"] + start - 6
+            hit = total == k
+            plain = hit & (p8d >= start) & (p8d <= end - 8)
+            xrefs += (sec["rva"] + p8d[plain] - start).tolist()
+            with_rex = hit & rex & (p8d >= start + 1) & (p8d <= end - 7)
+            xrefs += (sec["rva"] + p8d[with_rex] - start - 1).tolist()
+        return xrefs
+
+    @staticmethod
+    def _rip_xrefs_to_rva_ref(data: bytes, sections, target_rva: int) -> List[int]:
+        """逐字节的慢实现（与 1.2.2.6 及更早版本同逻辑）：既是缺 numpy 时的
+        回退路径，也是自检里给向量化版对拍的参照。"""
         xrefs: List[int] = []
         for sec in sections:
             if not (sec["chars"] & IMAGE_SCN_MEM_EXECUTE):
@@ -458,16 +558,25 @@ class WeChatUIA:
 
         单一候选在版本升级后会漂移，因此返回候选序列：调用方逐个热写并用
         「mmui 树是否真的物化」判定，成功者记入 _VERIFIED_GATE_RVA。
+
+        结果按 DLL 身份落盘（含「扫过了，没有候选」这个负结果——不支持的版本
+        每次都重扫最浪费）。读不到文件/不是 PE 都返回空序列而不是 None：调用
+        方是直接迭代的。
         """
+        identity = _dll_identity(dll_path)
+        cached = _gate_cache().get(identity, {}).get("candidates")
+        if isinstance(cached, list):
+            return tuple(int(c) for c in cached)
+
         try:
             with open(dll_path, "rb") as f:
                 data = f.read()
         except OSError:
-            return None
+            return ()
 
         sections = WeChatUIA._pe_sections(data)
         if not sections:
-            return None
+            return ()
 
         core_off = data.find(QACCESSIBLE_CORE_STRING)
         core_rva = WeChatUIA._offset_to_rva(sections, core_off) if core_off >= 0 else None
@@ -498,13 +607,16 @@ class WeChatUIA:
             candidates.append((distance, target_rva))
 
         if not candidates:
+            _gate_cache_put(identity, candidates=[])
             return ()
         candidates.sort(key=lambda item: item[0])
         # 优先取与 qt.accessibility.core 同一代码岛（≤0x20000）的候选；
         # 一个都没有时退化为全部候选，交给热写校验兜底
         near = [rva for dist, rva in candidates if dist <= 0x20000]
         ordered = near or [rva for _dist, rva in candidates]
-        return tuple(dict.fromkeys(ordered))
+        result = tuple(dict.fromkeys(ordered))
+        _gate_cache_put(identity, candidates=list(result))
+        return result
 
     @staticmethod
     def _scan_qaccessible_active_rva(dll_path: str) -> Optional[int]:
@@ -516,9 +628,14 @@ class WeChatUIA:
     def _qaccessible_candidate_rvas(dll_path: str) -> List[int]:
         """gate RVA 候选序列：已验证缓存 > 特征扫描 > 版本兜底表。"""
         out: List[int] = []
-        cached = _VERIFIED_GATE_RVA.get(_dll_identity(dll_path))
-        if cached is not None:
-            out.append(int(cached))
+        identity = _dll_identity(dll_path)
+        verified = _VERIFIED_GATE_RVA.get(identity)
+        if verified is None:
+            disk = _gate_cache().get(identity, {}).get("verified")
+            if isinstance(disk, int):
+                _VERIFIED_GATE_RVA[identity] = verified = disk
+        if verified is not None:
+            out.append(int(verified))
         for rva in WeChatUIA._scan_qaccessible_candidates(dll_path):
             if int(rva) not in out:
                 out.append(int(rva))
@@ -629,7 +746,9 @@ class WeChatUIA:
                 if not verify:
                     return True
                 if self._mmui_present(hwnd):
-                    _VERIFIED_GATE_RVA[_dll_identity(dll_path)] = int(rva)
+                    identity = _dll_identity(dll_path)
+                    _VERIFIED_GATE_RVA[identity] = int(rva)
+                    _gate_cache_put(identity, verified=int(rva))
                     wxlog.info("UIA 树已物化，已记录 gate RVA：Weixin.dll+0x%x", rva)
                     return True
                 # 候选不对：恢复原值，继续试下一个
@@ -642,11 +761,20 @@ class WeChatUIA:
             kernel32.CloseHandle(handle)
 
     def _wake_accessibility(self) -> bool:
-        """确保 mmui 树物化：设系统读屏标志 + 逐窗口热写并校验（含候选重试）。"""
+        """确保 mmui 树物化：设系统读屏标志 + 逐窗口热写并校验（含候选重试）。
+
+        这里兜住异常：PE 扫描/热写任何一步出错都只该让「UIA 这条路这次不可用」，
+        调用方会自己回落 OCR/坐标。以前不兜，扫描里一个异常会一路冒出
+        ``ensure_window``，把 ``quick_send`` 整个打断（用户实测崩在 198MB DLL 的
+        扫描循环里）。KeyboardInterrupt 属于 BaseException，不在此列，照常中断。
+        """
         self._set_screen_reader_flag(True)
         ok = False
         for hwnd in self._wechat_hwnds():
-            ok = self._hot_activate_accessibility(hwnd) or ok
+            try:
+                ok = self._hot_activate_accessibility(hwnd) or ok
+            except Exception as e:
+                wxlog.warning("热激活 UIA 异常，本轮跳过（改用 OCR/坐标定位）：%s", e)
         if ok:
             self._win = None
             time.sleep(0.2)
