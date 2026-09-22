@@ -316,6 +316,31 @@ chat.ForwardVoiceMessage(target="群名")    # 从当前会话提取语音转成
 
 ---
 
+### 5.7 拟人节奏与写动作节流 / Human pacing & write throttling (`rhythm`)
+
+微信风控看到的是**动作的时间分布**（固定间隔、光标传送、永远命中控件正中、匀速键入、
+几秒内连发），所以这层做在库里、默认生效。/ WeChat risk control sees the *time
+distribution* of actions, so pacing lives in the library and is on by default.
+
+```python
+from wechatauto import rhythm
+rhythm.set_profile('natural')   # 默认 / default：间隔 2.5-6s，120s 内 6 次，突发后冷却 30-75s
+rhythm.set_profile('calm')      # 长时间挂机 / 真人会话：间隔 6-14s，300s 内 3 次
+rhythm.set_profile('fast')      # 录屏赶时间：仍然非匀速，只是贴近原速
+rhythm.set_profile('off')       # 精确还原这层之前的行为，只用于对照实验
+print(rhythm.snapshot())        # 当前档位、距上次写动作秒数、窗口内计数
+```
+
+- **只管写动作**：发消息 / 发文件 / 点赞 / 评论 / 撤回 / 拍一拍 / 语音通话。读库、截图、
+  OCR、定位控件不节流。/ Reads are never throttled.
+- 环境变量单项覆盖（无需改代码）/ single-field overrides via env：
+  `WECHATAUTO_RHYTHM=natural|calm|fast|off`、`WECHATAUTO_WRITE_GAP=秒`、
+  `WECHATAUTO_WRITE_BURST=次`。
+- 节流状态在 `~/.wechatauto/rhythm.json`，**跨进程生效**（每个脚本都是新进程）。档位本身
+  不落盘，`rhythm.reset()` 只清计数，所以误设的 `off` 不会串到下一次会话。
+- 想给某个等待加抖动：`rhythm.nap(0.5)` 而不是 `time.sleep(0.5)`——倍率下限 1.0，只会等得更久，
+  不会把原来撑渲染稳定性的等待缩短。
+
 ## 6. 媒体下载 / Media Download
 
 ### 6.1 初始化与密钥 / Init & keys
