@@ -441,9 +441,62 @@ def t_rhythm() -> None:
         check("遗留坐标发送器 sender.send 同样有 gate",
               "rhythm.gate('send')" in sdc[sdc.index("    def send(self"):
                                           sdc.index("    def send_to(")])
+        sinks = _write_sink_functions()
+        gated = [s for s in sinks if s[3]]
+        check("检出 >=3 个「按下发送」落点（探测器本身没失效）", len(gated) >= 3,
+              ", ".join("%s.%s" % (c or "-", n) for _f, c, n, _g in gated))
+        leak = ["%s:%s.%s" % (f, c or "-", n) for f, c, n, g in sinks
+                if not g and (f, c, n) not in NOT_A_WRITE]
+        check("每个真的按下发送的函数都先过 rhythm.gate", not leak, ", ".join(leak))
+        check("朋友圈评论窗口 send 已补上节流（曾因走老路径而漏）",
+              ("moment.py", "MomentCommentDialog", "send", True) in sinks)
     finally:
         rhythm.time.sleep = real
         rhythm.reset()
+
+
+# 只是「引用了发送按钮/回车」但本身不对外产生消息的函数，不算写落点
+NOT_A_WRITE = {
+    ("guia.py", "WeChatGUI", "calibrate_layout"),        # 找按钮位置，不发东西
+    ("guia.py", "WeChatGUI", "_to_pinyin"),              # 输入法里选拼音
+    ("moment.py", "Moment", "_match_comment_line"),      # OCR 文本匹配
+    ("moment.py", "MomentCommentDialog", "_locate"),     # 定位控件
+    ("moment.py", "MomentCommentDialog", "_init_controls"),
+    ("sender.py", "WeChatUI", "open_chat"),              # 回车用于打开会话
+    ("sender.py", None, "press_enter"),                  # 原语本身
+}
+
+
+def _write_sink_functions():
+    """静态列出「按下发送」的函数：[(文件, 类, 函数名, 函数体里有没有 rhythm.gate)]。
+
+    这类回归的形态是「新写了一条对外可见的动作，但忘了接节流」——朋友圈评论窗口
+    的 ``send`` 就是这么漏掉的（它和 ``_click_comment_send`` 是两条并行路径）。
+    所以这里按「做了什么」找，而不是按函数名猜。
+    """
+    import ast
+    import re
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    prim = re.compile(r"SendKeys\('\{Enter\}'\)|press_enter\b|keybd_event\(0x0|'发送'")
+    out = []
+    for fname in ("guia.py", "uia_driver.py", "moment.py", "sender.py", "wx.py",
+                  "chat.py", "recall.py"):
+        path = os.path.join(here, "wechatauto", fname)
+        if not os.path.isfile(path):
+            continue
+        src = open(path, encoding="utf-8").read()
+        tree = ast.parse(src)
+        found = []
+        for cls in [n for n in tree.body if isinstance(n, ast.ClassDef)]:
+            found += [(cls.name, m) for m in cls.body
+                      if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        found += [(None, n) for n in tree.body
+                  if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        for cname, node in found:
+            body = ast.get_source_segment(src, node) or ""
+            if prim.search(body):
+                out.append((fname, cname, node.name, "rhythm.gate(" in body))
+    return out
 
 
 # ----------------------------------------------------------------------

@@ -2744,16 +2744,22 @@ class MomentCommentDialog(BaseUISubWnd):
         if not self.edit or not self.edit.Exists(0):
             return WxResponse.failure('未找到评论输入框')
 
+        # 这条是「评论窗口已弹出」之后的最后一步，和 _click_comment_send 一样是
+        # 对外可见的写动作，必须过节流（前置校验不过时不占用写动作额度）。
+        rhythm.gate('comment')
         try:
             self.edit.Click()
+            rhythm.nap(0.35)
             self.edit.SendKeys('{Ctrl}a')
             SetClipboardText(content)
             self.edit.SendKeys('{Ctrl}v')
+            rhythm.nap(0.5)
 
             if self.send_button and self.send_button.Exists(0):
                 self.send_button.Click()
             else:
                 self.edit.SendKeys('{Enter}')
+            rhythm.nap(0.4)
         except Exception as exc:  # pragma: no cover - UI 交互异常仅记录日志
             wxlog.debug(f'发送朋友圈评论失败：{exc}')
             return WxResponse.failure('发送评论失败')
