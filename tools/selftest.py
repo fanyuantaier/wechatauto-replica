@@ -740,6 +740,19 @@ def t_click() -> None:
           isinstance(WeChatUIA.__dict__["_search_button"], staticmethod)
           and callable(WeChatUIA.__dict__["_click_ctrl"]))
 
+    # 进朋友圈那条路：树没物化时必须先唤醒，否则报出来的是「找不到导航按钮」，
+    # 会被误判成版本不兼容（2026-09-23 在 4.1.15.13 上就是这么撞的）。
+    print("[click] 进朋友圈前先唤醒 mmui 树")
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    wsrc = open(os.path.join(here, "wechatauto", "wx.py"), encoding="utf-8").read()
+    i = wsrc.index("def _switch_to_moments_new_style")
+    seg = wsrc[i:wsrc.index("\n    def ", i)]     # 截到下一个方法级 def（SwitchToMoments 在它前面）
+    check("朋友圈路线里调了 ensure_materialized", "ensure_materialized(" in seg)
+    check("唤醒之后重新锚定根控件（不拿旧的空壳继续找）",
+          "root = _uia.ControlFromHandle(hwnd) or root" in seg)
+    check("唤醒只在树没就绪时做（不给正常路径加延迟）",
+          "if root is not None and not _tree_ready(root)" in seg)
+
 
 TESTS = {"layout": t_layout, "verify": t_verify, "rhythm": t_rhythm,
          "gate": t_gate, "click": t_click,

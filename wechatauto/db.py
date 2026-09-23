@@ -1751,8 +1751,16 @@ class WeChatDB:
         但超大群（数万条）不再把每个分片的全部行取回 Python。
         合并排序保持与旧实现相同的稳定语义：重复 sort_seq 时先分片顺序、
         再分片内 local_id 升序（已在分片内 ORDER BY 固定）。
+
+        非法入参一律**空返回**而不是回落到某个窗口：``limit<=0`` 直接空；
+        ``offset<0`` 也空——负数切片的 ``rows[-1:20]`` 在行数不足时会吐出最后
+        一条，等于把「参数错了」伪装成「查到了数据」。
         """
-        cap = max(0, int(limit)) + max(0, int(offset))
+        limit = int(limit)
+        offset = int(offset)
+        if limit <= 0 or offset < 0:
+            return []
+        cap = limit + offset
         rows = self._run_msg_query(
             user,
             lambda tables: self._shard_rows(

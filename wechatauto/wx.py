@@ -643,6 +643,28 @@ class WeChat(Chat, Listener):
             wxlog.debug(f'UIA 根控件获取失败：{exc!r}')
             return False
 
+        # 树没物化时 ControlFromHandle 只拿到 Qt 空壳（微信重启/升级后 gate byte
+        # 归零），下面每条查找都会落空，最后报出来的却是「找不到导航按钮」，
+        # 很容易被误判成版本不兼容。先按需唤醒 mmui 树，再重新锚定根控件。
+        def _tree_ready(node) -> bool:
+            try:
+                return _find_descendant(
+                    node,
+                    lambda c: (getattr(c, 'ClassName', '') or '').startswith('mmui::MainTabBar')
+                    or (getattr(c, 'ClassName', '') or '') == 'mmui::SNSContentView',
+                    max_depth=15) is not None
+            except Exception:
+                return False
+
+        if root is not None and not _tree_ready(root):
+            try:
+                from wechatauto.uia_driver import WeChatUIA
+                if WeChatUIA().ensure_materialized(timeout=6.0):
+                    root = _uia.ControlFromHandle(hwnd) or root
+                    wxlog.debug('进朋友圈前已唤醒 mmui 树')
+            except Exception as exc:
+                wxlog.debug(f'唤醒 mmui 树失败：{exc!r}')
+
         def _has_timeline() -> bool:
             try:
                 tl = _find_descendant(root, lambda c: getattr(c, 'ClassName', '') == 'mmui::TimeLineListView', max_depth=30)
