@@ -163,6 +163,7 @@ SPIF_SENDCHANGE = 0x02
 QACCESSIBLE_ACTIVE_RVA_BY_VERSION = {
     "4.1.11.22": 0x0A1E7DB8,
     "4.1.13.65": 0x0AE2B0C8,   # 2026-09-12 实测：热写后 mmui 树立即物化
+    "4.1.15.13": 0x0B135C38,   # 2026-09-23 实测：扫描得出，热写后校验通过
 }
 QACCESSIBLE_CORE_STRING = b"qt.accessibility.core"
 QACCESSIBLE_GATE_PATTERN = re.compile(
@@ -1185,7 +1186,14 @@ class WeChatUIA:
             self._restore_transparent(saved)
 
     # ------------------------------------------------------------------ 控件定位
-    def _search_box(self, win):
+    @staticmethod
+    def _search_button(win):
+        """微信 4.1.15 起搜索入口**收起**成一个按钮：Name=「搜索」的 ButtonControl。"""
+        return _find_by(win, lambda c: (c.Name or "").strip() == SEARCH_EDIT_NAME
+                        and "Button" in c.ControlTypeName, max_depth=40)
+
+    def _search_box_present(self, win):
+        """搜索框已经展开时的定位（4.1.13 及以前它常驻）。"""
         # 1) 已知锚点（类名+名称 / 名称 / 类名），遍历候选类名
         for cls in SEARCH_EDIT_CLASSES:
             for kw in (dict(ClassName=cls, Name=SEARCH_EDIT_NAME),
@@ -1197,6 +1205,26 @@ class WeChatUIA:
         # 2) 新旧版兜底：Name 含“搜索”的编辑框（忽略类名变化）
         return _find_by(win, lambda c: (c.ControlTypeName == "EditControl"
                                         and SEARCH_EDIT_NAME in (c.Name or "")))
+
+    def _search_box(self, win, expand: bool = False):
+        """定位搜索输入框。
+
+        ``expand=True`` 允许**点一下收起的搜索按钮**把它展开（4.1.15+ 静止状态下
+        树里没有输入框）。实测 ``Invoke()`` 是空操作、必须真点，所以这动作有副作用，
+        只有真要搜索时才传；``search_box_rect`` 那种只读锚点不传。
+        """
+        box = self._search_box_present(win)
+        if box is not None or not expand:
+            return box
+        btn = self._search_button(win)
+        if btn is None or not self._click_ctrl(btn):
+            return None
+        for _ in range(4):
+            time.sleep(0.3)
+            box = self._search_box_present(win)
+            if box is not None:
+                return box
+        return None
 
     def _chat_input(self, win=None):
         win = win or self._win
@@ -1228,11 +1256,11 @@ class WeChatUIA:
         """
         if self._win is None and not self.ensure_window():
             return None
-        box = self._search_box(self._win)
-        if box is None:
+        target = self._search_box(self._win) or self._search_button(self._win)
+        if target is None:
             return None
         try:
-            r = box.BoundingRectangle
+            r = target.BoundingRectangle
             return (r.left, r.top, r.right, r.bottom)
         except Exception:
             return None
@@ -1372,7 +1400,7 @@ class WeChatUIA:
         # 搜索框只在聊天页渲染：主窗停在朋友圈页时这里先无条件点回「微信」栏。
         self.back_to_chat_tab()
         win = self._win
-        box = self._search_box(win)
+        box = self._search_box(win, expand=True)
         if box is None:
             return False
 

@@ -679,13 +679,75 @@ def t_gate() -> None:
     check("正常路径仍然返回 True", WeChatUIA._wake_accessibility(s2) is True)
 
 
+# ----------------------------------------------------------------------
+# 8. 收起式搜索入口（纯离线：假 win，不碰微信）
+# ----------------------------------------------------------------------
+def t_click() -> None:
+    """微信 4.1.15 起搜索框默认收起，只有点「搜索」按钮才会出现输入框。"""
+    import wechatauto.uia_driver as ud
+    from wechatauto.uia_driver import WeChatUIA
+
+    def patch(cls, name, value):
+        old = cls.__dict__[name]
+        setattr(cls, name, value)
+        return old
+
+    calls = {"present": 0, "click": 0}
+    box, btn = object(), object()
+
+    def present(self, w):
+        calls["present"] += 1
+        return None if calls["present"] < 2 else box
+
+    class FakeWin:
+        def EditControl(self, **kw):
+            class _E:
+                @staticmethod
+                def Exists(t, i):
+                    return False
+            return _E()
+
+    print("[click] 4.1.15 收起式搜索入口")
+    o_present = patch(WeChatUIA, "_search_box_present", present)
+    o_btn = patch(WeChatUIA, "_search_button", staticmethod(lambda w: btn))
+    o_ctrl = patch(WeChatUIA, "_click_ctrl",
+                   lambda self, c, right=False: calls.__setitem__("click", calls["click"] + 1) or True)
+    try:
+        uia = WeChatUIA()
+        calls["present"] = 0; calls["click"] = 0
+        check("expand=False 时绝不多点一下（search_box_rect 是只读锚点）",
+              uia._search_box(FakeWin(), expand=False) is None and calls["click"] == 0,
+              "点了 %d 次" % calls["click"])
+        calls["present"] = 0; calls["click"] = 0
+        check("expand=True 时点一次搜索按钮、展开后返回输入框",
+              uia._search_box(FakeWin(), expand=True) is box and calls["click"] == 1,
+              "点了 %d 次" % calls["click"])
+        calls["present"] = 0; calls["click"] = 0
+        o_btn2 = patch(WeChatUIA, "_search_button", staticmethod(lambda w: None))
+        try:
+            check("连搜索按钮都没有 → 返回 None 而不是抛",
+                  uia._search_box(FakeWin(), expand=True) is None and calls["click"] == 0)
+        finally:
+            setattr(WeChatUIA, "_search_button", o_btn2)
+        calls["present"] = 100; calls["click"] = 0
+        check("输入框本来就常驻（4.1.13 及以前）时不多此一举",
+              uia._search_box(FakeWin(), expand=True) is box and calls["click"] == 0)
+    finally:
+        setattr(WeChatUIA, "_search_box_present", o_present)
+        setattr(WeChatUIA, "_search_button", o_btn)
+        setattr(WeChatUIA, "_click_ctrl", o_ctrl)
+    check("三个被替换的方法已原样还原",
+          isinstance(WeChatUIA.__dict__["_search_button"], staticmethod)
+          and callable(WeChatUIA.__dict__["_click_ctrl"]))
+
+
 TESTS = {"layout": t_layout, "verify": t_verify, "rhythm": t_rhythm,
-         "gate": t_gate,
+         "gate": t_gate, "click": t_click,
          "keys": t_keys, "sessions": t_sessions, "messages": t_messages}
 
 
 def main() -> int:
-    want = sys.argv[1:] or ["layout", "verify", "rhythm", "gate",
+    want = sys.argv[1:] or ["layout", "verify", "rhythm", "gate", "click",
                             "keys", "sessions", "messages"]
     for name in want:
         fn = TESTS.get(name)
