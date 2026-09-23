@@ -110,7 +110,7 @@ def _send_scroll(x: int, y: int, delta: int = -120, times: int = 1) -> None:
         if abs(p.x - x) <= 2 and abs(p.y - y) <= 2:
             break
         time.sleep(0.05)
-    time.sleep(0.08)
+    time.sleep(0.3)                         # 让目标窗口先收到 hover/进入事件
     for _ in range(max(1, int(times))):
         wheel = I(0, MI(0, 0, wintypes.DWORD(int(delta) & 0xFFFFFFFF), WHEEL, 0, 0))
         u.SendInput(1, ctypes.byref(wheel), ctypes.sizeof(I))
@@ -684,10 +684,17 @@ class Moment:
 
 
     def _scroll(self, delta: int = -120, times: int = 1) -> None:
-        """在时间线中心滚动。负 delta=向下(看更早)，正=向上(看最新)。"""
+        """在时间线中心滚动。负 delta=向下(看更早)，正=向上(看最新)。
+
+        滚轮和点击一样吃前台状态：微信窗口不是前台窗口时滚轮事件不会落到时间线
+        上（实测：非前台时连发三轮，顶部 cell 的 DB 对齐位置一动不动；先确保前台
+        后同一份代码立刻 3→6）。`_locate_more_click` 早就为点击写了这一步，滚轮
+        这边此前没有，于是 find_moment 把「滚不动」当成「已经到底」提前放弃。
+        """
         rect = self._time_line_rect()
         if not rect:
             return
+        self._ensure_window_foreground()
         x = int((rect[0] + rect[2]) // 2)
         y = int((rect[1] + rect[3]) // 2)
         _send_scroll(x, y, delta=delta, times=times)
@@ -2111,6 +2118,9 @@ class Moment:
 
     def _invoke_action_menu(self, item: MomentItem) -> Optional['MomentActionMenu']:
         action_button = None
+        # 与 _scroll / _locate_more_click 同理：非前台时第一下点击只用来激活窗口，
+        # 菜单不会弹，随后 exists(0.5) 判定失败、报「未能打开朋友圈操作菜单」。
+        self._ensure_window_foreground()
         try:
             for child in item.control.GetChildren():
                 if child.ControlTypeName == 'ButtonControl':
