@@ -75,7 +75,13 @@ def _lang(table, key: str) -> str:
 
 
 def _send_scroll(x: int, y: int, delta: int = -120, times: int = 1) -> None:
-    """在屏幕坐标 (x, y) 处向该窗口发送滚轮事件（模拟用户滚动）。
+    """在屏幕坐标 (x, y) 处滚动该窗口。
+
+    滚轮事件是按**光标当前位置**投递的。原来的写法把 MOVE 和 WHEEL 连着发、
+    两者之间零停顿，系统还没处理完这次移动，滚轮就已经落到旧位置那个窗口上了
+    ——实测朋友圈时间线纹丝不动（顶部 cell 连续多屏不变），``find_moment`` 于是
+    把它当成「已经到底」提前放弃。改成：同步 ``SetCursorPos`` 落位 → 读回确认
+    → 稍等目标窗口进入 hover → 再发滚轮。
 
     Args:
         x, y: 目标屏幕坐标（需落在朋友圈时间线区域）。
@@ -83,29 +89,31 @@ def _send_scroll(x: int, y: int, delta: int = -120, times: int = 1) -> None:
         times: 重复次数。
     """
     import ctypes
+    from ctypes import wintypes
 
-    INPUT_MOUSE = 0
-    MOVE = 0x0001
     WHEEL = 0x0800
-    ABS = 0x8000
 
     class MI(ctypes.Structure):
-        _fields_ = [("dx", ctypes.wintypes.DWORD), ("dy", ctypes.wintypes.DWORD),
-                    ("mouseData", ctypes.wintypes.DWORD), ("dwFlags", ctypes.wintypes.DWORD),
-                    ("time", ctypes.wintypes.DWORD), ("dwExtraInfo", ctypes.c_void_p)]
+        _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG),
+                    ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                    ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_void_p)]
 
     class I(ctypes.Structure):
-        _fields_ = [("type", ctypes.wintypes.DWORD), ("mi", MI)]
+        _fields_ = [("type", wintypes.DWORD), ("mi", MI)]
 
-    sw = ctypes.windll.user32.GetSystemMetrics(0)
-    sh = ctypes.windll.user32.GetSystemMetrics(1)
-    for _ in range(times):
-        dx0 = int(x * 65535 / max(sw - 1, 1))
-        dy0 = int(y * 65535 / max(sh - 1, 1))
-        move = I(INPUT_MOUSE, MI(dx0, dy0, 0, MOVE | ABS, 0, 0))
-        ctypes.windll.user32.SendInput(1, ctypes.byref(move), ctypes.sizeof(I))
-        wheel = I(INPUT_MOUSE, MI(0, 0, ctypes.wintypes.DWORD(delta & 0xFFFFFFFF), WHEEL, 0, 0))
-        ctypes.windll.user32.SendInput(1, ctypes.byref(wheel), ctypes.sizeof(I))
+    u = ctypes.windll.user32
+    x, y = int(x), int(y)
+    for _ in range(8):                      # 等光标真的落位（最多 ~0.4s）
+        u.SetCursorPos(x, y)
+        p = wintypes.POINT()
+        u.GetCursorPos(ctypes.byref(p))
+        if abs(p.x - x) <= 2 and abs(p.y - y) <= 2:
+            break
+        time.sleep(0.05)
+    time.sleep(0.08)
+    for _ in range(max(1, int(times))):
+        wheel = I(0, MI(0, 0, wintypes.DWORD(int(delta) & 0xFFFFFFFF), WHEEL, 0, 0))
+        u.SendInput(1, ctypes.byref(wheel), ctypes.sizeof(I))
         time.sleep(0.05)
 
 
