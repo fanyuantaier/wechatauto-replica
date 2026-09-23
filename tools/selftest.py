@@ -370,10 +370,23 @@ def t_rhythm() -> None:
               and len(u2.moves) == steps2, "%d 步" % steps2)
         check("轨迹不离起终点连线太远（弓形 <=20%）",
               all(200 <= x <= 1000 and 300 <= y <= 800 for x, y in u2.moves[:-1]))
-        arc = {tuple(m) for m in u2.moves}
-        u3 = FakeU32()
-        rhythm.move_to(u3, 900, 700, start=(300, 400))
-        check("两次移动的轨迹不重合", arc != {tuple(m) for m in u3.moves})
+        # 「两次轨迹不重合」这种单次对比会随机翻红：n、弓形、正负号都是抽出来的，
+        # 整数取点后撞车并不罕见。改成多次取样，断言「至少出现过两种轨迹」，
+        # 同时断言「不是直线」——那才是这层真正要保证的东西。
+        paths = []
+        for _ in range(8):
+            ux = FakeU32()
+            rhythm.move_to(ux, 900, 700, start=(300, 400))
+            paths.append(tuple(ux.moves))
+        check("8 次移动里至少出现 2 种轨迹（不是每次都同一条）",
+              len(set(paths)) >= 2, "%d 种" % len(set(paths)))
+        ux = FakeU32()
+        rhythm.move_to(ux, 900, 700, start=(300, 400))
+        mid = ux.moves[len(ux.moves) // 2]
+        # 中点到起终点连线的垂距：|cross| / |(600,300)| ，弓形最小 6% ≈ 40px
+        off = abs((mid[0] - 300) * 300 - (mid[1] - 400) * 600) / 670.8
+        check("路径中段偏离起终点连线（走的是曲线不是直达）",
+              off > 5.0, "中点 %s 偏离 %.1fpx" % (mid, off))
         u4 = FakeU32()
         check("目标已在脚下时不绕路",
               rhythm.move_to(u4, 300, 400, start=(301, 401)) == 1
