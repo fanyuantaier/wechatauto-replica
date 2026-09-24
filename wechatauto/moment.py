@@ -765,6 +765,83 @@ class Moment:
             return []
         return lst.get_items(refresh=refresh)
 
+    @staticmethod
+    def _rect_usable(item) -> bool:
+        """cell 的矩形是否还能用来定位点击。
+
+        UIA 句柄失效（cell 被回收）或已经滚出视口时，``BoundingRectangle`` 会变成
+        ``(0,0,0,0)``——这时任何基于坐标的动作都会报 ``Can not move cursor``，
+        表现出来就是「明明定位到了，点赞/评论却说打不开菜单」。
+        """
+        try:
+            r = item.control.BoundingRectangle
+        except Exception:
+            return False
+        return (r.right - r.left) > 1 and (r.bottom - r.top) > 1
+
+    @staticmethod
+    def _same_post(nick: str, text: str, when: str, cand) -> bool:
+        """判断候选 cell 是不是同一条动态（用于句柄失效后重新认领）。
+
+        昵称必须完全相等；正文按「前 10 字互相包含」比对——UIA 摘要会把正文
+        截断，DB 校正过的正文又可能比摘要长，精确比签名会认不出自己那条。
+        时间两边都知道时必须相等。正文和时间都为空的只剩昵称，认不出。
+        """
+        norm = lambda s: ''.join((s or '').split())
+        if (cand.publisher or '').strip() != nick:
+            return False
+        c_text = norm(cand.text)
+        if text or c_text:
+            if not (text and c_text):
+                return False
+            if text[:10] not in c_text and c_text[:10] not in text:
+                return False
+        if when and cand.timestamp and cand.timestamp.strip() != when:
+            return False
+        return True
+
+    def _reattach_item(self, item: MomentItem) -> bool:
+        """句柄失效时在同屏重新认领同一条动态，原地换 control（不换对象）。
+
+        调用方手里的 item 继续可用。认不出时宁可返回 False——同一个人往往有多条
+        动态，错挂就等于给另一条点赞。
+        """
+        if self._rect_usable(item):
+            return True
+        try:
+            if not item._parsed:
+                return False          # 解析要读 control.Name，死句柄读不到，无从比对
+            nick = (item.nickname or '').strip()
+            text = ''.join((item.content or '').split())
+            when = (item.time or '').strip()
+        except Exception:
+            return False
+        if not nick or (not text and not when):
+            return False
+        for it in self._read_visible_items(refresh=True):
+            try:
+                if not self._same_post(nick, text, when, it):
+                    continue
+            except Exception:
+                continue              # 新 cell 解析失败（句柄同样坏了）
+            if self._rect_usable(it):
+                item.control = it.control
+                wxlog.debug('cell 句柄已失效，已在同屏重新认领同一条并换上新句柄')
+                return True
+        return False
+
+    def _settle_item(self, item: MomentItem, publisher: Optional[str] = None,
+                     keyword: Optional[str] = None):
+        """命中之后确保这条真的还能操作：先换句柄，换不到再滚入视野重试一次。"""
+        if item is None or self._reattach_item(item):
+            return item
+        wxlog.debug('当前视野没有同一条的新句柄，重新滚入视野后再试')
+        try:
+            self._scroll_item_fully_visible(publisher=publisher, keyword=keyword)
+        except Exception:
+            return None
+        return item if self._reattach_item(item) else None
+
     def _scroll_item_fully_visible(self, publisher: Optional[str] = None,
                                    keyword: Optional[str] = None,
                                    max_retry: int = 10) -> Optional[MomentItem]:
@@ -1070,9 +1147,13 @@ class Moment:
             for item in items:
                 if self._matches(item, publisher, keyword):
                     wxlog.debug(f'第 {screen} 屏命中目标朋友圈')
+                    settled = self._settle_item(item, publisher, keyword)
+                    if settled is None:
+                        wxlog.debug('命中但 cell 句柄已失效且找不回，放弃（避免后续点击落在空矩形上）')
+                        return None
                     if db_posts:
-                        self._correct_nickname_from_db(db_posts, item)
-                    return item
+                        self._correct_nickname_from_db(db_posts, settled)
+                    return settled
 
             # 2) 无 DB：只能向下逐屏
             if target_idx is None:
@@ -1119,9 +1200,13 @@ class Moment:
                 for it in items:
                     if publisher and self._matches(it, publisher, None):
                         wxlog.debug(f'第 {screen} 屏按发布者兜底命中（diff={diff}）')
+                        settled = self._settle_item(it, publisher, None)
+                        if settled is None:
+                            wxlog.debug('兜底命中但 cell 句柄已失效且找不回，放弃')
+                            return None
                         if db_posts:
-                            self._correct_nickname_from_db(db_posts, it)
-                        return it
+                            self._correct_nickname_from_db(db_posts, settled)
+                        return settled
                 near_miss += 1
                 if near_miss >= 4:
                     if downward_only:
@@ -1433,6 +1518,10 @@ class Moment:
         if max_retry < 1:
             return False
         for attempt in range(max_retry):
+            if not self._reattach_item(item):
+                # 句柄失效且当前视野找不到同一条：先按下面的微调滚找回，
+                # 下一轮再试（_find_more_button 在空矩形上只会白跑）。
+                wxlog.debug(f'cell 句柄不可用（第 {attempt + 1} 次），微调滚动后重找')
             pt = self._find_more_button(item)
             if pt is not None:
                 before_shot = self._float_region_shot(item)
@@ -2119,6 +2208,11 @@ class Moment:
         # 与 _scroll / _locate_more_click 同理：非前台时第一下点击只用来激活窗口，
         # 菜单不会弹，随后 exists(0.5) 判定失败、报「未能打开朋友圈操作菜单」。
         self._ensure_window_foreground()
+        if not self._reattach_item(item):
+            # 死句柄上 RightClick()/Click() 只会抛 "Can not move cursor ...
+            # BoundingRectangle is (0,0,0,0)"，先换到新句柄再动手。
+            wxlog.debug('cell 句柄已失效且当前视野找不回同一条，放弃右键')
+            return None
         try:
             for child in item.control.GetChildren():
                 if child.ControlTypeName == 'ButtonControl':

@@ -179,7 +179,7 @@ def t_sessions() -> None:
                   "%s vs OCR 中心 %s" % (pos, (cx, cy)))
         else:
             print("  · 跳过 %r：OCR 抖动名，定位失败可接受" % name[:14])
-    check("会话定位通过率 ≥ 50%%", tot == 0 or hit / tot >= 0.5,
+    check("会话定位通过率 ≥ 50%", tot == 0 or hit / tot >= 0.5,
           "%d/%d（OCR 抖动名单列跳过属正常）" % (hit, tot))
     check("负例返回 None", g.find_session("不存在的会话名XYZ", max_scroll=1) is None)
 
@@ -803,14 +803,250 @@ def t_listen() -> None:
           str(lis.watermark))
 
 
+# ----------------------------------------------------------------------
+# 10. 朋友圈 cell 句柄自愈（纯离线：假控件假 cell，不碰微信也不滚动）
+# ----------------------------------------------------------------------
+def t_moment() -> None:
+    """UIA cell 被回收/滚出视口后 BoundingRectangle 变成 (0,0,0,0)，
+    基于坐标的点击全部报 ``Can not move cursor``——表现为「明明定位到了，
+    点赞/评论却说打不开菜单」。命中后必须换到新句柄才允许动手。"""
+    from wechatauto.moment import Moment, MomentItem
+
+    DEAD, LIVE = (0, 0, 0, 0), (100, 200, 900, 480)
+
+    class Rect:
+        def __init__(self, r):
+            self.left, self.top, self.right, self.bottom = r
+
+    class Ctrl:
+        def __init__(self, r, name='x'):
+            self.BoundingRectangle = Rect(r)
+            self.Name = name
+
+    class DeadCtrl(Ctrl):
+        def __init__(self, r=None, name='x'):
+            pass                      # 不设置字段：模拟句柄回收后只剩一个空壳
+
+        @property
+        def BoundingRectangle(self):
+            raise ValueError('UIA 句柄已失效')
+
+    class Item:
+        """假 cell：字段与 MomentItem 的解析结果同名，属性口与真类一致。"""
+        def __init__(self, nick, text, time, r=DEAD, parsed=True):
+            self.control = Ctrl(r)
+            self.nickname, self.content, self.time = nick, text, time
+            self._parsed = parsed
+
+        def _chk(self):
+            if not self._parsed:
+                raise RuntimeError('未解析的 cell 需要读控件，死句柄会抛')
+            return self.nickname
+
+        @property
+        def publisher(self):
+            self._chk(); return self.nickname
+
+        @property
+        def text(self):
+            self._chk(); return self.content
+
+        @property
+        def timestamp(self):
+            self._chk(); return self.time
+
+    m = Moment.__new__(Moment)          # 这些方法不依赖实例状态，绕开 __init__
+
+    print("[moment] 矩形可用性判定")
+    check("(0,0,0,0) 判为不可用", Moment._rect_usable(Item('a', 'b', 'c')) is False)
+    check("正常矩形判为可用",
+          Moment._rect_usable(Item('a', 'b', 'c', LIVE)) is True)
+    dead = Item('小美', '今天去了动物园看长颈鹿', '1小时前')
+    dead.control = DeadCtrl(DEAD)
+    check("BoundingRectangle 抛异常 → 不可用", Moment._rect_usable(dead) is False)
+    check("只有 1 像素宽的矩形也算不可用",
+          Moment._rect_usable(Item('a', 'b', 'c', (100, 100, 101, 400))) is False)
+    check("真 MomentItem 有 publisher/text/timestamp 属性（假 cell 的接口对齐真类）",
+          all(isinstance(getattr(MomentItem, k), property)
+              for k in ('publisher', 'text', 'timestamp')))
+
+    print("[moment] 句柄失效后按签名重挂")
+    twin = Item('小美', '今天去了动物园看长颈鹿，很开心', '1小时前', LIVE)
+    other = Item('小美', '加班到十一点', '3天前', LIVE)
+    seen = []
+
+    def patch_items(items):
+        def _f(self, refresh=True):
+            seen.append(list(items))
+            return list(items)
+        return _f
+
+    o_read = Moment.__dict__["_read_visible_items"]
+    try:
+        Moment._read_visible_items = patch_items([other, twin])
+        ok = m._reattach_item(dead)
+        check("换到了同一条的新句柄（不是同发布者的另一条）",
+              ok is True and dead.control is twin.control,
+              "命中=%s" % ("同一条" if ok and dead.control is twin.control else "错条/没找到"))
+        dead.control = DeadCtrl(DEAD)
+
+        Moment._read_visible_items = patch_items([other])
+        check("同屏只有同发布者的另一条时宁可不挂（否则会点错人）",
+              m._reattach_item(dead) is False and dead.control.__class__ is DeadCtrl)
+
+        Moment._read_visible_items = patch_items(
+            [Item('小美', '今天去了动物园看长颈鹿，很开心', '昨天', LIVE)])
+        check("昵称+正文前缀相同但时间不同 → 认不出，拒绝",
+              m._reattach_item(dead) is False)
+
+        Moment._read_visible_items = patch_items([Item('小美', '今天去了动物园', '1小时前', DEAD)])
+        check("同一条但新句柄矩形还是空的 → 继续判失败",
+              m._reattach_item(dead) is False)
+
+        Moment._read_visible_items = patch_items([])
+        check("屏上没有任何 cell → 失败而不是抛", m._reattach_item(dead) is False)
+
+        nodata = Item('小美', '随便', '1小时前', parsed=False)
+        check("死句柄且从未解析过（构造不出比对材料）→ 直接失败，不去读控件",
+              m._reattach_item(nodata) is False)
+
+        only_nick = Item('小美', '', '', DEAD)
+        Moment._read_visible_items = patch_items([Item('小美', '任意正文', '任意时间', LIVE)])
+        check("只剩昵称（纯图动态且没时间）时拒绝认领，不给同一个人的另一条点赞",
+              m._reattach_item(only_nick) is False)
+
+        long_text = Item('小美', '今天去了动物园看长颈鹿', '1小时前', DEAD)
+        Moment._read_visible_items = patch_items(
+            [Item('小美', '今天去了动物园看长颈鹿，还看了大象，玩得很开心', '1小时前', LIVE)])
+        check("摘要被截断/DB 正文更长时按前缀互含认领（精确比签名会认不出自己那条）",
+              m._reattach_item(long_text) is True and Moment._rect_usable(long_text) is True)
+
+        ok_item = Item('小美', '正文', '1小时前', LIVE)
+        n0 = len(seen)
+        check("矩形本来就可用时一次都不扫屏（不给正常路径加延迟）",
+              m._reattach_item(ok_item) is True and len(seen) == n0)
+
+        # 用真 MomentItem 实例再跑一遍：假 cell 的字段名万一和真类对不上，
+        # 上面那一堆断言会一起错掉。
+        def real_item(nick, text, when, ctrl):
+            it = MomentItem.__new__(MomentItem)
+            it._parsed, it.nickname, it.content, it.time = True, nick, text, when
+            it.control = ctrl
+            return it
+        dead_real = real_item('小美', '今天去了动物园看长颈鹿', '1小时前', DeadCtrl(DEAD))
+        twin_real = real_item('小美', '今天去了动物园看长颈鹿，还看了大象', '1小时前',
+                              Ctrl(LIVE))
+        Moment._read_visible_items = patch_items([twin_real])
+        check("真 MomentItem 实例：按昵称+正文前缀+时间重新认领",
+              m._reattach_item(dead_real) is True and dead_real.control is twin_real.control)
+        dead_real.control = DeadCtrl(DEAD)
+        Moment._read_visible_items = patch_items(
+            [real_item('小美', '今天去了动物园看长颈鹿', '昨天', Ctrl(LIVE))])
+        check("真 MomentItem 实例：时间不同照样拒绝", m._reattach_item(dead_real) is False)
+    finally:
+        setattr(Moment, "_read_visible_items", o_read)
+
+    print("[moment] 命中后的收尾：_settle_item")
+    dead2 = Item('小美', '今天去了动物园看长颈鹿，很开心', '1小时前')
+    dead2.control = DeadCtrl(DEAD)
+    twin2 = Item('小美', '今天去了动物园看长颈鹿，很开心', '1小时前', LIVE)
+    calls = {"scroll": 0}
+
+    def fake_scroll(self, publisher=None, keyword=None, max_retry=10):
+        calls["scroll"] += 1
+        seen_args.append((publisher, keyword))
+        return None                       # 只关心它有没有被调、传了什么
+
+    seen_args = []
+
+    def queue_items(batches):
+        left = [list(b) for b in batches]
+
+        def _f(self, refresh=True):
+            return left.pop(0) if len(left) > 1 else left[0]
+        return _f
+
+    o_read = Moment.__dict__["_read_visible_items"]
+    o_scroll = Moment.__dict__["_scroll_item_fully_visible"]
+    o_rect = Moment.__dict__["_time_line_rect"]
+    try:
+        Moment._time_line_rect = lambda self: (100, 100, 1000, 800)
+        Moment._scroll_item_fully_visible = fake_scroll
+
+        Moment._read_visible_items = queue_items([[dead2]])
+        got = m._settle_item(dead2, '小美', '长颈鹿')
+        check("同屏没有新句柄时才会去滚，滚完仍找不到就返回 None",
+              got is None and calls["scroll"] == 1, "scroll=%d" % calls["scroll"])
+        check("滚的时候带上 publisher/keyword（复用既有定位路线，不另写一套）",
+              seen_args == [('小美', '长颈鹿')], str(seen_args))
+
+        Moment._read_visible_items = queue_items([[twin2]])
+        calls["scroll"] = 0
+        got = m._settle_item(dead2, '小美', '长颈鹿')
+        check("同屏就能换到句柄时不多滚一次（正常路径零额外开销）",
+              got is dead2 and dead2.control is twin2.control and calls["scroll"] == 0,
+              "scroll=%d" % calls["scroll"])
+
+        calls["scroll"] = 0
+        check("健康的 item 原样返回，不滚也不扫屏",
+              m._settle_item(twin2, '小美', '长颈鹿') is twin2 and calls["scroll"] == 0)
+        check("_settle_item(None) 不抛", m._settle_item(None) is None)
+
+        dead4 = Item('小美', '今天去了动物园看长颈鹿，很开心', '1小时前')
+        dead4.control = DeadCtrl(DEAD)
+        Moment._read_visible_items = queue_items([[dead4], [twin2]])
+        calls["scroll"] = 0
+        got = m._settle_item(dead4, '小美', '长颈鹿')
+        check("滚入视野后再试一次：修复的是调用方手里那个对象（不换新对象）",
+              got is dead4 and dead4.control is twin2.control and calls["scroll"] == 1,
+              "scroll=%d" % calls["scroll"])
+
+        dead5 = Item('小美', '今天去了动物园看长颈鹿，很开心', '1小时前')
+        dead5.control = DeadCtrl(DEAD)
+        Moment._scroll_item_fully_visible = lambda self, **kw: (_ for _ in ()).throw(
+            RuntimeError('滚动失败'))
+        Moment._read_visible_items = queue_items([[dead5]])
+        check("滚屏过程抛异常时降级为 None，不把异常冒给调用方",
+              m._settle_item(dead5, '小美', '长颈鹿') is None)
+    finally:
+        setattr(Moment, "_read_visible_items", o_read)
+        setattr(Moment, "_scroll_item_fully_visible", o_scroll)
+        setattr(Moment, "_time_line_rect", o_rect)
+    check("三个被替换的方法已原样还原",
+          all(callable(Moment.__dict__[k])
+              for k in ("_read_visible_items", "_scroll_item_fully_visible",
+                        "_time_line_rect")))
+
+    print("[moment] 三条动作路线都接上了自愈")
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = open(os.path.join(here, "wechatauto", "moment.py"), encoding="utf-8").read()
+
+    def seg(name):
+        i = src.index("def " + name + "(")
+        return src[i:src.index("\n    def ", i + 1)]
+
+    fm = seg("find_moment")
+    check("find_moment 两处命中都过 _settle_item", fm.count("self._settle_item(") == 2,
+          "%d 处" % fm.count("self._settle_item("))
+    check("find_moment 里不再直接 return 原始命中项（空矩形就是这么漏出去的）",
+          not any(l.strip() in ("return item", "return it")
+                  for l in fm.splitlines()))
+    check("自愈失败时明确返回 None（让上层报「没找到」而不是点空矩形）",
+          fm.count("return None") >= 2)
+    for fn in ("_locate_more_click", "_invoke_action_menu"):
+        check("%s 动手前先重挂句柄" % fn, "self._reattach_item(item)" in seg(fn))
+    check("_invoke_action_menu 换不到句柄就直接失败（不再右键空矩形）",
+          "return None" in seg("_invoke_action_menu").split("for child in")[0])
+
+
 TESTS = {"layout": t_layout, "verify": t_verify, "rhythm": t_rhythm,
-         "gate": t_gate, "click": t_click, "listen": t_listen,
+         "gate": t_gate, "click": t_click, "listen": t_listen, "moment": t_moment,
          "keys": t_keys, "sessions": t_sessions, "messages": t_messages}
 
 
 def main() -> int:
     want = sys.argv[1:] or ["layout", "verify", "rhythm", "gate", "click", "listen",
-                            "keys", "sessions", "messages"]
+                            "moment", "keys", "sessions", "messages"]
     for name in want:
         fn = TESTS.get(name)
         if not fn:
