@@ -1325,7 +1325,22 @@ class WeChatDB:
         print("[wechatauto] 密钥诊断完成，以上为自动检测结果。完整排查请运行 "
               "python -m wechatauto.diagnose_keys", file=sys.stderr)
 
+    def _build_lock_for(self, rel: str) -> threading.Lock:
+        """按库文件取一把构建锁（注册表本身用一把小锁保护）。"""
+        reg = getattr(self, "_build_locks", None)
+        if reg is None:
+            reg = self._build_locks = {}
+            self._build_locks_guard = threading.Lock()
+        with self._build_locks_guard:
+            return reg.setdefault(rel, threading.Lock())
+
     def _open(self, rel: str) -> sqlite3.Connection:
+        """同一份库的并发解密要串行：两个线程各自解一遍是几秒级的重复重活，
+        还会互相踩中间产物（监听所有会话时几百个会话同时开库必现）。"""
+        with self._build_lock_for(rel):
+            return self._open_unlocked(rel)
+
+    def _open_unlocked(self, rel: str) -> sqlite3.Connection:
         """打开解密(并合并 -wal 增量)后的只读库。
 
         解密结果缓存到 workdir；主库或 WAL 有变化时：
@@ -1388,9 +1403,19 @@ class WeChatDB:
         # 一定可读，代价是可能缺最近少量消息；WAL 合并成功则用更新的那份。
         # 关键：任何中间产物都写在 tmp，**成功才原子替换** dst，失败不会毁掉
         # 上一份已验证副本。
-        tmp = dst + ".tmp"
+        # 中间产物按「进程 + 线程」唯一命名：固定名 dst+".tmp" 会被并发打开同一份
+        # 库的另一个线程用 os.replace 掉，这边就 FileNotFoundError（监听所有会话、
+        # 几百个会话同时开库时必现）。唯一命名后异常退出会留下残留文件，故构建前
+        # 顺手清掉 10 分钟前的陈旧中间产物。
+        tmp = "%s.%d.%x.tmp" % (dst, os.getpid(), threading.get_ident())
         applied = 0
         if build:
+            for stale in glob.glob(dst + ".*.tmp*"):
+                try:
+                    if time.time() - os.path.getmtime(stale) > 600:
+                        os.remove(stale)
+                except OSError:
+                    pass
             # 微信 checkpoint 会**就地改写主库页**：单次读取可能读到“撕裂”状态
             # （页头与内容来自不同时刻）→ quick_check 会失败。故解密后必须校验，
             # 失败就重读（每次重读都是一次新的快照）。
@@ -1412,7 +1437,7 @@ class WeChatDB:
             if build:
                 best_applied = 0
                 if wal_path and wal_size > self.WAL_HEADER_SZ:
-                    merged = dst + ".wal"
+                    merged = tmp + ".wal"
                     ok_wal = False
                     for attempt in (1, 3):
                         try:
