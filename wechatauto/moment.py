@@ -1572,10 +1572,19 @@ class Moment:
             wxlog.debug(f'点击浮层按钮 {name} 失败：{e}')
             return False
 
-    def _like_open(self) -> bool:
-        """在 “…” 浮层已弹出的前提下，点击「赞」。"""
+    def _like_open(self, cancel: bool = False) -> bool:
+        """在 “…” 浮层已弹出的前提下，点击「赞」（``cancel=True`` 用于取消赞）。
+
+        取消赞在有的版本里是独立文案「取消」，有的版本还是那个「赞」按钮再点
+        一次，所以先按取消文案找，找不到再点「赞」。
+        """
         rhythm.gate('like')
-        return self._click_float_button('赞', timeout=2.5)
+        names = ([_lang(MOMENTS, '取消'), _lang(MOMENTS, '赞')] if cancel
+                 else [_lang(MOMENTS, '赞')])
+        for nm in names:
+            if self._click_float_button(nm, timeout=2.5):
+                return True
+        return False
 
     def LikeMoment(self, publisher: Optional[str] = None,
                    keyword: Optional[str] = None, db=None,
@@ -1597,11 +1606,7 @@ class Moment:
                                 db=db, max_screens=max_screens)
         if item is None:
             return WxResponse.failure('未能定位到目标朋友圈')
-        if not self._locate_more_click(item, max_retry=max_retry):
-            return WxResponse.failure('未能打开 “…” 浮层')
-        if self._like_open():
-            return WxResponse.success('点赞成功')
-        return WxResponse.failure('未能在浮层中找到点赞按钮')
+        return self.Like(item, max_retry=max_retry)
 
 
     def _comment_open(self) -> bool:
@@ -1797,14 +1802,7 @@ class Moment:
                                 db=db, max_screens=max_screens)
         if item is None:
             return WxResponse.failure('未能定位到目标朋友圈')
-        if not self._locate_more_click(item, max_retry=max_retry):
-            return WxResponse.failure('未能打开 “…” 浮层')
-        if not self._comment_open():
-            return WxResponse.failure('未能在浮层中找到“评论”按钮')
-        self._comment_input_focus()
-        if not self._type_comment(content):
-            return WxResponse.failure('输入评论内容失败')
-        return self._click_comment_send()
+        return self.Comment(item, content, max_retry=max_retry)
 
     def ReplyCommentMoment(self, publisher: Optional[str] = None,
                            keyword: Optional[str] = None,
@@ -2142,7 +2140,16 @@ class Moment:
             return None
         return menu
 
-    def Like(self, item: MomentItem, cancel: bool = False) -> WxResponse:
+    def Like(self, item: MomentItem, cancel: bool = False,
+             max_retry: int = 8) -> WxResponse:
+        """点赞 / 取消点赞一条动态。
+
+        先走 “…” 浮层那条（``LikeMoment`` 用的同一条，也是录屏里跑通过的那条），
+        弹不出浮层再退回 ``MomentActionMenu`` 老路线。以前这两个方法各走一条，
+        浮层路线一改就只剩 ``LikeMoment`` 能用——同一个动作不该留两份实现。
+        """
+        if self._locate_more_click(item, max_retry=max_retry) and self._like_open(cancel=cancel):
+            return WxResponse.success('已取消点赞' if cancel else '点赞成功')
         menu = self._invoke_action_menu(item)
         if not menu:
             return WxResponse.failure('未能打开朋友圈操作菜单')
@@ -2151,7 +2158,15 @@ class Moment:
         finally:
             menu.close()
 
-    def Comment(self, item: MomentItem, content: str, reply_to: Optional[str] = None) -> WxResponse:
+    def Comment(self, item: MomentItem, content: str, reply_to: Optional[str] = None,
+                max_retry: int = 8) -> WxResponse:
+        """评论一条动态。
+
+        不带 ``reply_to`` 时先走 “…” 浮层 → 评论 → 输入 → 模板匹配点「发送」
+        （与 ``CommentMoment`` 同一条路线）；连浮层都弹不出来才退回老的独立评论
+        窗口 ``MomentCommentDialog``。已经进到输入框那条**不会**再回落，避免
+        同一条评论发两次。两条路线各自都带 ``rhythm.gate('comment')``。
+        """
         if reply_to:
             comment = item.find_comment(reply_to)
             if not comment:
@@ -2160,6 +2175,11 @@ class Moment:
             if not ctrl:
                 return WxResponse.failure('未定位到评论控件')
             ctrl.Click()
+        elif self._locate_more_click(item, max_retry=max_retry) and self._comment_open():
+            self._comment_input_focus()
+            if not self._type_comment(content):
+                return WxResponse.failure('输入评论内容失败')
+            return self._click_comment_send()
         else:
             menu = self._invoke_action_menu(item)
             if not menu:

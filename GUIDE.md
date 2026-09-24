@@ -247,6 +247,39 @@ wc.ChatWith("filehelper")  # 切换当前会话 / switch current chat
 wc.GetAllSubWindow()       # 所有会话窗口 / all chat windows
 ```
 
+### 4.3 监听所有会话 / Listen to every chat (`AddListenAll`)
+
+不想一个个点名时用全局监听。/ Register one callback for **all** sessions instead of naming them.
+
+```python
+from wechatauto import WeChat
+
+wc = WeChat()
+
+def on_any(msg, chat):
+    print(f"[{chat.nickname}] {msg.content}")
+    # 需要直接回话也可以：（第一次用时才构造真正的 Chat，并缓存下来）
+    # chat.SendMsg("收到")
+
+wc.AddListenAll(on_any)      # discover=True（默认）：之后新出现的会话也自动纳管
+wc.GetListenMessage()        # 或 wc.KeepRunning()
+# wc.RemoveListenAll()      # 停止全局监听
+```
+
+- **和 `AddListenChat` 可以并存**：一个会话能挂多个回调。已经单独监听过的会话
+  同样会收到全局回调（早期实现会跳过它们，等于全局监听漏掉最活跃那批会话）。
+- `chat.who` 是会话 `username`，`chat.nickname` 是显示名；`chat.SendMsg(...)`
+  走的是普通发送路线。
+- 只读数据库轮询，不点界面、不抢前台，因此和 UI 自动化互不影响。
+- 更底层（自定义轮询间隔、水位持久化）用 `db.Listener`：
+
+```python
+from wechatauto.db import WeChatDB, Listener
+lis = Listener(WeChatDB(), interval=1.0)   # 水位默认存到 workdir/listener_watermark.json
+lis.add_all(on_any, discover=True)         # 与 AddListenAll 同一套语义
+lis.start(); ...; lis.stop()
+```
+
 ---
 
 ## 5. 发送消息 / Sending Messages

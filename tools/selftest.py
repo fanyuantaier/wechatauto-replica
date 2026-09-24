@@ -754,13 +754,62 @@ def t_click() -> None:
           "if root is not None and not _tree_ready(root)" in seg)
 
 
+# ----------------------------------------------------------------------
+# 9. 监听：全局回调（add_all）的挂载语义（假 DB，不碰微信）
+# ----------------------------------------------------------------------
+def t_listen() -> None:
+    """``Listener.add_all`` 必须挂到**每一个**会话上，且不重复挂。"""
+    from wechatauto.db import Listener
+
+    class FakeDB:
+        workdir = ""
+
+        def __init__(self):
+            self.sessions = [{"username": "a"}, {"username": "b"}]
+
+        def get_sessions(self, limit=500):
+            return list(self.sessions)
+
+        def get_messages(self, user, limit=20, offset=0):
+            return [] if limit <= 0 else [{"sort_seq": 100}]
+
+        def get_new_messages(self, user, since_seq=0, limit=None):
+            return []
+
+    db = FakeDB()
+    per_chat = lambda row, l: None
+    glob = lambda row, l: None
+    lis = Listener(db, interval=0.1, watermark_file="")
+    lis.add_listener("a", per_chat)
+    lis.add_all(glob)
+    cbs = {u: list(v) for u, v in lis._callbacks.items()}
+    check("add_all 挂到没有回调的会话上", cbs.get("b") == [glob], "%s" % cbs.get("b"))
+    check("已经单独监听过的会话也拿到全局回调（老代码在这里漏）",
+          per_chat in cbs.get("a", []) and glob in cbs.get("a", []), "%s" % cbs.get("a"))
+    check("回调顺序保持：先单会话后全局", cbs.get("a") == [per_chat, glob], "%s" % cbs.get("a"))
+    lis.add_all(glob)
+    check("重复 add_all 不会把同一个回调挂两次",
+          lis._callbacks["a"].count(glob) == 1 and lis._callbacks["b"].count(glob) == 1,
+          "%s" % {k: v.count(glob) for k, v in lis._callbacks.items()})
+    db.sessions.append({"username": "c"})
+    lis._poll_once()
+    check("轮询中新出现的会话被自动纳管", glob in lis._callbacks.get("c", []),
+          "%s" % lis._callbacks.get("c"))
+    lis._discover_new = False
+    db.sessions.append({"username": "d"})
+    lis._poll_once()
+    check("discover=False 时不再自动纳管", "d" not in lis._callbacks, str(list(lis._callbacks)))
+    check("水位按会话独立初始化", lis.watermark.get("a") == 100 and lis.watermark.get("c") == 100,
+          str(lis.watermark))
+
+
 TESTS = {"layout": t_layout, "verify": t_verify, "rhythm": t_rhythm,
-         "gate": t_gate, "click": t_click,
+         "gate": t_gate, "click": t_click, "listen": t_listen,
          "keys": t_keys, "sessions": t_sessions, "messages": t_messages}
 
 
 def main() -> int:
-    want = sys.argv[1:] or ["layout", "verify", "rhythm", "gate", "click",
+    want = sys.argv[1:] or ["layout", "verify", "rhythm", "gate", "click", "listen",
                             "keys", "sessions", "messages"]
     for name in want:
         fn = TESTS.get(name)

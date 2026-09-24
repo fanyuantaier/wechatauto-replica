@@ -139,11 +139,45 @@ class _DBMessageParent:
 
 
 class _AllMessageChat:
-    """AddListenAll 使用的轻量 Chat 占位（仅含 .who，不触发 GUI 初始化）。"""
+    """``AddListenAll`` 回调里拿到的会话对象。
 
-    def __init__(self, username: str):
+    构造时**不碰 GUI**（每条消息都 new 一个 Chat 会触发 ``WeChatGUI`` 初始化），
+    只带 username 和解析好的昵称。想在回调里直接回话时，用 ``factory`` 按需升级
+    成真正的 :class:`Chat` 并缓存下来，``SendMsg`` 原样转发过去。
+    """
+
+    def __init__(self, username: str, nickname: str = '', factory=None):
         self.who = username
         self._wxid = username
+        self._nickname = nickname or ''
+        self._factory = factory
+        self._chat = None
+
+    @property
+    def nickname(self) -> str:
+        return self._nickname or self.who
+
+    def __str__(self):
+        return self.nickname
+
+    def __repr__(self):
+        return f'<{PROJECT_NAME} - _AllMessageChat("{self.who}")>'
+
+    @property
+    def chat(self):
+        if self._chat is None and self._factory is not None:
+            try:
+                self._chat = self._factory(self.who)
+            except Exception as e:
+                wxlog.debug(f'全局监听会话升级为 Chat 失败：{e}')
+        return self._chat
+
+    def SendMsg(self, msg: str, **kw):
+        chat = self.chat
+        if chat is None:
+            from wechatauto.exceptions import WechatautoError
+            raise WechatautoError('全局监听回调里无法回复：未能构造 Chat')
+        return chat.SendMsg(msg, **kw)
 
 
 def _extract_group_sender(content) -> str:
@@ -538,6 +572,7 @@ class WeChat(Chat, Listener):
         self.listen: Dict[str, tuple] = {}
         self._listener = None
         self._listen_wrappers: Dict[str, Callable] = {}
+        self._all_chat_cache: Dict[str, object] = {}
         self._listener_is_listening = False
         self._listener_stop_event = threading.Event()
         self._current_chat: Optional['Chat'] = None
@@ -750,6 +785,13 @@ class WeChat(Chat, Listener):
             wrapper = self._make_listen_cb(chat, _cb)
             self._listen_wrappers[name] = wrapper
             self._listener.add_listener(chat._wxid, wrapper)
+        # 全局监听也要在重建监听器时补挂：否则 StopListening() 之后再
+        # StartListening()，AddListenAll 的回调就悄悄没了，而
+        # _listen_all_active 还是 True，再调 AddListenAll 只会回「已开启全局监听」。
+        if (getattr(self, '_listen_all_active', False)
+                and getattr(self, '_listen_all_wrapper', None)):
+            self._listener.add_all(self._listen_all_wrapper,
+                                   discover=getattr(self, '_listen_all_discover', True))
         self._listener.start()
         self._listener_is_listening = True
         self._listener_stop_event.clear()
@@ -815,10 +857,15 @@ class WeChat(Chat, Listener):
         """监听所有会话的新消息（包括好友、群聊、文件传输助手等）。
 
         Args:
-            callback: 回调函数，参数为 (Message 对象, Chat-like 对象)。
-                Chat-like 对象的 .who 属性为会话原始 username。
+            callback: 回调函数，参数为 (Message 对象, Chat 对象)。第二个参数的
+                ``.who`` 是会话 username、``.nickname`` 是显示名；想直接在回调里
+                回话就调 ``chat.SendMsg(...)``（第一次用时按需构造真 Chat 并缓存，
+                不会为每条消息都初始化 GUI）。
             discover: 为 True 时自动发现新出现的会话（如新群聊）并注册
                 回调，无需重复调用。默认 True。
+
+        已经用 ``AddListenChat`` 单独监听过的会话**同样**会收到这里的回调
+        （一个会话可以挂多个回调）。
 
         Returns:
             WxResponse
@@ -840,15 +887,26 @@ class WeChat(Chat, Listener):
 
         def _wrap(row: dict, listener) -> None:
             try:
-                username = row.get('username', '')
-                fake_chat = _AllMessageChat(username)
-                msg = _db_row_to_message(row, fake_chat, self_wxid)
-                callback(msg, fake_chat)
+                username = row.get('username', '') or ''
+                chat = self._all_chat_cache.get(username)
+                if chat is None:
+                    try:
+                        nick = self._db.get_nickname(username) or ''
+                    except Exception:
+                        nick = ''
+                    chat = _AllMessageChat(
+                        username, nick,
+                        factory=lambda who: Chat(who, self._gui, self._db))
+                    self._all_chat_cache[username] = chat
+                msg = _db_row_to_message(row, chat, self_wxid)
+                callback(msg, chat)
             except Exception:
                 import traceback
                 wxlog.debug(f'全局监听回调发生错误：{traceback.format_exc()}')
 
         self._listen_all_callback = callback
+        self._listen_all_wrapper = _wrap
+        self._listen_all_discover = discover
         self._listen_all_active = True
         if self._listener is not None:
             self._listener.add_all(_wrap, discover=discover)
@@ -860,6 +918,7 @@ class WeChat(Chat, Listener):
             return WxResponse.failure('未开启全局监听')
         self._listen_all_active = False
         self._listen_all_callback = None
+        self._listen_all_wrapper = None
         if self._listener is not None:
             self._listener._discover_new = False
             self._listener._all_callback = None

@@ -2724,11 +2724,25 @@ class Listener:
         """
         self._all_callback = callback
         self._discover_new = discover
-        sessions = self.db.get_sessions(limit=500)
-        for s in sessions:
-            username = s["username"]
-            if username not in self._callbacks:
-                self.add_listener(username, callback)
+        for s in self.db.get_sessions(limit=500):
+            self._add_global(s["username"])
+
+    def _add_global(self, user: str) -> None:
+        """把全局回调挂到某个会话上。
+
+        注意**不能**因为「这个会话已经有回调」就跳过：``add_listener`` 是往列表
+        里追加，一个会话本来就可以同时挂「单会话回调」和「全局回调」。以前用
+        ``if username not in self._callbacks`` 判重，结果先 ``AddListenChat`` 过的
+        会话永远不会再收到 ``AddListenAll`` 的回调——全局监听漏掉了最活跃那批会话。
+        真正要防的是同一个回调被挂两次。
+        """
+        cb = self._all_callback
+        if cb is None:
+            return
+        existing = self._callbacks.get(user)
+        if existing is not None and cb in existing:
+            return
+        self.add_listener(user, cb)
 
     @property
     def watermark(self) -> Dict[str, int]:
@@ -2766,11 +2780,8 @@ class Listener:
         # 自动发现新会话（add_all 的 discover 模式）
         if getattr(self, '_discover_new', False) and getattr(self, '_all_callback', None):
             try:
-                sessions = self.db.get_sessions(limit=500)
-                for s in sessions:
-                    username = s["username"]
-                    if username not in self._callbacks:
-                        self.add_listener(username, self._all_callback)
+                for s in self.db.get_sessions(limit=500):
+                    self._add_global(s["username"])
             except Exception:
                 pass
         for user, callbacks in list(self._callbacks.items()):
