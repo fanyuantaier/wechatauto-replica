@@ -239,6 +239,41 @@ wc.GetListenMessage()        # 阻塞监听循环（Ctrl+C 退出）/ blocking l
 # 或 / or wc.KeepRunning()
 ```
 
+**回调里的「谁发的」** / who sent it
+
+`msg` 由数据库行转换而来，发送者身份分三步解析：`messages.real_sender_id`
+（数字 rowid）→ `message_resource.db` 的 `SenderName2Id` → 真 wxid → `contact.db`
+的备注/昵称。
+
+```python
+def on_msg(msg, chat):
+    msg.sender_wxid     # 真 wxid（群消息也能拿到，不再只有文本能刮正文前缀）
+    msg.sender          # 备注或昵称；解析不到时退回 wxid，再退回会话名
+    msg.sender_remark   # 同上（备注优先）
+    msg.wxid            # 自己发的消息 = 自己的 wxid（不再是常量 2）
+    msg.attr            # 'self' / 'friend'
+    msg.local_id, msg.sort_seq, msg.create_time
+```
+
+群里那些**不在你通讯录**的人只有成员表能给名字：
+
+```python
+members = chat.GetGroupMembers()   # [{username, nick_name, remark, is_owner}, ...]
+wc.GetGroupMembers()               # 当前会话是群时同样可用；非群返回 []
+db.get_nickname("wxid_xxx")        # 备注 > 昵称 > 原样返回
+db.nickname_map()                  # 一次性 wxid→昵称 字典，带缓存（批量场景用它）
+db.username_by_nickname("阿Q")      # 反查 wxid
+```
+
+> 注：`msg.sender` 在群里以前返回的是正文里的 `wxid_xxx`，现在返回昵称；需要原始
+> wxid 时用 `msg.sender_wxid`。`SenderName2Id` 缺记录时仍会从正文
+> `wxid_xxx:\n` 前缀兜底，所以文本消息的行为不变。
+>
+> 覆盖率（8 个真实群、1249 条历史消息实测）：带发送者身份 **95.8%**，非文本消息
+> **99.6%**（这轮之前非文本是 0%——只能靠正文前缀）。剩下 4.2% 是微信自己没留身份的行：
+> `real_sender_id` 在 `SenderName2Id` 里查不到，`source` 里也没有任何用户名标签，
+> 库里造不出来的东西就不造，`msg.sender_wxid` 保持空串，`msg.sender` 退回会话名。
+
 `WeChat` 还提供 / also offers：
 
 ```python

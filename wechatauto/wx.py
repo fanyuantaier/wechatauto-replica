@@ -146,12 +146,13 @@ class _AllMessageChat:
     成真正的 :class:`Chat` 并缓存下来，``SendMsg`` 原样转发过去。
     """
 
-    def __init__(self, username: str, nickname: str = '', factory=None):
+    def __init__(self, username: str, nickname: str = '', factory=None, db=None):
         self.who = username
         self._wxid = username
         self._nickname = nickname or ''
         self._factory = factory
         self._chat = None
+        self._db = db          # 只读库用（查群成员），不需要 GUI
 
     @property
     def nickname(self) -> str:
@@ -162,6 +163,19 @@ class _AllMessageChat:
 
     def __repr__(self):
         return f'<{PROJECT_NAME} - _AllMessageChat("{self.who}")>'
+
+    def GetGroupMembers(self) -> List[dict]:
+        """群成员列表（与 :meth:`Chat.GetGroupMembers` 同义，只读库、不建 GUI）。
+
+        全局监听回调里拿到的就是本类实例，所以这里也要能查名字。
+        """
+        wxid = self._wxid or ''
+        if not wxid.endswith('@chatroom') or self._db is None:
+            return []
+        try:
+            return self._db.get_group_members(wxid)
+        except Exception:
+            return []
 
     @property
     def chat(self):
@@ -223,11 +237,20 @@ def _pick_msg_class(is_self: bool, mtype: Optional[str], content: str):
     return get('SelfOtherMessage' if is_self else 'FriendOtherMessage')
 
 
-def _db_row_to_message(row: dict, chat: 'Chat', self_wxid: str = None) -> 'Message':
+def _db_row_to_message(row: dict, chat: 'Chat', self_wxid: str = None,
+                       db=None) -> 'Message':
     """把 db.py 的消息行转换为现有 Message 子类实例。
 
     direction 判定：``sender_id == 2`` 视为自己（与 guia 发送校验一致），
     也可用 self_wxid 比对兜底。
+
+    发送者身份：``real_sender_id`` 是 ``message_resource.db`` 里 ``SenderName2Id``
+    的 rowid，db 层已经把它换成真 wxid 放在 ``sender_username``，但老代码既没往下传，
+    ``msg.wxid`` 存的又还是那个数字，于是调用方只能靠文本消息正文里的 ``wxid_xxx:\\n``
+    前缀刮发送者——图片/语音/文件这些类型没有前缀，就彻底拿不到是谁发的。现在：
+    ``msg.sender_wxid`` 给真实 wxid（解析不到时退回正文前缀，再退回那个数字，
+    保持老代码能读到的值不变），``msg.sender`` 给备注/昵称（非文本消息也能对上人了），
+    ``msg.wxid`` 对自己的消息给 ``self_wxid`` 而不是常量 2。
     """
     from wechatauto.db import WeChatDB
     from wechatauto.msgs.mattr import SystemMessage
@@ -254,11 +277,25 @@ def _db_row_to_message(row: dict, chat: 'Chat', self_wxid: str = None) -> 'Messa
     msg.local_id = row.get('local_id')
     msg.sort_seq = row.get('sort_seq')
     msg.create_time = row.get('create_time')
-    msg.wxid = sender_id
     msg.attr = 'self' if is_self else 'friend'
-    sender = _extract_group_sender(content) or getattr(chat, 'who', '')
-    msg.sender = sender or getattr(chat, 'who', '')
-    msg.sender_remark = msg.sender
+
+    sender_wxid = str(row.get('sender_username') or '').strip()
+    if sender_wxid.isdigit():
+        sender_wxid = ''          # 1.2.4 之前兜底遗留：把数字 rowid 冒充成了用户名
+    if not sender_wxid:
+        sender_wxid = _extract_group_sender(content)   # 正文前缀仍然更准的场景
+
+    msg.sender_wxid = sender_wxid
+    msg.wxid = sender_wxid or (self_wxid if is_self else sender_id)
+    db = db if db is not None else getattr(chat, '_db', None)
+    disp = ''
+    if sender_wxid and db is not None:
+        try:
+            disp = db.nickname_map().get(sender_wxid, '')
+        except Exception:
+            disp = ''
+    msg.sender = disp or sender_wxid or getattr(chat, 'who', '')
+    msg.sender_remark = disp or msg.sender
     return msg
 
 
@@ -480,7 +517,22 @@ class Chat:
         """获取当前聊天窗口最近 50 条消息。"""
         rows = self._db.get_messages(self._wxid, limit=50)
         self_wxid = self._db.get_self_info()['username']
-        return [_db_row_to_message(r, self, self_wxid) for r in rows]
+        return [_db_row_to_message(r, self, self_wxid, self._db) for r in rows]
+
+    def GetGroupMembers(self) -> List[dict]:
+        """群成员列表（静态读库，不点界面）：``username`` / ``nick_name`` /
+        ``remark`` / ``is_owner``。不是群聊时返回空列表。
+
+        配合监听回调里的 ``msg.sender_wxid`` 用：群里那些**不在你通讯录**的人，
+        只有这张表能给出名字。
+        """
+        wxid = self._wxid or ''
+        if not wxid.endswith('@chatroom'):
+            return []
+        try:
+            return self._db.get_group_members(wxid)
+        except Exception:
+            return []
 
     def GetNewMessage(self, max_backlog: int = 5000) -> List['Message']:
         """获取新消息（首次调用仅建立基线，返回空列表）。
@@ -514,7 +566,7 @@ class Chat:
         # 水位只推进到实际取回的最后一条（而非数据库最新位置）
         self._last_seq = rows[-1]['sort_seq']
         self_wxid = self._db.get_self_info()['username']
-        return [_db_row_to_message(r, self, self_wxid) for r in rows]
+        return [_db_row_to_message(r, self, self_wxid, self._db) for r in rows]
 
     def GetMessageById(self, msg_id) -> Optional['Message']:
         """根据消息 local_id 获取消息实例。"""
@@ -525,7 +577,7 @@ class Chat:
         row = self._db.get_message_row(self._wxid, local_id)
         if not row:
             return None
-        return _db_row_to_message(row, self)
+        return _db_row_to_message(row, self, db=self._db)
 
     def GetMessageByHash(self, msg_hash: str) -> Optional['Message']:
         """根据消息哈希值获取消息实例。"""
@@ -533,7 +585,7 @@ class Chat:
             return None
         self_wxid = self._db.get_self_info()['username']
         for row in self._db.get_messages(self._wxid, limit=200):
-            m = _db_row_to_message(row, self, self_wxid)
+            m = _db_row_to_message(row, self, self_wxid, self._db)
             if m.hash == msg_hash or getattr(m, 'hash_text', None) == msg_hash:
                 return m
         return None
@@ -543,7 +595,7 @@ class Chat:
         rows = self._db.get_messages(self._wxid, limit=1)
         if not rows:
             return None
-        return _db_row_to_message(rows[0], self)
+        return _db_row_to_message(rows[0], self, db=self._db)
 
 
 # ---------------------------------------------------------------------------
@@ -807,7 +859,7 @@ class WeChat(Chat, Listener):
 
         def _wrapper(row: dict, listener) -> None:
             try:
-                msg = _db_row_to_message(row, chat, self_wxid)
+                msg = _db_row_to_message(row, chat, self_wxid, self._db)
                 callback(msg, chat)
             except Exception:
                 import traceback
@@ -896,9 +948,10 @@ class WeChat(Chat, Listener):
                         nick = ''
                     chat = _AllMessageChat(
                         username, nick,
-                        factory=lambda who: Chat(who, self._gui, self._db))
+                        factory=lambda who: Chat(who, self._gui, self._db),
+                        db=self._db)
                     self._all_chat_cache[username] = chat
-                msg = _db_row_to_message(row, chat, self_wxid)
+                msg = _db_row_to_message(row, chat, self_wxid, self._db)
                 callback(msg, chat)
             except Exception:
                 import traceback

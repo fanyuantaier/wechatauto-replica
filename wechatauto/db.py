@@ -1858,11 +1858,7 @@ class WeChatDB:
         sender_id = row["real_sender_id"]
         sender_username = ""
         if sender_id and sender_id != 2:
-            sender_index = self._sender_id_index()
-            sender_username = sender_index.get(int(sender_id), "")
-            if not sender_username:
-                # fallback: 尝试从 contact.db 获取昵称
-                sender_username = self.get_nickname(str(sender_id))
+            sender_username = self._sender_id_index().get(int(sender_id), "")
         return {
             "local_id": row["local_id"],
             "local_type": row["local_type"],
@@ -1938,11 +1934,10 @@ class WeChatDB:
         sender_id = r["real_sender_id"]
         sender_username = ""
         if sender_id and sender_id != 2:
-            sender_index = self._sender_id_index()
-            sender_username = sender_index.get(int(sender_id), "")
-            if not sender_username:
-                # fallback: 尝试从 contact.db 获取昵称
-                sender_username = self.get_nickname(str(sender_id))
+            # SenderName2Id 里没有就留空：以前这里拿数字 rowid 去查
+            # contact.username，永远查不到，get_nickname 又把输入原样返回，
+            # 于是 sender_username 里会混进「看起来像用户名的纯数字」。
+            sender_username = self._sender_id_index().get(int(sender_id), "")
         return {
             "local_id": r["local_id"],
             "type": mtype,
@@ -2306,6 +2301,17 @@ class WeChatDB:
             break
         self._sender_id_cache = idx
         return idx
+
+    def nickname_map(self, refresh: bool = False) -> Dict[str, str]:
+        """``username(wxid) -> 备注或昵称`` 的映射，带进程内缓存。
+
+        监听回调里每条消息都要把发送者 wxid 换成能看的名字，逐条查 contact.db 太贵；
+        缓存策略与 :meth:`_sender_id_index` 一致（微信运行期间昵称基本不变）。
+        需要拿最新值时传 ``refresh=True``。
+        """
+        if refresh or getattr(self, '_nick_cache', None) is None:
+            self._nick_cache = self._nickname_index()
+        return self._nick_cache
 
     def _resolve_sender(self, sender_id, sender_index, nicks, self_nick) -> str:
         if sender_id in (2, "2"):

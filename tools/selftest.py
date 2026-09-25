@@ -1039,14 +1039,140 @@ def t_moment() -> None:
           "return None" in seg("_invoke_action_menu").split("for child in")[0])
 
 
+# ----------------------------------------------------------------------
+# 11. 群消息「谁发的」：real_sender_id → wxid → 昵称（纯离线，假 db）
+# ----------------------------------------------------------------------
+def t_sender() -> None:
+    """监听回调里必须拿得到发送者身份，不能只有文本消息能刮出 wxid。"""
+    from wechatauto.wx import _db_row_to_message, Chat
+    from wechatauto.db import WeChatDB
+
+    class NickDB:
+        def __init__(self, mapping, boom=False):
+            self.mapping, self.boom, self.calls = mapping, boom, 0
+
+        def nickname_map(self, refresh=False):
+            self.calls += 1
+            if self.boom:
+                raise RuntimeError('contact.db 打不开')
+            return dict(self.mapping)
+
+    class FakeChat:
+        def __init__(self, who='某群', db=None):
+            self.who = who
+            if db is not None:
+                self._db = db
+
+    def row(**kw):
+        base = dict(local_id=1, type='图片', sender_id=7, create_time=100,
+                    content='[图片]', sort_seq=100, sender_username='')
+        base.update(kw)
+        return base
+
+    NAMES = {'wxid_p': '备注阿P', 'wxid_q': '阿Q'}
+
+    print("[sender] 行字典里的 wxid 要一路传到回调")
+    db = NickDB(NAMES)
+    m = _db_row_to_message(row(sender_username='wxid_p'), FakeChat('群A'), 'self_x', db)
+    check("非文本消息也带上了发送者 wxid（以前只有文本能从正文前缀刮）",
+          getattr(m, 'sender_wxid', None) == 'wxid_p', repr(getattr(m, 'sender_wxid', None)))
+    check("发送者 wxid 已换成备注/昵称", m.sender == '备注阿P', m.sender)
+    check("msg.wxid 用的就是解析出来的 wxid", m.wxid == 'wxid_p', repr(m.wxid))
+    check("msg.sender_remark 与昵称一致", m.sender_remark == '备注阿P')
+
+    m2 = _db_row_to_message(row(sender_username='7'), FakeChat('群A'), 'self_x', db)
+    check("冒充用户名的数字 rowid 不当作 wxid（1.2.4 及更早的兜底遗留）",
+          m2.sender_wxid == '' and m2.wxid == 7,
+          "sender_wxid=%r wxid=%r" % (m2.sender_wxid, m2.wxid))
+    check("解析不到发送者时 sender 退回会话名（老行为不变）", m2.sender == '群A', m2.sender)
+
+    m3 = _db_row_to_message(row(type='文本', content='wxid_q:\n早'), FakeChat('群A'),
+                            'self_x', db)
+    check("SenderName2Id 缺记录时仍从正文前缀兜底", m3.sender_wxid == 'wxid_q',
+          repr(m3.sender_wxid))
+    check("兜底出来的 wxid 一样能换成昵称", m3.sender == '阿Q', m3.sender)
+
+    m4 = _db_row_to_message(row(sender_id=2, type='文本', content='我发的'),
+                            FakeChat('群A'), 'self_x', db)
+    check("自己发的消息 wxid 给真实 self_wxid，而不是常量 2",
+          m4.attr == 'self' and m4.wxid == 'self_x', repr(m4.wxid))
+
+    print("[sender] 拿不到 db / 昵称查询炸了都不能打断回调")
+    m5 = _db_row_to_message(row(sender_username='wxid_p'), FakeChat('群A'), None, None)
+    check("没有 db 时不抛，sender 退回 wxid", m5.sender == 'wxid_p', m5.sender)
+    m6 = _db_row_to_message(row(sender_username='wxid_p'), FakeChat('群A'), None,
+                            NickDB(NAMES, boom=True))
+    check("nickname_map 抛异常时降级为 wxid，不把异常冒到监听线程",
+          m6.sender == 'wxid_p', m6.sender)
+
+    print("[sender] nickname_map 的缓存语义")
+    d = WeChatDB.__new__(WeChatDB)
+    hits = {'n': 0}
+
+    def fake_index():
+        hits['n'] += 1
+        return {'wxid_z': '老张'}
+
+    d._nickname_index = fake_index
+    check("两次调用只查一次 contact.db",
+          d.nickname_map() == {'wxid_z': '老张'} and d.nickname_map() is not None
+          and hits['n'] == 1, "查了 %d 次" % hits['n'])
+    d.nickname_map(refresh=True)
+    check("refresh=True 会重新查", hits['n'] == 2, "查了 %d 次" % hits['n'])
+
+    print("[sender] 群成员表（群里不在通讯录的人只能靠它）")
+    g = Chat.__new__(Chat)
+    g._wxid = '1234567890@chatroom'
+    g._db = type('Stub', (), {'get_group_members': lambda self, w: [
+        {'username': 'wxid_p', 'nick_name': '阿P', 'remark': '备注阿P', 'is_owner': True}]})()
+    got = g.GetGroupMembers()
+    check("群聊返回成员列表", len(got) == 1 and got[0]['username'] == 'wxid_p', str(got))
+    p = Chat.__new__(Chat)
+    p._wxid = 'wxid_p'
+    check("非群聊返回空列表而不是抛", p.GetGroupMembers() == [])
+    q = Chat.__new__(Chat)
+    q._wxid = '1234567890@chatroom'
+    q._db = type('Boom', (), {'get_group_members': lambda self, w: (_ for _ in ()).throw(
+        RuntimeError('库损坏'))})()
+    check("读群成员出问题时返回空列表", q.GetGroupMembers() == [])
+
+    from wechatauto.wx import _AllMessageChat
+    ac = _AllMessageChat('1234567890@chatroom', '群A', db=g._db)
+    check("全局监听的伪会话也能查群成员（不建 GUI）",
+          len(ac.GetGroupMembers()) == 1, str(len(ac.GetGroupMembers())))
+    check("没带 db 的伪会话返回空列表而不是抛",
+          _AllMessageChat('1234567890@chatroom', '群A').GetGroupMembers() == [])
+
+    print("[sender] db 层不再有那条假兜底")
+    import os
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = open(os.path.join(here, "wechatauto", "db.py"), encoding="utf-8").read()
+    check("不再拿数字 rowid 去查 contact.username",
+          'get_nickname(str(sender_id))' not in src)
+    check("sender_username 只认 SenderName2Id 的结果",
+          src.count('self._sender_id_index().get(int(sender_id), "")') == 2,
+          "%d 处行构造" % src.count('self._sender_id_index().get(int(sender_id), "")'))
+
+    wsrc = open(os.path.join(here, "wechatauto", "wx.py"), encoding="utf-8").read()
+    i = wsrc.find('_AllMessageChat(\n')
+    check("AddListenAll 造的伪会话带上了 db（否则回调里查不到群成员）",
+          i >= 0 and 'db=self._db' in wsrc[i:i + 260],
+          ' '.join(wsrc[i:i + 200].split())[:120] if i >= 0 else '没找到构造点')
+    j = wsrc.find('def _make_listen_cb')
+    seg = wsrc[j:wsrc.index('\n    def ', j + 1)] if j >= 0 else ''
+    check("AddListenChat 的回调也走同一个身份解析（两条监听路径不能只修一条）",
+          '_db_row_to_message(row, chat, self_wxid, self._db)' in seg, seg[:60])
+
+
 TESTS = {"layout": t_layout, "verify": t_verify, "rhythm": t_rhythm,
          "gate": t_gate, "click": t_click, "listen": t_listen, "moment": t_moment,
+         "sender": t_sender,
          "keys": t_keys, "sessions": t_sessions, "messages": t_messages}
 
 
 def main() -> int:
     want = sys.argv[1:] or ["layout", "verify", "rhythm", "gate", "click", "listen",
-                            "moment", "keys", "sessions", "messages"]
+                            "moment", "sender", "keys", "sessions", "messages"]
     for name in want:
         fn = TESTS.get(name)
         if not fn:
