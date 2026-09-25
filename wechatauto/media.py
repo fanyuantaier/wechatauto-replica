@@ -616,14 +616,134 @@ class MediaDownloader:
             f.write(data)
         return out
 
+    def _voice_index(self, user: str):
+        """该会话在各 media 分片里的 ``(chat_name_id, svr_id) -> 音频字节数``。
+
+        一次性按会话取，别每条语音都全表扫一遍。返回 ``(已知会话数, 索引)``：
+        已知会话数为 0 说明这个会话在 media 库里连 Name2Id 都没有。
+        """
+        known = 0
+        idx = {}
+        for rel, path, _ in self.db._db_files:
+            if not os.path.basename(path).startswith("media_"):
+                continue
+            conn = self.db._open(rel)
+            try:
+                cids = [r[0] for r in conn.execute(
+                    "SELECT rowid FROM Name2Id WHERE user_name=?", (user,))]
+                if not cids:
+                    continue
+                known += 1
+                marks = ",".join("?" * len(cids))
+                for cid, svr, ln in conn.execute(
+                        "SELECT chat_name_id, svr_id, length(voice_data) "
+                        "FROM VoiceInfo WHERE chat_name_id IN (%s)" % marks,
+                        tuple(cids)):
+                    idx[str(svr)] = max(idx.get(str(svr), 0), ln or 0)
+            except Exception:
+                continue
+            finally:
+                conn.close()
+        return known, idx
+
+    @staticmethod
+    def _voice_reason(svr: str, size: int, ds, known: int) -> str:
+        """把「取到什么」归成一个可回答的原因（单条与批量共用一份判据）。"""
+        if not svr or svr == "0":
+            return "no_server_id"
+        if size > 0:
+            return "ok"
+        if not known:
+            return "session_not_in_media_index"
+        if ds == 0:
+            return "audio_not_downloaded"      # 微信没把音频落盘，读库无能为力
+        if ds is None:
+            # 这张消息表没有 download_status 列（版本差异），只能保守判断
+            return "audio_not_downloaded"
+        return "audio_missing_from_media_db"   # 状态说该有，VoiceInfo 里却没有
+
+    def list_voice_status(self, user: str,
+                          limit: int = 500) -> List[dict]:
+        """列出会话里的语音消息，并逐条说明**音频到底在不在本地**。
+
+        ``download_voice()`` 取不到时只返回 ``None``，调用方分不清「微信本地根本没
+        存这段音频」和「库读挂了」——issue #20「26 条语音只识别到 19 条」就是被这个
+        歧义卡住的。本机 975 条语音实测：``download_status != 0`` 与「音频在本地」
+        完全一一对应（914 条在 / 59 条 ds=0 且确实不在），所以这个字段就是判据。
+
+        Returns:
+            按时间降序的 dict 列表，字段：
+
+            - ``local_id`` / ``server_id`` / ``create_time`` / ``self_sent``
+            - ``download_status``：消息表原值；老版本表没这列时为 ``None``
+            - ``available``：能否取到非空音频
+            - ``bytes``：音频字节数（不可用时为 0）
+            - ``reason``：``ok`` / ``audio_not_downloaded``（微信没把这段音频
+              落盘，读取路径无能为力，只能在界面上播放一次）/
+              ``audio_missing_from_media_db``（``download_status`` 说该有，但
+              ``VoiceInfo`` 里查不到——这才可能是库的问题）/
+              ``session_not_in_media_index`` / ``no_server_id`` / ``empty_blob``
+        """
+        rows = self.db.get_voice_rows(user, limit=limit)
+        if not rows:
+            return []
+        known, idx = self._voice_index(user)
+        out = []
+        for r in rows:
+            svr = str(r.get("server_id") or "")
+            ds = r.get("download_status")
+            size = idx.get(svr, 0)
+            reason = self._voice_reason(svr, size, ds, known)
+            out.append({
+                "local_id": r.get("local_id"),
+                "server_id": r.get("server_id"),
+                "create_time": r.get("create_time"),
+                "self_sent": r.get("real_sender_id") == 2,
+                "download_status": ds,
+                "available": reason == "ok",
+                "bytes": size,
+                "reason": reason,
+            })
+        return out
+
+    def voice_status(self, user: str, local_id: int) -> dict:
+        """单条语音的可用性说明（字段同 :meth:`list_voice_status`）。
+
+        取不到这条语音时返回 ``{'available': False, 'reason': 'no_voice_row'}``。
+        """
+        rows = self.db.get_voice_rows(user, limit=1, local_id=local_id)
+        if not rows:
+            return {"local_id": local_id, "available": False,
+                    "reason": "no_voice_row", "bytes": 0,
+                    "download_status": None, "server_id": None,
+                    "self_sent": False, "create_time": None}
+        known, idx = self._voice_index(user)
+        r = rows[0]
+        svr = str(r.get("server_id") or "")
+        size = idx.get(svr, 0)
+        ds = r.get("download_status")
+        reason = self._voice_reason(svr, size, ds, known)
+        return {"local_id": r.get("local_id"), "server_id": r.get("server_id"),
+                "create_time": r.get("create_time"),
+                "self_sent": r.get("real_sender_id") == 2,
+                "download_status": ds, "available": reason == "ok",
+                "bytes": size, "reason": reason}
+
     def download_voice(self, user: str, local_id: int, save_dir: Optional[str] = None) -> Optional[str]:
         """语音：media_*.db VoiceInfo.voice_data（SILK 二进制），落盘 .silk
 
         微信按账号/时间把语音分片存到多个 media_*.db，逐个搜索直到找到。
+
+        返回 ``None`` 不等于库读坏了：微信只把**在界面上播放/接收过**的语音写进
+        ``VoiceInfo``，没落盘的那条再怎么试都没有。想知道具体是哪一种，用
+        :meth:`voice_status`（单条）或 :meth:`list_voice_status`（整个会话），
+        失败时这里也会把原因写进 debug 日志。
         """
         row = self.db.get_message_row(user, local_id, local_type=34)
         if not row or row["local_type"] != 34 or not row["server_id"]:
+            wxlog.debug("语音 %s/%s 取不到：消息行缺失或没有 server_id" % (user, local_id))
             return None
+        out_path = None
         for rel, path, _ in self.db._db_files:
             if not os.path.basename(path).startswith("media_"):
                 continue
@@ -643,10 +763,13 @@ class MediaDownloader:
             finally:
                 conn.close()
             if v and v["voice_data"]:
-                out = self._out(save_dir, "%s_%s.silk" % (user, local_id))
-                with open(out, "wb") as f:
+                out_path = self._out(save_dir, "%s_%s.silk" % (user, local_id))
+                with open(out_path, "wb") as f:
                     f.write(v["voice_data"])
-                return out
+                return out_path
+        st = self.voice_status(user, local_id)
+        wxlog.debug("语音 %s/%s 取不到音频，原因=%s（download_status=%s）"
+                    % (user, local_id, st.get("reason"), st.get("download_status")))
         return None
 
     def download_video(self, user: str, local_id: int, save_dir: Optional[str] = None) -> Optional[str]:

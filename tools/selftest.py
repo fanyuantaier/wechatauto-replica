@@ -1164,15 +1164,182 @@ def t_sender() -> None:
           '_db_row_to_message(row, chat, self_wxid, self._db)' in seg, seg[:60])
 
 
+# ----------------------------------------------------------------------
+# 12. 语音可用性判据（纯离线：内存 sqlite + 假 db，不碰微信也不落敏感文件）
+# ----------------------------------------------------------------------
+def t_voice() -> None:
+    """issue #20「26 条语音只识别到 19 条」：库没读坏，是微信没把音频落盘。
+    新增的 reason 判据必须能区分这两种情况，并且老版本表结构不能把行弄丢。"""
+    import os as _os
+    import sqlite3
+    import tempfile
+
+    from wechatauto.db import WeChatDB
+    from wechatauto.media import MediaDownloader
+
+    vr = MediaDownloader._voice_reason
+    print("[voice] 可用性判据")
+    check("VoiceInfo 里有非空数据 → ok", vr('111', 4096, 1, 1) == 'ok')
+    check("没有 server_id → no_server_id", vr('', 0, 1, 1) == 'no_server_id'
+          and vr('0', 0, 1, 1) == 'no_server_id')
+    check("download_status=0 → audio_not_downloaded（不是库的错）",
+          vr('111', 0, 0, 1) == 'audio_not_downloaded')
+    check("老表没有这一列（None）也归到「未落盘」，不谎报库坏了",
+          vr('111', 0, None, 1) == 'audio_not_downloaded')
+    check("状态说该有但 VoiceInfo 查不到 → 指向库侧可疑",
+          vr('111', 0, 5, 1) == 'audio_missing_from_media_db')
+    check("会话在 media 库里连 Name2Id 都没有 → 单独一种原因",
+          vr('111', 0, 1, 0) == 'session_not_in_media_index')
+
+    # ---- get_voice_rows：真的 sqlite，带/不带 download_status 两种表结构 ----
+    def build(with_status: bool):
+        conn = sqlite3.connect(':memory:')
+        conn.row_factory = sqlite3.Row
+        cols = ("local_id INTEGER, server_id INTEGER, real_sender_id INTEGER, "
+                "create_time INTEGER, sort_seq INTEGER, local_type INTEGER")
+        if with_status:
+            cols += ", download_status INTEGER"
+        conn.execute("CREATE TABLE Msg_1 (%s)" % cols)
+        data = [(1, 111, 7, 100, 300, 34, 1), (2, 222, 2, 200, 400, 34, 0),
+                (3, 0, 7, 300, 500, 34, 1), (4, 444, 7, 400, 600, 1, 1)]
+        for r in data:
+            if with_status:
+                conn.execute("INSERT INTO Msg_1 VALUES (?,?,?,?,?,?,?)", r)
+            else:
+                conn.execute("INSERT INTO Msg_1 VALUES (?,?,?,?,?,?)", r[:6])
+        conn.commit()
+        return conn
+
+    def fake(with_status):
+        d = WeChatDB.__new__(WeChatDB)
+        conn = build(with_status)
+        d._run_msg_query = lambda user, fn: fn([(conn, 'Msg_1')])
+        return d, conn
+
+    print("[voice] get_voice_rows 的窄查询")
+    d, _ = fake(True)
+    rows = d.get_voice_rows('wxid_a', limit=100)
+    check("只返回语音行（local_type=34）", len(rows) == 3, str(len(rows)))
+    check("按 sort_seq 降序", [r['local_id'] for r in rows] == [3, 2, 1],
+          str([r['local_id'] for r in rows]))
+    check("带出 download_status", rows[1]['download_status'] == 0
+          and rows[0]['download_status'] == 1,
+          str([r['download_status'] for r in rows]))
+    one = d.get_voice_rows('wxid_a', local_id=2)
+    check("local_id 过滤生效", len(one) == 1 and one[0]['server_id'] == 222, str(one))
+    check("limit 生效", len(d.get_voice_rows('wxid_a', limit=2)) == 2)
+
+    d2, _ = fake(False)
+    rows2 = d2.get_voice_rows('wxid_a', limit=100)
+    check("老版本表没有 download_status 列时**不丢行**（通用路径会 continue 整片丢）",
+          len(rows2) == 3, "只回来 %d 条" % len(rows2))
+    check("缺列时 download_status 退化为 None 而不是 KeyError",
+          all(r['download_status'] is None for r in rows2))
+    check("缺列时其余字段照常可读", rows2[0]['sort_seq'] == 500
+          and rows2[1]['server_id'] == 222)
+
+    # ---- list_voice_status / voice_status ----
+    print("[voice] 批量与单条可用性报告")
+    ROWS = [
+        {'local_id': 1, 'server_id': 111, 'create_time': 100, 'sort_seq': 300,
+         'real_sender_id': 7, 'download_status': 1},
+        {'local_id': 2, 'server_id': 222, 'create_time': 200, 'sort_seq': 400,
+         'real_sender_id': 2, 'download_status': 0},
+        {'local_id': 3, 'server_id': 0, 'create_time': 300, 'sort_seq': 500,
+         'real_sender_id': 7, 'download_status': 1},
+        {'local_id': 4, 'server_id': 444, 'create_time': 400, 'sort_seq': 600,
+         'real_sender_id': 7, 'download_status': 1},
+    ]
+
+    class FakeDB:
+        def get_voice_rows(self, user, limit=500, local_id=None):
+            out = [dict(r) for r in ROWS
+                   if local_id is None or r['local_id'] == local_id]
+            return out[:limit]
+
+    md = MediaDownloader.__new__(MediaDownloader)
+    md.db = FakeDB()
+    md.save_dir = tempfile.mkdtemp(prefix='wxst-voice-')
+    md._voice_index = lambda user: (1, {'111': 4096})   # 只有 111 真的落盘了
+    st = md.list_voice_status('wxid_a')
+    check("条数与消息表一致（不可用的也在列表里，带原因）", len(st) == 4, str(len(st)))
+    by_id = {x['local_id']: x for x in st}
+    check("落盘过的 → available + bytes", by_id[1]['available'] is True
+          and by_id[1]['bytes'] == 4096 and by_id[1]['reason'] == 'ok')
+    check("download_status=0 → audio_not_downloaded 且 available=False",
+          by_id[2]['reason'] == 'audio_not_downloaded'
+          and by_id[2]['available'] is False)
+    check("server_id 为 0 → no_server_id", by_id[3]['reason'] == 'no_server_id')
+    check("状态正常但 VoiceInfo 没有 → audio_missing_from_media_db",
+          by_id[4]['reason'] == 'audio_missing_from_media_db')
+    check("自己发的语音标出来（对方/自己要分开统计时要用）",
+          by_id[2]['self_sent'] is True and by_id[1]['self_sent'] is False)
+    v1 = md.voice_status('wxid_a', 1)
+    check("单条查询与批量结论一致", v1['available'] is True and v1['bytes'] == 4096)
+    check("消息表里没这条语音 → no_voice_row，不抛",
+          md.voice_status('wxid_a', 99)['reason'] == 'no_voice_row')
+
+    # ---- 真 media 分片（临时文件 sqlite）跑通 Name2Id / VoiceInfo 与落盘 ----
+    print("[voice] Name2Id 索引与真实落盘")
+    media_path = _os.path.join(tempfile.mkdtemp(prefix='wxst-media-'), 'media_0.db')
+    media = sqlite3.connect(media_path)
+    media.row_factory = sqlite3.Row
+    media.execute("CREATE TABLE Name2Id (user_name TEXT)")
+    media.execute("INSERT INTO Name2Id (user_name) VALUES ('wxid_a')")   # rowid=1
+    media.execute("INSERT INTO Name2Id (user_name) VALUES ('wxid_b')")   # rowid=2
+    media.execute("CREATE TABLE VoiceInfo (chat_name_id INT, svr_id INT, "
+                  "voice_data BLOB, create_time INT)")
+    media.execute("INSERT INTO VoiceInfo VALUES (1, 111, ?, 5)", (b'SILKDATA',))
+    media.execute("INSERT INTO VoiceInfo VALUES (2, 111, ?, 6)", (b'OTHER',))
+    media.commit()
+    media.close()
+
+    # 撤掉上面那个桩，让 _voice_index 走真实现；_open 每次开新连接
+    # （真实现读后会 close，:memory: 库一 close 就空了，所以这里用文件库）
+    del md._voice_index
+    md.db._db_files = [('message\\media_0.db', 'media_0.db', None)]
+
+    def open_media(rel):
+        c = sqlite3.connect(media_path)
+        c.row_factory = sqlite3.Row      # 真 db._open 也是这个 row_factory
+        return c
+
+    md.db._open = open_media
+    known, idx = md._voice_index('wxid_a')
+    check("按会话取索引：只认自己那份音频", known == 1 and idx == {'111': 8},
+          "%s %s" % (known, idx))
+    check("别的会话拿不到（不串号）", md._voice_index('wxid_z') == (0, {}))
+    same_svr = md._voice_index('wxid_b')
+    check("同号不同会话各自计数", same_svr[1] == {'111': 5}, str(same_svr[1]))
+
+
+    md.db.get_message_row = lambda user, local_id, local_type=None: (
+        {'local_type': 34, 'server_id': 111} if local_id == 1 else
+        ({'local_type': 34, 'server_id': 222} if local_id == 2 else None))
+    outp = md.download_voice('wxid_a', 1, save_dir=md.save_dir)
+    got = open(outp, 'rb').read() if outp else b''
+    check("音频落盘且字节一致", outp is not None and got == b'SILKDATA',
+          os.path.basename(outp) if outp else 'None')
+    check("未落盘的那条仍然返回 None（行为不变）",
+          md.download_voice('wxid_a', 2, save_dir=md.save_dir) is None)
+    check("消息行缺失时返回 None 而不是抛",
+          md.download_voice('wxid_a', 3, save_dir=md.save_dir) is None)
+    for fn in os.listdir(md.save_dir):
+        _os.remove(_os.path.join(md.save_dir, fn))
+    _os.rmdir(md.save_dir)
+    _os.remove(media_path)
+    _os.rmdir(_os.path.dirname(media_path))
+
+
 TESTS = {"layout": t_layout, "verify": t_verify, "rhythm": t_rhythm,
          "gate": t_gate, "click": t_click, "listen": t_listen, "moment": t_moment,
-         "sender": t_sender,
+         "sender": t_sender, "voice": t_voice,
          "keys": t_keys, "sessions": t_sessions, "messages": t_messages}
 
 
 def main() -> int:
     want = sys.argv[1:] or ["layout", "verify", "rhythm", "gate", "click", "listen",
-                            "moment", "sender", "keys", "sessions", "messages"]
+                            "moment", "sender", "voice", "keys", "sessions", "messages"]
     for name in want:
         fn = TESTS.get(name)
         if not fn:

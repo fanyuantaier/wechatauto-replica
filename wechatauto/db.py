@@ -1797,6 +1797,57 @@ class WeChatDB:
         rows.sort(key=lambda r: r["sort_seq"], reverse=True)
         return [self._msg_row_to_dict(r) for r in rows[offset:offset + limit]]
 
+    def get_voice_rows(self, user: str, limit: int = 500,
+                       local_id: Optional[int] = None) -> List[dict]:
+        """语音消息（``local_type=34``）的原始行，额外带 ``download_status``。
+
+        ``download_status`` 没放进 :meth:`_shard_rows` 的通用 SELECT：那是每条消息
+        都要走的热点，多取一列不划算；而「这条语音的音频在不在本地」只有语音消息需要
+        回答，所以单独开一条窄查询。
+
+        老版本的消息表可能没有 ``download_status`` 这一列——这时**不能**让它像通用
+        路径那样 ``except: continue`` 把整个分片的行丢掉（那会把「读不到」伪装成
+        「没有语音」），而是退化成人无此列的 None。
+
+        Args:
+            user: 会话 username（wxid 或 ``xxx@chatroom``）。
+            limit: 最多返回多少条。
+            local_id: 只取这一条时传入（跨分片同号会返回多条，由调用方挑）。
+
+        Returns:
+            按 ``sort_seq`` 降序的 dict 列表：``local_id`` / ``server_id`` /
+            ``real_sender_id`` / ``create_time`` / ``sort_seq`` / ``download_status``。
+        """
+        want = max(1, int(limit))
+        sql_ext = "WHERE local_type=34" + (" AND local_id=?" if local_id else "")
+        params = (local_id,) if local_id else ()
+        cols = ("local_id, server_id, real_sender_id, create_time, sort_seq")
+
+        def _run(tables):
+            out = []
+            for conn, table in tables:
+                order = " ORDER BY sort_seq DESC, local_id DESC LIMIT %d" % want
+                try:
+                    out += [dict(r) for r in conn.execute(
+                        "SELECT %s, download_status FROM %s %s%s"
+                        % (cols, table, sql_ext, order), params)]
+                except sqlite3.Error:
+                    # 这张表没有 download_status（版本差异）→ 退化取值，
+                    # 绝不能像通用路径那样 continue 把整个分片的行丢掉
+                    try:
+                        out += [dict(r, download_status=None) for r in conn.execute(
+                            "SELECT %s FROM %s %s%s"
+                            % (cols, table, sql_ext, order), params)]
+                    except sqlite3.Error:
+                        continue
+            return out
+
+        rows = self._run_msg_query(user, _run)
+        if not rows:
+            return []
+        rows.sort(key=lambda r: r.get("sort_seq") or 0, reverse=True)
+        return rows[:want]
+
     def get_message_rows_for_media(self, user: str, local_id: int) -> List[dict]:
         """返回跨分片 local_id 命中的全部消息行（供媒体分发判定类型）。
 

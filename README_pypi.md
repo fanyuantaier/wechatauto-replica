@@ -726,6 +726,7 @@ def on_msg(msg, listener):
 7. **引用消息功能（BETA）仅供测试**：`quote_msg` 通过坐标 + OCR + SendInput
    模拟右键菜单选择「引用」，依赖微信 4.1.x 自绘渲染布局，随窗口尺寸/DPI/
    会话内容不同可能存在定位偏差，仅建议在测试账号中验证流程。
+8. **语音消息的音频可能不在本地**：微信只有在界面上播放/接收过之后才会把 `voice_data` 写进 `media_*.db`，其余语音 `download_voice()` 只能返回 `None`，而且分不清是「本地没有」还是「库读挂了」。现在 `MediaDownloader.list_voice_status()` / `voice_status()` 会给出原因：`audio_not_downloaded`（本地确实没有，去微信里播放一次即可）与 `audio_missing_from_media_db`（这才值得开 issue）。实测 20 个会话 958 条语音：898 条可取、54 条 `download_status=0` 且确实不在、6 条所在会话在 media 库里没有 Name2Id 索引；`download_status != 0` 与「音频在本地」一一对应，无一例外。
 
 ---
 
@@ -972,6 +973,7 @@ Runnable demo: `python -m wechatauto.demo_moments_interact [--like N | --unlike 
 5. **Group-chat image originals** are stored locally only after being opened (viewed) in WeChat; until then only the thumbnail (`_t.dat`) exists — `download_image` falls back to the thumbnail (marked `_thumb` in the filename).
 6. **Moments posting is dropped** (4.x self-drawn UI, unreliable); reading/likes/comments are supported.
 7. **Quote-message sending (BETA)** goes through a coordinate + OCR + `SendInput` pipeline that depends on WeChat 4.1.x self-drawn layout; positioning may drift with window size / DPI / chat content — test flow on a throwaway account only.
+8. **Voice messages can be missing their audio locally** — WeChat only writes `voice_data` into `media_*.db` after a voice has been played/received on that machine, so `download_voice()` returns `None` for the rest, with no way to tell "not on disk" from "library broke". `MediaDownloader.list_voice_status()` / `voice_status()` now return the reason: `audio_not_downloaded` (play it once in WeChat) vs `audio_missing_from_media_db` (worth an issue). Measured over 958 voices in 20 sessions: 898 available, 54 flagged `download_status=0` and indeed absent, 6 with no media index entry — `download_status != 0` matched "audio on disk" with no exceptions.
 
 ## 🗺️ Roadmap
 

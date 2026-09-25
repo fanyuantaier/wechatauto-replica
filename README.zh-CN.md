@@ -715,6 +715,7 @@ def on_msg(msg, listener):
 7. **引用消息功能（BETA）仅供测试**：`quote_msg` 通过坐标 + OCR + SendInput
    模拟右键菜单选择「引用」，依赖微信 4.1.x 自绘渲染布局，随窗口尺寸/DPI/
    会话内容不同可能存在定位偏差，仅建议在测试账号中验证流程。
+8. **语音消息的音频可能不在本地**：微信只有在界面上播放/接收过之后才会把 `voice_data` 写进 `media_*.db`，其余语音 `download_voice()` 只能返回 `None`，而且分不清是「本地没有」还是「库读挂了」。现在 `MediaDownloader.list_voice_status()` / `voice_status()` 会给出原因：`audio_not_downloaded`（本地确实没有，去微信里播放一次即可）与 `audio_missing_from_media_db`（这才值得开 issue）。实测 20 个会话 958 条语音：898 条可取、54 条 `download_status=0` 且确实不在、6 条所在会话在 media 库里没有 Name2Id 索引；`download_status != 0` 与「音频在本地」一一对应，无一例外。
 
 ---
 

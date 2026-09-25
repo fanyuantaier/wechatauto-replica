@@ -450,6 +450,36 @@ out = md.download_image_original("filehelper", 123, timeout=30)
 
 返回落盘路径，失败返回 `None`。 / Returns the saved path, or `None` on failure.
 
+### 6.2.1 语音取不到时，先分清是谁的问题 / Why some voices have no audio
+
+`download_voice()` 返回 `None` 有两种完全不同的原因，以前分不出来
+（issue #20「26 条语音只识别到 19 条」就卡在这个歧义上）：
+
+```python
+for v in md.list_voice_status("wxid_xxx", limit=500):
+    v['available'], v['reason'], v['bytes'], v['download_status'], v['self_sent']
+
+md.voice_status("wxid_xxx", local_id)     # 单条，字段同上
+```
+
+`reason` 取值：
+
+| reason | 含义 | 能怎么办 |
+|---|---|---|
+| `ok` | 音频在 `media_*.db` 的 `VoiceInfo` 里，能取字节 | 正常下载 |
+| `audio_not_downloaded` | 微信**没把这段音频落盘**（`download_status=0`） | 读库无能为力；在微信里播放一次就会落盘 |
+| `audio_missing_from_media_db` | `download_status` 说该有，`VoiceInfo` 里却没有 | 这才是可能的库侧问题，值得开 issue |
+| `session_not_in_media_index` | 该会话在 media 库里连 `Name2Id` 条目都没有 | 同上，通常也是没落盘 |
+| `no_server_id` / `no_voice_row` | 消息行缺 `server_id` / 这条不是语音 | 数据本身的问题 |
+
+判据来自实测：本机 20 个会话 958 条语音里，`download_status != 0` 与「音频在本地」
+**一一对应，无一例外**（898 可用 / 54 未落盘 / 6 会话无索引，可用率 93.7%），
+所以 `download_status` 可以直接当「微信有没有下载」的标志用；新实现与独立复算
+在这 958 条上逐条一致。
+
+> 想补齐那 6%，只能在界面上把语音播放一遍（微信随后会把 `voice_data` 写进
+> `VoiceInfo`）。那属于驱动真实客户端的写动作，要走 `rhythm`，本库没有自动化它。
+
 ### 6.3 群聊图片 / Group chat images
 
 - 群聊图片原图**只有点开查看过才落盘**；否则只有缩略图 / originals only stored after being opened
