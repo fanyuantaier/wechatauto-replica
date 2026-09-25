@@ -32,7 +32,7 @@
 本项目复刻上游 wxauto 项目，目标是实现对当前微信 4.x Windows 客户端的自动化
 （读取消息、发送消息、媒体下载、朋友圈），非网页版，直接操作本机客户端。
 
-> 当前版本：1.2.4
+> 当前版本：1.2.4.1
 >
 > **兼容范围**：Windows 10/11 ｜ Python 3.9+（已在 3.12 验证）｜ 微信 **4.1.12+**（已在 4.1.15.13 验证）
 > （数据库读取路线对微信版本不敏感；坐标+OCR 发送路线依赖 4.1.12+ 自绘渲染
@@ -60,6 +60,13 @@
 ---
 
 ## 版本记录
+
+### v1.2.4.1（2026-09-25）
+
+- **修复：群消息除了文本，都看不出是谁发的。** `real_sender_id` 是数字 rowid，`wechatauto/db.py` 早就通过 `message_resource.db` 的 `SenderName2Id` 把它换成了真 wxid 放在 `sender_username` 里——但 `wx.py:_db_row_to_message` 从没往下传，`msg.wxid` 存的还是那个数字，唯一能用的路子是从**文本**正文里刮 `wxid_xxx:\n` 前缀，于是图片/语音/文件/表情全是匿名的。现在 `msg.sender_wxid` 给真 wxid（解析不到时退回正文前缀，再退回原来的数字，保证老代码可见值不变），`msg.sender` / `sender_remark` 给备注或昵称，自己发的消息 `msg.wxid` 是真实 wxid 而不是常量 `2`。新增 `Chat.GetGroupMembers()`（`{username, nick_name, remark, is_owner}`）与 `WeChatDB.nickname_map()`（带缓存的 wxid→名字），覆盖不在你通讯录里的人。实测 8 个真实群 / 1249 条历史消息：带发送者身份 **95.8%**，**非文本消息从 0% 变成 99.6%**（451/453）。剩下 4.2% 是微信自己没留身份——`SenderName2Id` 只有 655 条、不含那些 id，抽查 20 条的 `source` 里也没有任何用户名标签；造不出来的就不造，`sender_wxid` 保持空串。顺手删掉一条陈旧兜底：拿数字 rowid 去查 `contact.username`（永远查不到，`get_nickname` 又把数字原样返回，冒充成用户名）。
+- **修复：`download_voice()` 只返回 `None`，没有任何线索**（issue #20「26 条语音只识别到 19 条」）。复现了，而且**不是查找键错**：独立实现与库在 **958/958** 条语音上逐条一致，「`svr_id` 存在但挂在别的 `chat_name_id` 下」为 **0** 条。真因是微信只在界面上播放/接收过之后才把 `voice_data` 写进 `media_*.db`，所以多数取不到其实是音频从来没落盘，而沉默的 `None` 让人分不清这是本地没有还是库坏了。判据其实一直躺在消息表里：**`download_status`**。975 条语音上相关性精确——`download_status != 0` ⇔ 「音频在本地」（`ds=1` 515 条 + `ds=5` 400 条，0 例外），`ds=0` 的 60 条全部确实不在。新增 `MediaDownloader.list_voice_status(user)` / `voice_status(user, local_id)`，返回 `available` / `bytes` / `download_status` / `self_sent` / `reason`，`reason` 取 `ok`、`audio_not_downloaded`（本地确实没有，去微信里播放一次即可）、`audio_missing_from_media_db`（状态说该有却没有，**这种才值得开 issue**）、`session_not_in_media_index`、`no_server_id`、`no_voice_row`。`download_voice()` 签名与行为不变，失败时把原因写进日志。本机可用率 **93.7%**（898 可取 / 54 未落盘 / 6 会话无 media 索引）。新查询还防住一个真陷阱：`download_status` 故意**不**放进通用的消息 `SELECT`；当某张消息表没有这一列时改为退化取值并对该列返回 `None`——若沿用通用路径的 `except: continue`，会**静默丢掉那个分片的每一行**，把「读不到」伪装成「没有语音」，比要修的 bug 更糟。
+- **需要知道的行为变更**：群里 `msg.sender` 以前是正文里刮出来的原始 `wxid_xxx`，现在是备注/昵称；要原始 id 请读 `msg.sender_wxid`。
+- **回归覆盖**：`tools/selftest.py` 新增 `sender` 组（22 项：数字冒充、正文前缀兜底、自己发的、无 db 与昵称查询失败两条降级路径、缓存语义、群成员三种失败路径，以及两条监听路径确实都把 db 传了下去）与 `voice` 组（28 项，基于真实的内存/临时文件 SQLite 消息库与 media 库，含「缺列必须不丢行」）。整套 **226 项 0 失败**。变异验证两组都会咬：把发送者身份解析退回老写法 → 5 项红；把假数字兜底放回去 → 源码级检查红；把语音查询的缺列退化改成通用的 `continue` → 「不丢行」那条红（只回来 0 条）并连带崩组。
 
 ### v1.2.4（2026-09-24）
 
@@ -821,7 +828,7 @@ quick_send_file(r'D:\资料\报告.pdf', '文件传输助手')
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.2.4 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13)
+> **Current version:** 1.2.4.1 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13)
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -982,6 +989,13 @@ Runnable demo: `python -m wechatauto.demo_moments_interact [--like N | --unlike 
 - Performance: parallel export / first-scan, incremental memory-scan cache
 
 ## 📝 Changelog
+
+### v1.2.4.1 (2026-09-25)
+
+- **Fixed: a group message could not tell you who sent it unless it was text** (issue #20 territory, reported as "who is talking"). `real_sender_id` is a numeric rowid; `wechatauto/db.py` already resolved it through `message_resource.db`'s `SenderName2Id` into a real wxid and put it in `sender_username` — but `wx.py:_db_row_to_message` never passed that on, `msg.wxid` stored the number, and the only working path was scraping the `wxid_xxx:\n` prefix out of **text** bodies, so images / voice / files / stickers were anonymous. Now `msg.sender_wxid` carries the real wxid (falling back to the body prefix, then to the old numeric value so nothing that worked breaks), `msg.sender` / `sender_remark` give the remark-or-nickname, and `msg.wxid` for your own messages is your real wxid instead of the constant `2`. New `Chat.GetGroupMembers()` (`{username, nick_name, remark, is_owner}`) and `WeChatDB.nickname_map()` (cached wxid→name) cover people who are not in your contact list. Measured over 8 real groups / 1249 stored messages: **95.8%** carry a sender identity, and **non-text messages went from 0% to 99.6%** (451/453). The remaining 4.2% have no identity anywhere in WeChat's own data — `SenderName2Id` has 655 rows and does not contain those ids, and sampling 20 of them found no username tag in `source` either. Nothing is invented: `sender_wxid` stays empty. A stale fallback that fed the numeric rowid into `contact.username` (which can never match, and made `get_nickname` echo the number back as if it were a username) is gone.
+- **Fixed: `download_voice()` returning `None` told you nothing** (issue #20, "26 voice messages but only 19 came through"). Reproduced, and the cause is **not** a broken lookup: an independent re-implementation agreed with the library on **958/958** voices, and the "svr_id exists but under a different `chat_name_id`" case was **0**. WeChat only writes `voice_data` into `media_*.db` after a voice has been played or received on that machine, so most misses mean the audio was never on disk — and the silent `None` made that indistinguishable from a library bug. The oracle was already there: the message table's **`download_status`**. Over 975 voices the correlation is exact — `download_status != 0` ⇔ "audio on disk" (515 rows `ds=1` + 400 `ds=5`, 0 exceptions), and all 60 rows with `ds=0` were genuinely absent. New `MediaDownloader.list_voice_status(user)` / `voice_status(user, local_id)` return `available` / `bytes` / `download_status` / `self_sent` / `reason`, where `reason` is `ok`, `audio_not_downloaded` (nothing on disk — play it once in WeChat), `audio_missing_from_media_db` (the flag says it should be there and it is not — *that* one is worth an issue), `session_not_in_media_index`, `no_server_id` or `no_voice_row`. `download_voice()` keeps its signature and behaviour; on failure it now logs the reason. Measured availability here: **93.7%** (898 ok / 54 not downloaded / 6 with no media index entry). The new narrow query also guards a real trap: `download_status` is deliberately **not** in the shared message `SELECT`, and where a message table lacks the column the query degrades and returns `None` for it — the shared path's `except: continue` would have silently dropped **every row of that shard**, turning "cannot read" into "there are no voices", which is worse than the bug being fixed.
+- **Behaviour change to know about**: in groups, `msg.sender` used to be the raw `wxid_xxx` scraped from the body; it is now the remark/nickname. Read `msg.sender_wxid` for the raw id.
+- **Regression coverage**: `tools/selftest.py` gained a `sender` group (22 checks: the numeric-rowid masquerade, the text-prefix fallback, your own messages, no-db and nickname-query-failure paths, cache semantics, three group-member failure modes, and both listener paths actually passing `db` through) and a `voice` group (28 checks, built on real in-memory / temp-file SQLite message and media databases, including the missing-column degradation that must not drop rows). Whole suite **226 checks / 0 fail**. Mutations confirm both groups bite: reverting the sender-identity resolution → 5 red; putting the fake numeric fallback back → source check red; making the voice query use the shared `continue` on a missing column → "does not lose rows" goes red (0 rows came back) and the group crashes.
 
 ### v1.2.4 (2026-09-24)
 

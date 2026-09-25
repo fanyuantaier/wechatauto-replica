@@ -19,7 +19,7 @@
 本项目复刻上游 wxauto 项目，目标是实现对当前微信 4.x Windows 客户端的自动化
 （读取消息、发送消息、媒体下载、朋友圈），非网页版，直接操作本机客户端。
 
-> 当前版本：1.2.4
+> 当前版本：1.2.4.1
 >
 > **兼容范围**：Windows 10/11 ｜ Python 3.9+（已在 3.12 验证）｜ 微信 **4.1.12+**（已在 4.1.15.13 验证）
 > （数据库读取路线对微信版本不敏感；坐标+OCR 发送路线依赖 4.1.12+ 自绘渲染
@@ -47,6 +47,13 @@
 ---
 
 ## 版本记录
+
+### v1.2.4.1（2026-09-25）
+
+- **修复：群消息除了文本，都看不出是谁发的。** `real_sender_id` 是数字 rowid，`wechatauto/db.py` 早就通过 `message_resource.db` 的 `SenderName2Id` 把它换成了真 wxid 放在 `sender_username` 里——但 `wx.py:_db_row_to_message` 从没往下传，`msg.wxid` 存的还是那个数字，唯一能用的路子是从**文本**正文里刮 `wxid_xxx:\n` 前缀，于是图片/语音/文件/表情全是匿名的。现在 `msg.sender_wxid` 给真 wxid（解析不到时退回正文前缀，再退回原来的数字，保证老代码可见值不变），`msg.sender` / `sender_remark` 给备注或昵称，自己发的消息 `msg.wxid` 是真实 wxid 而不是常量 `2`。新增 `Chat.GetGroupMembers()`（`{username, nick_name, remark, is_owner}`）与 `WeChatDB.nickname_map()`（带缓存的 wxid→名字），覆盖不在你通讯录里的人。实测 8 个真实群 / 1249 条历史消息：带发送者身份 **95.8%**，**非文本消息从 0% 变成 99.6%**（451/453）。剩下 4.2% 是微信自己没留身份——`SenderName2Id` 只有 655 条、不含那些 id，抽查 20 条的 `source` 里也没有任何用户名标签；造不出来的就不造，`sender_wxid` 保持空串。顺手删掉一条陈旧兜底：拿数字 rowid 去查 `contact.username`（永远查不到，`get_nickname` 又把数字原样返回，冒充成用户名）。
+- **修复：`download_voice()` 只返回 `None`，没有任何线索**（issue #20「26 条语音只识别到 19 条」）。复现了，而且**不是查找键错**：独立实现与库在 **958/958** 条语音上逐条一致，「`svr_id` 存在但挂在别的 `chat_name_id` 下」为 **0** 条。真因是微信只在界面上播放/接收过之后才把 `voice_data` 写进 `media_*.db`，所以多数取不到其实是音频从来没落盘，而沉默的 `None` 让人分不清这是本地没有还是库坏了。判据其实一直躺在消息表里：**`download_status`**。975 条语音上相关性精确——`download_status != 0` ⇔ 「音频在本地」（`ds=1` 515 条 + `ds=5` 400 条，0 例外），`ds=0` 的 60 条全部确实不在。新增 `MediaDownloader.list_voice_status(user)` / `voice_status(user, local_id)`，返回 `available` / `bytes` / `download_status` / `self_sent` / `reason`，`reason` 取 `ok`、`audio_not_downloaded`（本地确实没有，去微信里播放一次即可）、`audio_missing_from_media_db`（状态说该有却没有，**这种才值得开 issue**）、`session_not_in_media_index`、`no_server_id`、`no_voice_row`。`download_voice()` 签名与行为不变，失败时把原因写进日志。本机可用率 **93.7%**（898 可取 / 54 未落盘 / 6 会话无 media 索引）。新查询还防住一个真陷阱：`download_status` 故意**不**放进通用的消息 `SELECT`；当某张消息表没有这一列时改为退化取值并对该列返回 `None`——若沿用通用路径的 `except: continue`，会**静默丢掉那个分片的每一行**，把「读不到」伪装成「没有语音」，比要修的 bug 更糟。
+- **需要知道的行为变更**：群里 `msg.sender` 以前是正文里刮出来的原始 `wxid_xxx`，现在是备注/昵称；要原始 id 请读 `msg.sender_wxid`。
+- **回归覆盖**：`tools/selftest.py` 新增 `sender` 组（22 项：数字冒充、正文前缀兜底、自己发的、无 db 与昵称查询失败两条降级路径、缓存语义、群成员三种失败路径，以及两条监听路径确实都把 db 传了下去）与 `voice` 组（28 项，基于真实的内存/临时文件 SQLite 消息库与 media 库，含「缺列必须不丢行」）。整套 **226 项 0 失败**。变异验证两组都会咬：把发送者身份解析退回老写法 → 5 项红；把假数字兜底放回去 → 源码级检查红；把语音查询的缺列退化改成通用的 `continue` → 「不丢行」那条红（只回来 0 条）并连带崩组。
 
 ### v1.2.4（2026-09-24）
 
