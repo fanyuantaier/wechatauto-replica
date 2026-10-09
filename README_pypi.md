@@ -32,7 +32,7 @@
 本项目复刻上游 wxauto 项目，目标是实现对当前微信 4.x Windows 客户端的自动化
 （读取消息、发送消息、媒体下载、朋友圈），非网页版，直接操作本机客户端。
 
-> 当前版本：1.2.5.1
+> 当前版本：1.2.6
 >
 > **兼容范围**：Windows 10/11 ｜ Python 3.9+（已在 3.12 验证）｜ 微信 **4.1.12+**（已在 4.1.15.13 验证）
 > （数据库读取路线对微信版本不敏感；坐标+OCR 发送路线依赖 4.1.12+ 自绘渲染
@@ -87,10 +87,44 @@ wechatauto 朋友圈 --me              # 看自己发的朋友圈
 > 感谢 [wenjiavv](https://github.com/wenjiavv) 报告 [issue #28](https://github.com/fanyuantaier/wechatauto-replica/issues/28)（1.2.2.5 缺失 `import threading`，布局校准必抛 `NameError`）与 [issue #29](https://github.com/fanyuantaier/wechatauto-replica/issues/29)（发送回读校验接受包含额外正文的历史消息），两份都附了复现步骤、宽屏/竖屏的不同症状和修复建议（v1.2.2.6 修复）。
 >
 > 感谢 [dhz1145](https://github.com/dhz1145) 报告 [issue #32](https://github.com/fanyuantaier/wechatauto-replica/issues/32)：微信存储位置设在盘符根（`d:\`）时自动检测依赖启动目录。附了逐条复现步骤（换启动目录的对照输出）、成因定位、`GetFullPathNameW` 的路径解析复核和修复建议（v1.2.5.1 修复）。
+>
+> 感谢 [WrenZephyrSol](https://github.com/WrenZephyrSol) 在 [issue #20](https://github.com/fanyuantaier/wechatauto-replica/issues/20) 里的复查：同一个会话他拿 `list_message_chats()` 数出 2654 条、走 `get_messages()` 只有 763 条，并贴出逐行源码对照，还给出「下载那一步不能走 `get_message_row`、要自己带 server_id 去语音库捞」的绕行方案。那份分析读的是 v1.2.1，但顺着它挖出了 `local_id` 跨分片重复这个真洞（v1.2.6 修复）。
 
 ---
 
 ## 版本记录
+
+### v1.2.6（2026-10-09）
+
+- ⚠️ **重要修复：跨分片会话里 `(会话, local_id)` 不唯一，按号回读会拿到别的分片的另一条消息。**（[issue #20](https://github.com/fanyuantaier/wechatauto-replica/issues/20)）
+  - 背景：微信把一个会话的历史**横向拆进多个 `message_N.db`**（分片），而 `local_id` 是
+    **每个分片各自从 1 开始计数**的。合并读取（v1.2.2 起）之后，`(user, local_id)` 就不再是唯一键了。
+  - 本机实测：200 个会话表中 54 个跨多片；**20008 组** `(会话, local_id)` 同时命中多个分片，
+    其中 **10477 组连 `local_type` 都相同**而正文/图片不同（抽样里光图片就有 **35 组**同号但 md5 不同）。
+  - 后果：`get_message_row()` 以前不打任何日志，直接取 `sort_seq` 最新的那一条。语音/图片/文件/视频
+    下载全以它为入口，于是表现为"**按 A 那条的号，下到了 B 那张图**"。
+  - 修法：消息行统一带上 **`shard`**（分片库文件名），合并视图里 `(local_id, shard)` 才是唯一键；
+    `get_message_row(user, local_id, local_type=…, shard=…)` 可以钉死某一片；不指定 `shard` 而命中
+    多片时**先告警**再按旧口径取最新；`shard` 写错返回 `None` 并告警，不瞎猜。
+  - 顺带铺开：`list_voice_status()` / `list_image_status()` 的行也带 `shard`；`image_status` /
+    `download_image` / `download_image_original` / `download_voice` / `download_video` /
+    `download_file` 全部接受 `shard`，`download_media()` 分发时自动带上候选行自己的 `shard`。
+  - 兼容性：只给返回 dict **增加** `shard` 键、给方法增加**可选**关键字参数，旧调用形状一字不变。
+  - 判据：新增 `tools/test_db_shard.py` **46 项**——双分片临时库夹具验合并读取、`shard` 寻址、
+    新加的 `? AS shard` 不挤掉 WHERE 参数、以及分片读失败的可见性；真机部分逐片回读一个真实的
+    「同号 + 同类型 + 跨分片」行（不带 `shard` 拿到的是最新那片，带上之后各拿本片那一行），
+    并核对 `get_messages()` 条数 = 各分片 `count(*)` 之和、覆盖分片数 = 该会话的分片数。
+
+- **修复：某个分片查询报 `database disk image is malformed` 时被当成"这个分片没有消息"。**
+  损坏现在抛给 `_run_msg_query` 走解密缓存重建重试；其它错误仍跳过该片，但会点名是哪个分片
+  （同一条只说一次，轮询里不刷屏）。这是"读不全"的另一个静默来源——少了一半还返回成功。
+
+- **删除：`_find_msg_table()` / `_msg_conn()` 两个单分片桩函数**（零调用者，docstring 写着
+  "只返回第一个命中分片"）。[issue #20](https://github.com/fanyuantaier/wechatauto-replica/issues/20) 里那份逐行对照就是照着它们断定 `get_messages()` 只读
+  一片——那段代码自 v1.2.2 起已经没人调用了，但墓碑还挂在文件里。
+
+- 其余内容同 v1.2.5.1（微信数据目录设在盘符根时的自动检测修复、回车前回读校验、
+  `WxParam.ENABLE_OCR` 总开关、通讯录标签 + 右键转发）。
 
 ### v1.2.5.1（2026-10-07）
 
@@ -945,7 +979,7 @@ quick_send_file(r'D:\资料\报告.pdf', '文件传输助手')
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.2.5.1 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13)
+> **Current version:** 1.2.6 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13)
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -1136,6 +1170,23 @@ Runnable demo: `python -m wechatauto.demo_moments_interact [--like N | --unlike 
 - Performance: parallel export / first-scan, incremental memory-scan cache
 
 ## 📝 Changelog
+
+### v1.2.6 (2026-10-09)
+
+- ⚠️ **Important fix: within a sharded chat, `(chat, local_id)` is not unique, so looking a row up by id could return a message from a different shard.** ([issue #20](https://github.com/fanyuantaier/wechatauto-replica/issues/20))
+  - Background: WeChat splits one chat's history **horizontally across several `message_N.db` shards**, and `local_id` **restarts at 1 in every shard**. Once reads were merged (v1.2.2), `(user, local_id)` stopped being a unique key.
+  - Measured locally: of 200 session tables, 54 span multiple shards; **20008** `(chat, local_id)` pairs hit more than one shard, and **10477** of those share the same `local_type` while carrying different content (a sample of image rows alone contained **35** groups with the same id but different md5).
+  - Impact: `get_message_row()` used to pick the highest `sort_seq` silently. Voice, image, video and file downloads all go through it, so the observable result was "**asked for A's id, downloaded B's media**".
+  - Fix: every message row now carries **`shard`** (the shard's database file name) — in the merged view `(local_id, shard)` is the unique key. `get_message_row(user, local_id, local_type=…, shard=…)` pins one shard; when several shards match and no `shard` was given it **warns first** and then falls back to the previous behaviour; a wrong `shard` name returns `None` with a warning instead of guessing.
+  - Spread through the API: `list_voice_status()` / `list_image_status()` rows carry `shard` too, and `image_status` / `download_image` / `download_image_original` / `download_voice` / `download_video` / `download_file` all accept `shard`; `download_media()` passes the candidate row's own `shard` when it dispatches.
+  - Compatibility: only **additive** — a new `shard` key in returned dicts and new **optional** keyword arguments; every existing call shape is unchanged.
+  - Tests: new `tools/test_db_shard.py`, **46 checks** — a two-shard temporary-database fixture covers merged reads, `shard` addressing, that the new `? AS shard` placeholder cannot steal a WHERE parameter, and shard-failure visibility; the live section re-reads a real same-id, same-type, cross-shard row per shard (without `shard` you get the newest shard, with it each shard returns its own row) and asserts that `get_messages()` returns exactly the sum of the per-shard `count(*)` across all of the chat's shards.
+
+- **Fix: a shard whose query raised `database disk image is malformed` was treated as "this shard has no messages".** Corruption now propagates to `_run_msg_query`, which rebuilds the decrypted cache and retries; other errors still skip that shard but name it in a warning (logged once per key, so a poll loop doesn't flood). This was the second silent source of "incomplete reads" — returning success with half the rows missing.
+
+- **Removed: the `_find_msg_table()` / `_msg_conn()` single-shard stubs** (no callers, docstring saying "returns only the first matching shard"). The line-by-line analysis in [issue #20](https://github.com/fanyuantaier/wechatauto-replica/issues/20) was written against them — that code has been unreachable since v1.2.2, but the tombstones were still in the file.
+
+- Everything else carries over from v1.2.5.1 (the drive-root data-directory fix, the read-back gate before Enter, the `WxParam.ENABLE_OCR` master switch, contact labels + right-click forwarding).
 
 ### v1.2.5.1 (2026-10-07)
 
@@ -1414,6 +1465,8 @@ Thanks to [uiharukazari0105](https://github.com/uiharukazari0105) for finding th
 Thanks to [wenjiavv](https://github.com/wenjiavv) for reporting the missing `threading` import that broke layout calibration in the published 1.2.2.5 ([#28](https://github.com/fanyuantaier/wechatauto-replica/issues/28)) and the substring/no-watermark hole in send verification ([#29](https://github.com/fanyuantaier/wechatauto-replica/issues/29)), both with reproductions and fix proposals (fixed in v1.2.2.6).
 
 Thanks to [dhz1145](https://github.com/dhz1145) for reporting [issue #32](https://github.com/fanyuantaier/wechatauto-replica/issues/32) — auto-detection depended on the working directory whenever WeChat's storage location was a drive root (`d:\`), complete with step-by-step reproductions, the root cause, a `GetFullPathNameW` cross-check and a fix proposal (fixed in v1.2.5.1).
+
+Thanks to [WrenZephyrSol](https://github.com/WrenZephyrSol) for the follow-up on [issue #20](https://github.com/fanyuantaier/wechatauto-replica/issues/20): on the same chat `list_message_chats()` counted 2654 messages while `get_messages()` returned 763, and they pasted a line-by-line source comparison plus a workaround that avoided `get_message_row` for downloads by carrying `server_id` over themselves. The analysis was written against v1.2.1, but following it uncovered the real hole — `local_id` is not unique across shards (fixed in v1.2.6).
 
 ## 📄 License & Disclaimer
 

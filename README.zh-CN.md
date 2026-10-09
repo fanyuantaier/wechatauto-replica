@@ -19,7 +19,7 @@
 本项目复刻上游 wxauto 项目，目标是实现对当前微信 4.x Windows 客户端的自动化
 （读取消息、发送消息、媒体下载、朋友圈），非网页版，直接操作本机客户端。
 
-> 当前版本：1.2.5.1
+> 当前版本：1.2.6
 >
 > **兼容范围**：Windows 10/11 ｜ Python 3.9+（已在 3.12 验证）｜ 微信 **4.1.12+**（已在 4.1.15.13 验证）
 > （数据库读取路线对微信版本不敏感；坐标+OCR 发送路线依赖 4.1.12+ 自绘渲染
@@ -74,10 +74,44 @@ wechatauto 朋友圈 --me              # 看自己发的朋友圈
 > 感谢 [wenjiavv](https://github.com/wenjiavv) 报告 [issue #28](https://github.com/fanyuantaier/wechatauto-replica/issues/28)（1.2.2.5 缺失 `import threading`，布局校准必抛 `NameError`）与 [issue #29](https://github.com/fanyuantaier/wechatauto-replica/issues/29)（发送回读校验接受包含额外正文的历史消息），两份都附了复现步骤、宽屏/竖屏的不同症状和修复建议（v1.2.2.6 修复）。
 >
 > 感谢 [dhz1145](https://github.com/dhz1145) 报告 [issue #32](https://github.com/fanyuantaier/wechatauto-replica/issues/32)：微信存储位置设在盘符根（`d:\`）时自动检测依赖启动目录。附了逐条复现步骤（换启动目录的对照输出）、成因定位、`GetFullPathNameW` 的路径解析复核和修复建议（v1.2.5.1 修复）。
+>
+> 感谢 [WrenZephyrSol](https://github.com/WrenZephyrSol) 在 [issue #20](https://github.com/fanyuantaier/wechatauto-replica/issues/20) 里的复查：同一个会话他拿 `list_message_chats()` 数出 2654 条、走 `get_messages()` 只有 763 条，并贴出逐行源码对照，还给出「下载那一步不能走 `get_message_row`、要自己带 server_id 去语音库捞」的绕行方案。那份分析读的是 v1.2.1，但顺着它挖出了 `local_id` 跨分片重复这个真洞（v1.2.6 修复）。
 
 ---
 
 ## 版本记录
+
+### v1.2.6（2026-10-09）
+
+- ⚠️ **重要修复：跨分片会话里 `(会话, local_id)` 不唯一，按号回读会拿到别的分片的另一条消息。**（[issue #20](https://github.com/fanyuantaier/wechatauto-replica/issues/20)）
+  - 背景：微信把一个会话的历史**横向拆进多个 `message_N.db`**（分片），而 `local_id` 是
+    **每个分片各自从 1 开始计数**的。合并读取（v1.2.2 起）之后，`(user, local_id)` 就不再是唯一键了。
+  - 本机实测：200 个会话表中 54 个跨多片；**20008 组** `(会话, local_id)` 同时命中多个分片，
+    其中 **10477 组连 `local_type` 都相同**而正文/图片不同（抽样里光图片就有 **35 组**同号但 md5 不同）。
+  - 后果：`get_message_row()` 以前不打任何日志，直接取 `sort_seq` 最新的那一条。语音/图片/文件/视频
+    下载全以它为入口，于是表现为"**按 A 那条的号，下到了 B 那张图**"。
+  - 修法：消息行统一带上 **`shard`**（分片库文件名），合并视图里 `(local_id, shard)` 才是唯一键；
+    `get_message_row(user, local_id, local_type=…, shard=…)` 可以钉死某一片；不指定 `shard` 而命中
+    多片时**先告警**再按旧口径取最新；`shard` 写错返回 `None` 并告警，不瞎猜。
+  - 顺带铺开：`list_voice_status()` / `list_image_status()` 的行也带 `shard`；`image_status` /
+    `download_image` / `download_image_original` / `download_voice` / `download_video` /
+    `download_file` 全部接受 `shard`，`download_media()` 分发时自动带上候选行自己的 `shard`。
+  - 兼容性：只给返回 dict **增加** `shard` 键、给方法增加**可选**关键字参数，旧调用形状一字不变。
+  - 判据：新增 `tools/test_db_shard.py` **46 项**——双分片临时库夹具验合并读取、`shard` 寻址、
+    新加的 `? AS shard` 不挤掉 WHERE 参数、以及分片读失败的可见性；真机部分逐片回读一个真实的
+    「同号 + 同类型 + 跨分片」行（不带 `shard` 拿到的是最新那片，带上之后各拿本片那一行），
+    并核对 `get_messages()` 条数 = 各分片 `count(*)` 之和、覆盖分片数 = 该会话的分片数。
+
+- **修复：某个分片查询报 `database disk image is malformed` 时被当成"这个分片没有消息"。**
+  损坏现在抛给 `_run_msg_query` 走解密缓存重建重试；其它错误仍跳过该片，但会点名是哪个分片
+  （同一条只说一次，轮询里不刷屏）。这是"读不全"的另一个静默来源——少了一半还返回成功。
+
+- **删除：`_find_msg_table()` / `_msg_conn()` 两个单分片桩函数**（零调用者，docstring 写着
+  "只返回第一个命中分片"）。[issue #20](https://github.com/fanyuantaier/wechatauto-replica/issues/20) 里那份逐行对照就是照着它们断定 `get_messages()` 只读
+  一片——那段代码自 v1.2.2 起已经没人调用了，但墓碑还挂在文件里。
+
+- 其余内容同 v1.2.5.1（微信数据目录设在盘符根时的自动检测修复、回车前回读校验、
+  `WxParam.ENABLE_OCR` 总开关、通讯录标签 + 右键转发）。
 
 ### v1.2.5.1（2026-10-07）
 
