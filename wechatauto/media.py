@@ -970,14 +970,16 @@ class MediaDownloader:
             md5 = self._img_md5(r)
             if not md5:
                 out.append({"local_id": r.get("local_id"), "md5": None, "tiers": {},
-                            "best": None, "available": False, "reason": "no_md5"})
+                            "best": None, "available": False, "reason": "no_md5",
+                            "shard": r.get("shard")})
                 continue
             st = cache.get(md5)
             if st is None:
                 st = self._image_status_for(user, r.get("local_id"), md5)
                 cache[md5] = st
             out.append(dict(st, local_id=r.get("local_id"),
-                            create_time=r.get("create_time")))
+                            create_time=r.get("create_time"),
+                            shard=r.get("shard")))
         return out
 
     # ------------------------------------------------------------------
@@ -1659,7 +1661,9 @@ class MediaDownloader:
         Returns:
             按时间降序的 dict 列表，字段：
 
-            - ``local_id`` / ``server_id`` / ``create_time`` / ``self_sent``
+            - ``local_id`` / ``server_id`` / ``create_time`` / ``self_sent`` /
+              ``shard``（分片库文件名：``local_id`` 跨分片会重复，要下载同一条时把它
+              传给 :meth:`download_voice`）
             - ``download_status``：消息表原值；老版本表没这列时为 ``None``
             - ``available``：能否取到非空音频
             - ``bytes``：音频字节数（不可用时为 0）
@@ -1688,6 +1692,7 @@ class MediaDownloader:
                 "available": reason == "ok",
                 "bytes": size,
                 "reason": reason,
+                "shard": r.get("shard"),
             })
         return out
 
