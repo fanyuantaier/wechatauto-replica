@@ -132,6 +132,18 @@ def _is_malformed(exc) -> bool:
     return isinstance(exc, sqlite3.DatabaseError) and "malformed" in str(exc).lower()
 
 
+def _row_get(r, key, default=None):
+    """从 sqlite3.Row 或 dict 取一列，缺列时给默认值。
+
+    ``shard`` 是新加的列，老库/桩数据（自制 (conn, table) 列表）没有它，
+    直接 ``r[key]`` 会抛 IndexError/KeyError 把整次读取打死。
+    """
+    try:
+        return r[key]
+    except (KeyError, IndexError):
+        return default
+
+
 def _pbkdf2(passwd: bytes, salt: bytes, iters: int) -> bytes:
     return hashlib.pbkdf2_hmac("sha512", passwd, salt, iters, dklen=32)
 
@@ -1613,18 +1625,6 @@ class WeChatDB:
             rel for rel, _, _ in self._db_files if not self._key_works(rel)
         ]
 
-    def _find_msg_table(self, user: str, conns: List[sqlite3.Connection]) -> Optional[Tuple[sqlite3.Connection, str]]:
-        """定位会话消息表（只返回第一个命中分片，兼容旧接口；跨分片请用 _find_msg_tables）"""
-        target = "Msg_" + _md5_hex(user.encode())
-        for conn in conns:
-            row = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-                (target,),
-            ).fetchone()
-            if row:
-                return conn, target
-        return None
-
     def _find_msg_tables(self, user: str, conns: List[sqlite3.Connection]) -> List[Tuple[sqlite3.Connection, str]]:
         """定位会话消息表的全部命中分片（同一 Msg_ 表可能拆分在 message_0..N）。"""
         target = "Msg_" + _md5_hex(user.encode())
@@ -1692,17 +1692,12 @@ class WeChatDB:
                 c.close()
         return found
 
-    def _msg_conn(self, user: str, _retry: bool = True) -> Optional[Tuple[sqlite3.Connection, str]]:
-        """兼容旧接口：只返回第一个命中分片（跨分片场景请用 _msg_conns）。"""
-        found = self._msg_conns(user, _retry=_retry)
-        return found[0] if found else None
-
     def _run_msg_query(self, user: str, build):
         """对消息库执行只读查询；查询到库损坏时清缓存重建并重试一次。
 
         build(tables) -> rows，其中 tables 为 List[(conn, table)]，覆盖该
         会话的全部命中分片（跨分片由调用方合并排序）。
-        _msg_conn 已处理 schema 损坏重建，本方法兜底数据页损坏。
+        _msg_conns 已处理 schema 损坏重建，本方法兜底数据页损坏。
         重试后仍失败则抛原始异常（Listener 捕获后跳过本轮，不阻断运行）。
         找不到该会话返回 None。
         """
@@ -1735,12 +1730,42 @@ class WeChatDB:
     _MSG_ORDER_DESC = "ORDER BY sort_seq DESC, local_id ASC"
     _MSG_ORDER_ASC = "ORDER BY sort_seq ASC, local_id ASC"
 
+    def _warn_once(self, key, msg, *a):
+        """同一条告警只说一次。
+
+        这些读取路径在轮询里每秒都会走一遍，重复的分片错误如果每次都打，
+        日志会被同一条刷屏、把别的信息挤掉。
+        """
+        warned = getattr(self, "_warned_keys", None)
+        if warned is None:
+            warned = self._warned_keys = set()
+        if key in warned or len(warned) >= 500:
+            return
+        warned.add(key)
+        wxlog.warning(msg, *a)
+
+    def _shard_label(self, conn: sqlite3.Connection) -> str:
+        """分片标识：该连接对应的解密缓存库文件名（如 ``message__message_2.db``）。
+
+        ``local_id`` 只在分片内唯一，跨分片会重复（实测本账号 54 个跨分片会话里
+        有 20008 个 ``(会话, local_id)`` 在多片同时命中），因此对外必须给一个
+        能把 ``(user, local_id)`` 钉到唯一一行的字段，``shard`` 就是它。
+        """
+        try:
+            row = conn.execute("PRAGMA database_list").fetchone()
+        except sqlite3.Error:
+            return ""
+        return os.path.basename(row[2] or "") if row and row[2] else ""
+
     def _shard_rows(self, tables, sql_ext, params=(), order_ext="", per_shard_limit=None):
         """跨分片执行统一 SELECT，返回合并后的 sqlite3.Row 列表（调用方后续排序）。
 
         tables: _run_msg_query 传入的 [(conn, table), ...]。
         分片间 local_id 会重复（每片从 1 起），因此跨分片排序键必须带上
         local_id，不能用跨分片 LIMIT/OFFSET 直查。
+
+        每行额外带 ``shard`` 列（分片库文件名）：合并视图里 ``(local_id, shard)``
+        才是唯一键，调用方要回读某一行时必须带上它，否则会取到别的分片的同号行。
 
         order_ext: 分片内 ORDER BY 子句（如 _MSG_ORDER_DESC）。
         per_shard_limit: 分片内 LIMIT，必须与 order_ext 使用同一排序键。
@@ -1755,15 +1780,23 @@ class WeChatDB:
             limit_sql = " LIMIT %d" % max(0, int(per_shard_limit))
         rows = []
         for conn, table in tables:
+            shard = self._shard_label(conn)
             try:
                 rows += conn.execute(
                     "SELECT local_id, local_type, real_sender_id, create_time, "
                     "message_content, source, packed_info_data, compress_content, "
-                    "server_id, sort_seq FROM %s %s %s%s" % (
+                    "server_id, sort_seq, ? AS shard FROM %s %s %s%s" % (
                         table, sql_ext, order_ext, limit_sql),
-                    params,
+                    (shard,) + tuple(params),
                 ).fetchall()
-            except sqlite3.DatabaseError:
+            except sqlite3.DatabaseError as exc:
+                # 库损坏不能当成「这个分片没有消息」：交给 _run_msg_query
+                # 清缓存重建重试，否则读出来的会话永远少一截还看着像正常。
+                if _is_malformed(exc):
+                    raise
+                self._warn_once(("shard", shard, type(exc).__name__),
+                                "分片 %s 读取失败(%s: %s)，本轮结果不含该分片",
+                                shard or "?", type(exc).__name__, str(exc)[:120])
                 continue
         return rows
 
@@ -1780,6 +1813,10 @@ class WeChatDB:
         非法入参一律**空返回**而不是回落到某个窗口：``limit<=0`` 直接空；
         ``offset<0`` 也空——负数切片的 ``rows[-1:20]`` 在行数不足时会吐出最后
         一条，等于把「参数错了」伪装成「查到了数据」。
+
+        每行带 ``shard``（命中的分片库文件名）：``local_id`` 只在分片内唯一，
+        跨分片会重复。要按 ``(user, local_id)`` 回读某一条（媒体下载等），把
+        ``shard`` 一起传回 :meth:`get_message_row` 才能锁定这一行。
         """
         limit = int(limit)
         offset = int(offset)
@@ -1816,7 +1853,8 @@ class WeChatDB:
 
         Returns:
             按 ``sort_seq`` 降序的 dict 列表：``local_id`` / ``server_id`` /
-            ``real_sender_id`` / ``create_time`` / ``sort_seq`` / ``download_status``。
+            ``real_sender_id`` / ``create_time`` / ``sort_seq`` /
+            ``download_status`` / ``shard``。
         """
         want = max(1, int(limit))
         sql_ext = "WHERE local_type=34" + (" AND local_id=?" if local_id else "")
@@ -1826,19 +1864,28 @@ class WeChatDB:
         def _run(tables):
             out = []
             for conn, table in tables:
+                shard = self._shard_label(conn)
                 order = " ORDER BY sort_seq DESC, local_id DESC LIMIT %d" % want
                 try:
-                    out += [dict(r) for r in conn.execute(
+                    out += [dict(r, shard=shard) for r in conn.execute(
                         "SELECT %s, download_status FROM %s %s%s"
                         % (cols, table, sql_ext, order), params)]
-                except sqlite3.Error:
+                except sqlite3.Error as exc:
+                    if _is_malformed(exc):
+                        raise
                     # 这张表没有 download_status（版本差异）→ 退化取值，
                     # 绝不能像通用路径那样 continue 把整个分片的行丢掉
                     try:
-                        out += [dict(r, download_status=None) for r in conn.execute(
+                        out += [dict(r, download_status=None, shard=shard)
+                                for r in conn.execute(
                             "SELECT %s FROM %s %s%s"
                             % (cols, table, sql_ext, order), params)]
-                    except sqlite3.Error:
+                    except sqlite3.Error as exc2:
+                        if _is_malformed(exc2):
+                            raise
+                        self._warn_once(("voice", shard, type(exc2).__name__),
+                                        "分片 %s 语音行读取失败(%s: %s)，本轮结果不含该分片",
+                                        shard or "?", type(exc2).__name__, str(exc2)[:120])
                         continue
             return out
 
@@ -1863,12 +1910,18 @@ class WeChatDB:
         def _run(tables):
             out = []
             for conn, table in tables:
+                shard = self._shard_label(conn)
                 try:
-                    out += [dict(r) for r in conn.execute(
+                    out += [dict(r, shard=shard) for r in conn.execute(
                         "SELECT %s FROM %s WHERE local_type=3 "
                         "ORDER BY sort_seq DESC, local_id DESC LIMIT %d"
                         % (cols, table, want))]
-                except sqlite3.Error:
+                except sqlite3.Error as exc:
+                    if _is_malformed(exc):
+                        raise
+                    self._warn_once(("image", shard, type(exc).__name__),
+                                    "分片 %s 图片行读取失败(%s: %s)，本轮结果不含该分片",
+                                    shard or "?", type(exc).__name__, str(exc)[:120])
                     continue
             return out
 
@@ -1885,6 +1938,7 @@ class WeChatDB:
                         "sort_seq": r.get("sort_seq"),
                         "packed_info": r.get("packed_info_data"),
                         "content": r.get("message_content"),
+                        "shard": r.get("shard", ""),
                         "type": "图片"})
         return out
 
@@ -1893,6 +1947,9 @@ class WeChatDB:
 
         跨分片下 local_id 非全局唯一，同一 local_id 可能对应不同类型消息
         （图片/语音/文本等）。媒体下载分发时需要拿到所有候选再按类型路由。
+
+        每行带 ``shard``：同号同类型也可能分属不同分片（正文不同），路由到
+        具体某个下载方法时把它原样传回，才能拿到这一行而不是别的分片。
         """
         row = self._run_msg_query(
             user,
@@ -1917,32 +1974,53 @@ class WeChatDB:
                 "packed_info": r["packed_info_data"],
                 "compress_content": r["compress_content"],
                 "sort_seq": r["sort_seq"],
+                "shard": _row_get(r, "shard", ""),
             })
         return out
 
     def get_message_row(self, user: str, local_id: int,
-                        local_type: Optional[int] = None) -> Optional[dict]:
+                        local_type: Optional[int] = None,
+                        shard: Optional[str] = None) -> Optional[dict]:
         """按 local_id 读取一条消息的完整原始字段（媒体下载用，含 server_id/packed_info）。
 
         Args:
             local_id: 消息行号。注意跨分片下 local_id 非全局唯一，
                 同一 local_id 可在不同分片对应不同类型消息。
             local_type: 可选，调用方已知消息类型时传入以精确过滤，
-                避免命中其它分片中的同号异类型消息。
+                避免命中其它分片中的同号异类型消息。**类型相同照样会撞**：
+                实测本账号有 10477 组「同号 + 同类型 + 不同正文」，只靠类型
+                筛不掉，需要唯一就用 ``shard``。
+            shard: 可选，分片库文件名——把消息行里的 ``shard`` 字段原样传回
+                即可锁定那一个分片，结果必然唯一。传错名字不会瞎猜：直接返回
+                ``None`` 并告警。
+
+        未指定 ``shard`` 且命中多片时，取 ``sort_seq`` 最新的一条并告警
+        （保持旧行为），因为调用方此刻没法知道自己拿到的是哪一条同号行。
         """
         sql = "WHERE local_id=?"
         params = [local_id]
         if local_type is not None:
             sql += " AND local_type=?"
             params.append(local_type)
-        row = self._run_msg_query(
-            user,
-            lambda tables: self._shard_rows(
-                tables, sql, tuple(params),
-            ),
-        )
+
+        def _build(tables):
+            if shard:
+                tables = [t for t in tables if self._shard_label(t[0]) == shard]
+            return self._shard_rows(tables, sql, tuple(params))
+
+        row = self._run_msg_query(user, _build)
         if not row:
+            if shard:
+                self._warn_once(("shard-miss", user, local_id, shard),
+                                "按 shard=%s 定位 local_id=%s 没命中（会话 %s）："
+                                "分片名写错或该分片没这条消息", shard, local_id, user)
             return None
+        if len(row) > 1:
+            self._warn_once(("amb", user, local_id),
+                            "local_id=%s（会话 %s）在 %d 个分片都有：%s —— 取 sort_seq "
+                            "最新的一条，可能不是你要的那条；要精确请带 shard=",
+                            local_id, user, len(row),
+                            ",".join(sorted({_row_get(r, "shard", "") or "?" for r in row})))
         # 跨分片下 local_id 可能重复（各分片独立计数），取 sort_seq 最新者
         row.sort(key=lambda r: r["sort_seq"], reverse=True)
         row = row[0]
@@ -1962,6 +2040,7 @@ class WeChatDB:
             "packed_info": row["packed_info_data"],
             "compress_content": row["compress_content"],
             "sort_seq": row["sort_seq"],
+            "shard": _row_get(row, "shard", ""),
         }
 
     def _find_media_rows(self, user: str, types: set) -> List[int]:
@@ -2037,6 +2116,7 @@ class WeChatDB:
             "create_time": r["create_time"],
             "content": content,
             "sort_seq": r["sort_seq"],
+            "shard": _row_get(r, "shard", ""),
         }
 
     @staticmethod

@@ -1313,9 +1313,17 @@ def t_voice() -> None:
     check("同号不同会话各自计数", same_svr[1] == {'111': 5}, str(same_svr[1]))
 
 
-    md.db.get_message_row = lambda user, local_id, local_type=None: (
-        {'local_type': 34, 'server_id': 111} if local_id == 1 else
-        ({'local_type': 34, 'server_id': 222} if local_id == 2 else None))
+    seen_shard = []
+
+    def _voice_row(user, local_id, local_type=None, shard=None):
+        seen_shard.append(shard)
+        if local_id == 1:
+            return {'local_type': 34, 'server_id': 111}
+        if local_id == 2:
+            return {'local_type': 34, 'server_id': 222}
+        return None
+
+    md.db.get_message_row = _voice_row
     outp = md.download_voice('wxid_a', 1, save_dir=md.save_dir)
     got = open(outp, 'rb').read() if outp else b''
     check("音频落盘且字节一致", outp is not None and got == b'SILKDATA',
@@ -1324,6 +1332,12 @@ def t_voice() -> None:
           md.download_voice('wxid_a', 2, save_dir=md.save_dir) is None)
     check("消息行缺失时返回 None 而不是抛",
           md.download_voice('wxid_a', 3, save_dir=md.save_dir) is None)
+    check("不传时 media 不带 shard（旧调用形状不变）",
+          seen_shard[-1] is None, repr(seen_shard[-1]))
+    md.download_voice('wxid_a', 1, save_dir=md.save_dir,
+                  shard='message__message_3.db')
+    check("download_voice 把 shard 透传给 db（跨分片同号才能钉死）",
+          seen_shard[-1] == 'message__message_3.db', repr(seen_shard[-1]))
     for fn in os.listdir(md.save_dir):
         _os.remove(_os.path.join(md.save_dir, fn))
     _os.rmdir(md.save_dir)
@@ -1584,7 +1598,7 @@ def t_image() -> None:
         class FakeDB:
             account_dir = d
 
-            def get_message_row(self, u, lid, local_type=None):
+            def get_message_row(self, u, lid, local_type=None, shard=None):
                 return {"local_type": 3, "create_time": 1, "sort_seq": 9,
                         "packed_info": MD5.encode(), "content": b''}
         md.db = FakeDB()
@@ -1644,7 +1658,7 @@ def t_image() -> None:
     class NoRow:
         account_dir = '.'
 
-        def get_message_row(self, u, lid, local_type=None):
+        def get_message_row(self, u, lid, local_type=None, shard=None):
             return None
     mdr = MediaDownloader.__new__(MediaDownloader)
     mdr.db = NoRow()
@@ -1652,7 +1666,7 @@ def t_image() -> None:
           mdr.image_status('x', 1)['reason'] == 'no_message_row')
 
     class NoMd5(NoRow):
-        def get_message_row(self, u, lid, local_type=None):
+        def get_message_row(self, u, lid, local_type=None, shard=None):
             return {"local_type": 3, "create_time": 1, "packed_info": b'', "content": '文本'}
     mdn = MediaDownloader.__new__(MediaDownloader)
     mdn.db = NoMd5()
@@ -2731,7 +2745,7 @@ def t_image() -> None:
         def _sender_id_index(self):
             return dict(self._index)
 
-        def get_message_row(self, u, lid, local_type=None):
+        def get_message_row(self, u, lid, local_type=None, shard=None):
             return {"local_type": 3, "create_time": 1, "sort_seq": 50,
                     "sender_id": self.sender, "packed_info": MD5.encode(),
                     "content": b""}

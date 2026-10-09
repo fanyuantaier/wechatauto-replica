@@ -883,7 +883,8 @@ class MediaDownloader:
             f.write(data)
         return out
 
-    def image_status(self, user: str, local_id: int, verify: bool = False) -> dict:
+    def image_status(self, user: str, local_id: int, verify: bool = False,
+                     shard: Optional[str] = None) -> dict:
         """一条图片消息在本机的副本情况——让「只要原图」的调用方不必靠猜。
 
         Args:
@@ -903,11 +904,13 @@ class MediaDownloader:
               （实测例：某条 ``.dat`` 44,002 字节、预览图 2,961 字节，那张 ``.dat``
               仍是预览图）。本机分不出来，只有预览窗里有没有「图片原始大小」那颗键
               能回答。
+            ``shard``：把消息行里的 ``shard``（分片库文件名）原样传回，用于跨分片
+                同号时锁定那一条；不传则按 ``sort_seq`` 取最新并告警。
             ``reason`` 取值：``ok``、``no_message_row``、``not_image``、``no_md5``、
             ``no_local_copy``、``only_thumbnail``、``mid_only``、``original_partial``
             （有 ``_h.dat`` 但结构不完整，即原图下载中断）。
         """
-        row = self.db.get_message_row(user, local_id, local_type=3)
+        row = self.db.get_message_row(user, local_id, local_type=3, shard=shard)
         if not row or row.get("local_type") != 3:
             return {"local_id": local_id, "md5": None, "tiers": {},
                     "best": None, "available": False, "reason": "no_message_row"}
@@ -1064,7 +1067,8 @@ class MediaDownloader:
 
     def download_image(self, user: str, local_id: int, save_dir: Optional[str] = None,
                        aes_key: Optional[str] = None, xor_key: Optional[int] = None,
-                       tier: Optional[str] = None) -> Optional[str]:
+                       tier: Optional[str] = None,
+                       shard: Optional[str] = None) -> Optional[str]:
         """下载图片消息并解密为 jpg/png/gif，返回落盘路径。
 
         一条图片在本地最多有三档：``_h.dat`` 原图（点过「查看原图」才有）、
@@ -1087,8 +1091,10 @@ class MediaDownloader:
                 以前 ``tier=None`` 拿到压缩版时文件名不带任何标记，调用方分不清
                 自己拿到的是原图还是压缩版，只能靠大小猜——「只要原图」的调用方
                 因此要么误收、要么反复重试。
+            ``shard``：把消息行里的 ``shard``（分片库文件名）原样传回，用于跨分片
+                同号时锁定那一条；不传则按 ``sort_seq`` 取最新并告警。
         """
-        row = self.db.get_message_row(user, local_id, local_type=3)
+        row = self.db.get_message_row(user, local_id, local_type=3, shard=shard)
         if not row or row["local_type"] != 3:
             return None
         md5 = self._img_md5(row)
@@ -1708,8 +1714,12 @@ class MediaDownloader:
                 "download_status": ds, "available": reason == "ok",
                 "bytes": size, "reason": reason}
 
-    def download_voice(self, user: str, local_id: int, save_dir: Optional[str] = None) -> Optional[str]:
+    def download_voice(self, user: str, local_id: int, save_dir: Optional[str] = None,
+                       shard: Optional[str] = None) -> Optional[str]:
         """语音：media_*.db VoiceInfo.voice_data（SILK 二进制），落盘 .silk
+
+        ``shard``：把消息行里的 ``shard``（分片库文件名）原样传回，用于跨分片
+            同号时锁定那一条；不传则按 ``sort_seq`` 取最新并告警。
 
         微信按账号/时间把语音分片存到多个 media_*.db，逐个搜索直到找到。
 
@@ -1718,7 +1728,7 @@ class MediaDownloader:
         :meth:`voice_status`（单条）或 :meth:`list_voice_status`（整个会话），
         失败时这里也会把原因写进 debug 日志。
         """
-        row = self.db.get_message_row(user, local_id, local_type=34)
+        row = self.db.get_message_row(user, local_id, local_type=34, shard=shard)
         if not row or row["local_type"] != 34 or not row["server_id"]:
             wxlog.debug("语音 %s/%s 取不到：消息行缺失或没有 server_id" % (user, local_id))
             return None
@@ -1751,9 +1761,14 @@ class MediaDownloader:
                     % (user, local_id, st.get("reason"), st.get("download_status")))
         return None
 
-    def download_video(self, user: str, local_id: int, save_dir: Optional[str] = None) -> Optional[str]:
-        """视频：按 packed_info 中的 id 在 msg/video 下查找 <id>.mp4"""
-        row = self.db.get_message_row(user, local_id, local_type=43)
+    def download_video(self, user: str, local_id: int, save_dir: Optional[str] = None,
+                       shard: Optional[str] = None) -> Optional[str]:
+        """视频：按 packed_info 中的 id 在 msg/video 下查找 <id>.mp4
+
+        ``shard``：把消息行里的 ``shard``（分片库文件名）原样传回，用于跨分片
+            同号时锁定那一条；不传则按 ``sort_seq`` 取最新并告警。
+        """
+        row = self.db.get_message_row(user, local_id, local_type=43, shard=shard)
         if not row or row["local_type"] != 43:
             return None
         pi = row.get("packed_info")
@@ -1797,9 +1812,14 @@ class MediaDownloader:
             break
         return None
 
-    def download_file(self, user: str, local_id: int, save_dir: Optional[str] = None) -> Optional[str]:
-        """文件：msg/file/<YYYY-MM>/<原文件名>，原文件名来自 message_resource"""
-        row = self.db.get_message_row(user, local_id, local_type=49)
+    def download_file(self, user: str, local_id: int, save_dir: Optional[str] = None,
+                      shard: Optional[str] = None) -> Optional[str]:
+        """文件：msg/file/<YYYY-MM>/<原文件名>，原文件名来自 message_resource
+
+        ``shard``：把消息行里的 ``shard``（分片库文件名）原样传回，用于跨分片
+            同号时锁定那一条；不传则按 ``sort_seq`` 取最新并告警。
+        """
+        row = self.db.get_message_row(user, local_id, local_type=49, shard=shard)
         if not row or row["local_type"] != 49:
             return None
         name = self._file_name(row)
@@ -1873,7 +1893,8 @@ class MediaDownloader:
                               aes_key: Optional[str] = None, xor_key: Optional[int] = None,
                               timeout: float = 30.0, chat_name: Optional[str] = None,
                               min_bytes: int = 1024, scroll: bool = True,
-                              max_scrolls: int = 6) -> Optional[str]:
+                              max_scrolls: int = 6,
+                              shard: Optional[str] = None) -> Optional[str]:
         """要这条图片的**原件 ``_h.dat``**：本机没有就一定驱动界面去下载。
 
         一条图片在本地最多三档，但**别把 ``.dat`` 当"完整图"**：
@@ -1907,10 +1928,13 @@ class MediaDownloader:
             本机三档的实际情况随时可以用 :meth:`image_status` 查到（``best`` 是本地最高
             一档，但 ``best == 'mid'`` **不代表那就是完整图** —— 见上面 ``.dat`` 的说明）。
 
+            ``shard``：把消息行里的 ``shard``（分片库文件名）原样传回，用于跨分片
+                同号时锁定那一条；不传则按 ``sort_seq`` 取最新并告警。
+
             「本机只有 ``.dat``」不是提前返回的理由：那条一路都会走界面；只有本机已经有
             ``_h.dat`` 时才跳过界面（那种点也不需要点）。
         """
-        row = self.db.get_message_row(user, local_id, local_type=3)
+        row = self.db.get_message_row(user, local_id, local_type=3, shard=shard)
         if not row or row["local_type"] != 3:
             wxlog.warning("原图取不到：消息 %s/%s 不是图片行" % (user, local_id))
             return None
@@ -2208,16 +2232,19 @@ class MediaDownloader:
         """按消息类型自动分发：3 图片 / 34 语音 / 43 视频 / 49 文件。
 
         跨分片下 local_id 可能对应多类型，逐个尝试下载直到成功。
+        分发时会带上候选行的 ``shard``，所以拿到的是候选行本身而不是别的分片的同号行。
         """
         rows = self.db.get_message_rows_for_media(user, local_id)
         for row in rows:
             t = row["local_type"]
+            # 带上候选行的 shard：同号跨分片时不指定分片就会取到别的那一条
+            sd = row.get("shard") or None
             if t == 3:
-                return self.download_image(user, local_id, save_dir)
+                return self.download_image(user, local_id, save_dir, shard=sd)
             if t == 34:
-                return self.download_voice(user, local_id, save_dir)
+                return self.download_voice(user, local_id, save_dir, shard=sd)
             if t == 43:
-                return self.download_video(user, local_id, save_dir)
+                return self.download_video(user, local_id, save_dir, shard=sd)
             if t == 49:
-                return self.download_file(user, local_id, save_dir)
+                return self.download_file(user, local_id, save_dir, shard=sd)
         return None
