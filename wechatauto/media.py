@@ -790,13 +790,12 @@ class MediaDownloader:
     def _sent_by_self(self, row) -> bool:
         """这条消息是不是本机账号自己发的。
 
-        ``real_sender_id`` 是 ``message_resource.db`` 里 ``SenderName2Id`` 的 rowid，
-        **本机账号落在哪个 rowid 不是一定的**：代码里原本写死 ``== 2``（1.1.8 从
-        别人那台机器带过来的取值），本机实测自己是 1——文件传输助手 400 条消息
-        全是 ``sender_id=1``，而 ``SenderName2Id`` 里解析成本机 wxid 的 rowid 也是 1，
-        ``2`` 反而是某个常联系的好友（图片消息里有 512 条）。写错这一条的代价很直接：
-        自己发的图被当成别人发的，先去点左边那块，永远点不中气泡，看起来就是
-        「我发的图片提示找不到原图」。
+        ``real_sender_id`` 是**消息所在分片** ``Name2Id`` 的 rowid，db 层已按那一片
+        解析成 ``sender_username``（issue #34）。本机账号在 message_0/1/2.db 里的
+        rowid 实测分别是 **2/4/1**——所以任何「编号 N 就是自己」的硬编码都会在部分
+        分片里指到别人身上（写死 ``== 2`` 是 1.1.8 从别人那台机器带过来的取值）。
+        代价很直接：自己发的图被当成别人发的，先去点左边那块，永远点不中气泡，
+        看起来就是「我发的图片提示找不到原图」。
         """
         sid = row.get("sender_id")
         if sid is None:
@@ -808,12 +807,22 @@ class MediaDownloader:
         own = ""
         try:
             own = (getattr(self.db, "wxid", "") or "").strip()
-            who = self.db._sender_id_index().get(sid)
         except Exception:
-            who = None
+            own = ""
+        who = str(row.get("sender_username") or "").strip()
+        if not who:
+            # 窄查询回来的行（图片/语音列表）没带解析结果：按那一行自己的分片再解一次
+            try:
+                who = self.db.sender_username(row.get("shard") or "", sid)
+            except Exception:
+                who = ""
         if own and who:
             return who == own
-        return sid == 1                  # 索引没覆盖（多库账号）时兜底：自己一般是 1
+        # 解析不到就按「不是本机发的」处理，不再猜编号——猜错的代价是选错气泡锚点边，
+        # 而这里返回 True 的分支还会额外要求原图档位，猜成自己反而更容易误判。
+        wxlog.debug("发送者解析不出来（shard=%s sid=%s），按非本机发送处理",
+                    row.get("shard"), sid)
+        return False
 
     # 预览窗的顶层形状实测有两种（同一台机、同一个微信版本）：
     #   ① 桌面的直接子节点就是 ``mmui::PreviewWindow``（Name 是 'Weixin'）；

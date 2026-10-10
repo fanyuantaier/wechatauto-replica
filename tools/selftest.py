@@ -1092,10 +1092,17 @@ def t_sender() -> None:
           repr(m3.sender_wxid))
     check("兜底出来的 wxid 一样能换成昵称", m3.sender == '阿Q', m3.sender)
 
-    m4 = _db_row_to_message(row(sender_id=2, type='文本', content='我发的'),
+    m4 = _db_row_to_message(row(sender_id=2, sender_username='self_x',
+                                type='文本', content='我发的'),
                             FakeChat('群A'), 'self_x', db)
     check("自己发的消息 wxid 给真实 self_wxid，而不是常量 2",
           m4.attr == 'self' and m4.wxid == 'self_x', repr(m4.wxid))
+    m5 = _db_row_to_message(row(sender_id=2, sender_username='wxid_other',
+                                type='文本', content='他发的'),
+                            FakeChat('群A'), 'self_x', db)
+    check("同一个编号在另一片解析成别人时判成对方（issue #34 的错位本体）",
+          m5.attr == 'friend' and m5.wxid == 'wxid_other',
+          "%s %r" % (m5.attr, m5.wxid))
 
     print("[sender] 拿不到 db / 昵称查询炸了都不能打断回调")
     m5 = _db_row_to_message(row(sender_username='wxid_p'), FakeChat('群A'), None, None)
@@ -1149,9 +1156,12 @@ def t_sender() -> None:
     src = open(os.path.join(here, "wechatauto", "db.py"), encoding="utf-8").read()
     check("不再拿数字 rowid 去查 contact.username",
           'get_nickname(str(sender_id))' not in src)
-    check("sender_username 只认 SenderName2Id 的结果",
-          src.count('self._sender_id_index().get(int(sender_id), "")') == 2,
-          "%d 处行构造" % src.count('self._sender_id_index().get(int(sender_id), "")'))
+    check("sender_username 只认**本分片 Name2Id**（错表入口已删，issue #34）",
+          '_sender_id_index' not in src and 'SELECT rowid, user_name FROM SenderName2Id' not in src,
+          "db.py 里 SenderName2Id 残留 %d 处" % src.count('SenderName2Id'))
+    check("发送者解析都带着分片映射（不是全局一张表）",
+          src.count('self._shard_maps(tables)') >= 2,
+          "%d 处" % src.count('self._shard_maps(tables)'))
 
     wsrc = open(os.path.join(here, "wechatauto", "wx.py"), encoding="utf-8").read()
     i = wsrc.find('_AllMessageChat(\n')
@@ -2742,13 +2752,16 @@ def t_image() -> None:
             self.sender, self.wxid = sender, own
             self._index = dict(index or {})
 
-        def _sender_id_index(self):
-            return dict(self._index)
+        def sender_username(self, shard, sender_id):
+            # 真实现按「行所在分片」的 Name2Id 解析；index 就是那一片的映射
+            return self._index.get(sender_id, "")
 
         def get_message_row(self, u, lid, local_type=None, shard=None):
             return {"local_type": 3, "create_time": 1, "sort_seq": 50,
                     "sender_id": self.sender, "packed_info": MD5.encode(),
-                    "content": b""}
+                    "content": b"",
+                    "sender_username": self._index.get(self.sender, ""),
+                    "shard": shard or "message__message_0.db"}
 
         def get_messages(self, user, limit=20, offset=0):
             # 降序：让 db_seq 非空，否则函数根本不会去调 _locate_image_row
@@ -2888,20 +2901,28 @@ def t_image() -> None:
           plans and plans[-1] > 0, str(plans))
     clicks.clear()
     smoke(2, chat="显示名")
-    check("sender_id=2 不再当成「自己发的」（本机实测 2 是某个常联系的好友，512 条图）",
+    check("解析不出发送者时不猜「编号 2 就是自己」（issue #34：2 在别的分片是好友）",
           clicks and clicks[0][0] == 777, str(clicks[:2]))
     clicks.clear()
-    smoke(1, chat="显示名")
-    check("自己发的（sender_id=1，文件传输助手 400 条全是它）：先点右边 x=2753",
+    smoke(1, chat="显示名", own="wxid_me", index={1: "wxid_me"})
+    check("本分片把 sid=1 解析成自己 → 先点右边 x=2753",
+          clicks and clicks[0][0] == 2753, str(clicks[:2]))
+    clicks.clear()
+    smoke(2, chat="显示名", own="wxid_me", index={2: "wxid_me"})
+    check("同一个编号 2 在另一片解析成自己时也该点右边（跟编号无关，跟分片走）",
           clicks and clicks[0][0] == 2753, str(clicks[:2]))
     clicks.clear()
     smoke(7, chat="显示名", own="wxid_me", index={7: "wxid_me", 1: "wxid_other"})
-    check("按 SenderName2Id 解析判「是不是我发的」，不写死常数（别人那台机器 rowid 是 7）",
+    check("按**本分片 Name2Id** 解析判「是不是我发的」，不写死常数（别人那台机器 rowid 是 7）",
           clicks and clicks[0][0] == 2753, str(clicks[:2]))
     clicks.clear()
     smoke(1, chat="显示名", own="wxid_me", index={7: "wxid_me", 1: "wxid_other"})
     check("解析出来是别人就当别人（哪怕 sender_id==1）",
           clicks and clicks[0][0] == 777, str(clicks[:2]))
+    clicks.clear()
+    smoke(9, chat="显示名", own="wxid_me", index={9: "wxid_me"})
+    check("行里没带解析结果时，媒体层会按 shard 再解一次（不回落到别的表）",
+          clicks and clicks[0][0] == 2753, str(clicks[:2]))
     check("行中心取的是那一行的中线", clicks and clicks[0][1] == 700 + 123, str(clicks[:1]))
     chatwith.clear()
     smoke(None, chat="别的会话")

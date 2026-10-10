@@ -13,7 +13,7 @@ Windows-only automation library for the **WeChat 4.x desktop client** (not web).
 - **Send / interact** = `guia.py` (coordinate + WinRT OCR, clipboard+Ctrl+V input) and `uia_driver.py` (hot-activates the Qt accessibility gate byte inside Weixin.dll to materialize the otherwise-hidden `mmui::*` UIA tree). `wx.py` `WeChat`/`Chat` dispatch between DB and GUI.
 - `wechatauto.wx.Listener` is a backwards-compat abstract stub; the real listener is `wechatauto.db.Listener` (per-chat worker threads, watermark advanced by `sort_seq`).
 - Moments: `MomentDB` reads `sns.db`; **posting Moments is deliberately dropped**; like/comment go through UIA only (`WeChat.Moment`, which is `None` without a hot-activated tree).
-- `sender_id == 2` means self. Message type codes are in `db.MSG_TYPE_NAMES` (1 text, 3 image, 34 voice, 43 video, 47 emoji, 49 file).
+- `real_sender_id` is a rowid into **the row's own shard** `Name2Id` table (`message_N.db`) — *not* `message_resource.db`'s `SenderName2Id`. The same number is a different person in another shard, and the local account's rowid differs per shard (measured 2 / 4 / 1). `db.py` resolves it per shard into `sender_username`; never compare the number against a constant (issue #34). Message type codes are in `db.MSG_TYPE_NAMES` (1 text, 3 image, 34 voice, 43 video, 47 emoji, 49 file).
 
 ## State/cache files (the reset knob for "it worked yesterday")
 - `%TEMP%\wechatauto_db\<account>\keys.json` — extracted DB keys (auto re-extracted on re-login).

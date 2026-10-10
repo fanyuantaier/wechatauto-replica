@@ -1757,6 +1757,59 @@ class WeChatDB:
             return ""
         return os.path.basename(row[2] or "") if row and row[2] else ""
 
+    def _name2id_map(self, conn: sqlite3.Connection) -> Dict[int, str]:
+        """本分片的 ``real_sender_id`` 命名空间：``Name2Id.rowid -> username``。
+
+        ``real_sender_id`` 是**消息所在分片**那张 ``Name2Id`` 的 rowid，不是
+        ``message_resource.db.SenderName2Id`` 的 rowid（issue #34）。同一个数字在
+        两张表里、在不同分片里都是不同的人：本机实测自己账号在 message_0/1/2.db 的
+        rowid 分别是 2/4/1，所以「编号 2 = 自己」这类硬编码只在其中一片成立。
+        """
+        try:
+            return {int(rid): (u or "") for rid, u in conn.execute(
+                "SELECT rowid, user_name FROM Name2Id")}
+        except sqlite3.Error:
+            return {}
+
+    def _shard_maps(self, tables) -> Dict[str, Dict[int, str]]:
+        """本次查询涉及的分片各自的发送者映射：``{分片名: {rowid: username}}``。
+
+        必须在连接还开着的时候取（``_run_msg_query`` 收尾就 close 了），所以由各
+        查询方法在同一个 build 回调里一并返回，跟随结果一起交给 :meth:`_msg_row_to_dict`。
+        """
+        out: Dict[str, Dict[int, str]] = {}
+        for conn, _ in tables:
+            lab = self._shard_label(conn)
+            if lab and lab not in out:
+                out[lab] = self._name2id_map(conn)
+        return out
+
+    def sender_username(self, shard: str, sender_id) -> str:
+        """按分片自己的 ``Name2Id`` 把 ``real_sender_id`` 换成 username。
+
+        给「行已经离开查询上下文」的调用方兜底（媒体层拿着一条行单独判断发送者）；
+        解析不到就返回空串——**不回落到别的库去猜**，那正是 issue #34 的名称错位。
+
+        Args:
+            shard: 消息行里的 ``shard`` 字段（解密缓存库名，如 ``message__message_3.db``）。
+            sender_id: 消息行的 ``real_sender_id``。
+        """
+        if not shard or sender_id in (None, ""):
+            return ""
+        try:
+            sid = int(sender_id)
+        except (TypeError, ValueError):
+            return ""
+        for rel in self._message_dbs():
+            if rel.replace(os.sep, "__") != shard:
+                continue
+            conn = self._open(rel)
+            try:
+                return self._name2id_map(conn).get(sid, "")
+            finally:
+                conn.close()
+        return ""
+
     def _shard_rows(self, tables, sql_ext, params=(), order_ext="", per_shard_limit=None):
         """跨分片执行统一 SELECT，返回合并后的 sqlite3.Row 列表（调用方后续排序）。
 
@@ -1823,16 +1876,21 @@ class WeChatDB:
         if limit <= 0 or offset < 0:
             return []
         cap = limit + offset
-        rows = self._run_msg_query(
+        got = self._run_msg_query(
             user,
-            lambda tables: self._shard_rows(
-                tables, "", order_ext=self._MSG_ORDER_DESC, per_shard_limit=cap,
+            lambda tables: (
+                self._shard_rows(
+                    tables, "", order_ext=self._MSG_ORDER_DESC, per_shard_limit=cap),
+                self._shard_maps(tables),
             ),
         )
+        if not got:
+            return []
+        rows, maps = got
         if not rows:
             return []
         rows.sort(key=lambda r: r["sort_seq"], reverse=True)
-        return [self._msg_row_to_dict(r) for r in rows[offset:offset + limit]]
+        return [self._msg_row_to_dict(r, maps) for r in rows[offset:offset + limit]]
 
     def get_voice_rows(self, user: str, limit: int = 500,
                        local_id: Optional[int] = None) -> List[dict]:
@@ -2006,9 +2064,12 @@ class WeChatDB:
         def _build(tables):
             if shard:
                 tables = [t for t in tables if self._shard_label(t[0]) == shard]
-            return self._shard_rows(tables, sql, tuple(params))
+            return (self._shard_rows(tables, sql, tuple(params)),
+                    self._shard_maps(tables))
 
-        row = self._run_msg_query(user, _build)
+        got = self._run_msg_query(user, _build)
+        row = got[0] if got else None
+        maps = got[1] if got else {}
         if not row:
             if shard:
                 self._warn_once(("shard-miss", user, local_id, shard),
@@ -2026,8 +2087,13 @@ class WeChatDB:
         row = row[0]
         sender_id = row["real_sender_id"]
         sender_username = ""
-        if sender_id and sender_id != 2:
-            sender_username = self._sender_id_index().get(int(sender_id), "")
+        if sender_id:
+            # 同 :meth:`_msg_row_to_dict`：按本行所在分片的 Name2Id 解析
+            try:
+                sender_username = ((maps or {}).get(
+                    _row_get(row, "shard", "") or {}) or {}).get(int(sender_id), "") or ""
+            except (TypeError, ValueError):
+                sender_username = ""
         return {
             "local_id": row["local_id"],
             "local_type": row["local_type"],
@@ -2070,20 +2136,25 @@ class WeChatDB:
         稳定合并（先分片顺序），与旧实现逐条一致。
         """
         want = max(0, int(limit))
-        rows = self._run_msg_query(
+        got = self._run_msg_query(
             user,
-            lambda tables: self._shard_rows(
-                tables, "WHERE sort_seq > ?",
-                (since_seq,),
-                order_ext=self._MSG_ORDER_ASC, per_shard_limit=want,
+            lambda tables: (
+                self._shard_rows(
+                    tables, "WHERE sort_seq > ?",
+                    (since_seq,),
+                    order_ext=self._MSG_ORDER_ASC, per_shard_limit=want),
+                self._shard_maps(tables),
             ),
         )
+        if not got:
+            return []
+        rows, maps = got
         if not rows:
             return []
         rows.sort(key=lambda r: r["sort_seq"])
-        return [self._msg_row_to_dict(r) for r in rows[:want]]
+        return [self._msg_row_to_dict(r, maps) for r in rows[:want]]
 
-    def _msg_row_to_dict(self, r) -> dict:
+    def _msg_row_to_dict(self, r, maps: Optional[Dict[str, Dict[int, str]]] = None) -> dict:
         content = r["message_content"]
         mtype = WeChatDB._msg_type_name(r["local_type"])
         if isinstance(content, bytes):
@@ -2103,11 +2174,15 @@ class WeChatDB:
                     content = cc_text
         sender_id = r["real_sender_id"]
         sender_username = ""
-        if sender_id and sender_id != 2:
-            # SenderName2Id 里没有就留空：以前这里拿数字 rowid 去查
-            # contact.username，永远查不到，get_nickname 又把输入原样返回，
-            # 于是 sender_username 里会混进「看起来像用户名的纯数字」。
-            sender_username = self._sender_id_index().get(int(sender_id), "")
+        if sender_id:
+            # 按**本行所在分片**的 Name2Id 解析（issue #34：以前拿
+            # message_resource.SenderName2Id 解析，同一个数字解析成无关的人）。
+            # 解析不到就留空，不拿别的库的编号猜。
+            try:
+                mp = (maps or {}).get(_row_get(r, "shard", "") or {}) or {}
+                sender_username = mp.get(int(sender_id), "") or ""
+            except (TypeError, ValueError):
+                sender_username = ""
         return {
             "local_id": r["local_id"],
             "type": mtype,
@@ -2493,47 +2568,37 @@ class WeChatDB:
             break
         return idx
 
-    def _sender_id_index(self) -> Dict[int, str]:
-        """消息表 real_sender_id(数字) → 用户名，来自 message_resource.SenderName2Id"""
-        if hasattr(self, '_sender_id_cache') and self._sender_id_cache is not None:
-            return self._sender_id_cache
-        idx: Dict[int, str] = {}
-        for rel, path, _ in self._db_files:
-            if os.path.basename(path) != "message_resource.db":
-                continue
-            conn = self._open(rel)
-            try:
-                for rid, u in conn.execute(
-                    "SELECT rowid, user_name FROM SenderName2Id"
-                ):
-                    if u:
-                        idx[int(rid)] = u
-            finally:
-                conn.close()
-            break
-        self._sender_id_cache = idx
-        return idx
-
     def nickname_map(self, refresh: bool = False) -> Dict[str, str]:
         """``username(wxid) -> 备注或昵称`` 的映射，带进程内缓存。
 
         监听回调里每条消息都要把发送者 wxid 换成能看的名字，逐条查 contact.db 太贵；
-        缓存策略与 :meth:`_sender_id_index` 一致（微信运行期间昵称基本不变）。
+        微信运行期间昵称基本不变，所以进程内缓存一次。
         需要拿最新值时传 ``refresh=True``。
         """
         if refresh or getattr(self, '_nick_cache', None) is None:
             self._nick_cache = self._nickname_index()
         return self._nick_cache
 
-    def _resolve_sender(self, sender_id, sender_index, nicks, self_nick) -> str:
-        if sender_id in (2, "2"):
+    def _resolve_sender(self, sender_id, maps, shard, nicks, self_nick,
+                        own_wxid: str = "") -> str:
+        """``real_sender_id`` → 可显示名字，按**消息所在分片**的 Name2Id 解析。
+
+        issue #34 的两处硬假设都错过：编号 2 不一定是自己（本机各分片里自己账号的
+        rowid 实测是 2/4/1），而全局 ``SenderName2Id`` 里同一个数字是另一个人。
+        解析不到返回空串（未知），不把编号本身当名字吐出去。
+        """
+        if not sender_id:
+            return ""
+        try:
+            sid = int(sender_id)
+        except (TypeError, ValueError):
+            return ""
+        who = ((maps or {}).get(shard) or {}).get(sid, "") or ""
+        if not who:
+            return ""
+        if own_wxid and who == own_wxid:
             return self_nick
-        if isinstance(sender_id, int):
-            u = sender_index.get(sender_id)
-            if u:
-                return nicks.get(u, u)
-        u = str(sender_id)
-        return nicks.get(u, u)
+        return nicks.get(who, who)
 
     @staticmethod
     def _msg_type_name(t: int):
@@ -2631,7 +2696,6 @@ class WeChatDB:
         idx = self._build_md5_index()
         nicks = self._nickname_index()
         self_info = self.get_self_info()
-        sender_index = self._sender_id_index()
         target_md5s = None
         if users:
             target_md5s = {
@@ -2663,12 +2727,15 @@ class WeChatDB:
                 if progress:
                     progress(i, len(order), name)
                 rows = []
+                maps = {}
                 for conn, table in buckets[md5]:
                     try:
+                        lab = self._shard_label(conn)
+                        maps.setdefault(lab, self._name2id_map(conn))
                         rows += conn.execute(
                             "SELECT local_id, local_type, server_id, real_sender_id, "
-                            "create_time, message_content, packed_info_data, sort_seq "
-                            "FROM %s" % table
+                            "create_time, message_content, packed_info_data, sort_seq, "
+                            "? AS shard FROM %s" % table, (lab,)
                         ).fetchall()
                     except sqlite3.DatabaseError:
                         continue
@@ -2677,12 +2744,13 @@ class WeChatDB:
                 rows.sort(key=lambda r: (r["sort_seq"], r["local_id"]))
                 if limit_per_chat:
                     rows = rows[-limit_per_chat:]
+                own_wxid = self.wxid or ""
                 msgs = [
                     dict(
                         self._export_row(r, MSG_TYPE_NAMES),
                         sender_name=self._resolve_sender(
-                            r["real_sender_id"], sender_index, nicks,
-                            self_info.get("nick_name", "我"),
+                            r["real_sender_id"], maps, _row_get(r, "shard", ""),
+                            nicks, self_info.get("nick_name", "我"), own_wxid,
                         ),
                     )
                     for r in rows

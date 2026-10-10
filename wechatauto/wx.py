@@ -241,11 +241,11 @@ def _db_row_to_message(row: dict, chat: 'Chat', self_wxid: str = None,
                        db=None) -> 'Message':
     """把 db.py 的消息行转换为现有 Message 子类实例。
 
-    direction 判定：``sender_id == 2`` 视为自己（与 guia 发送校验一致），
-    也可用 self_wxid 比对兜底。
+    direction 判定：只认「db 解析出来的发送者 username == 本机 wxid」。
 
-    发送者身份：``real_sender_id`` 是 ``message_resource.db`` 里 ``SenderName2Id``
-    的 rowid，db 层已经把它换成真 wxid 放在 ``sender_username``，但老代码既没往下传，
+    发送者身份：``real_sender_id`` 是**消息所在分片** ``Name2Id`` 的 rowid，db 层按
+    那一片把它换成真 wxid 放在 ``sender_username``（issue #34：以前拿
+    ``message_resource.db`` 的 ``SenderName2Id`` 解析，同一个数字解析成无关的人），但老代码既没往下传，
     ``msg.wxid`` 存的又还是那个数字，于是调用方只能靠文本消息正文里的 ``wxid_xxx:\\n``
     前缀刮发送者——图片/语音/文件这些类型没有前缀，就彻底拿不到是谁发的。现在：
     ``msg.sender_wxid`` 给真实 wxid（解析不到时退回正文前缀，再退回那个数字，
@@ -262,7 +262,15 @@ def _db_row_to_message(row: dict, chat: 'Chat', self_wxid: str = None,
     if isinstance(content, bytes):
         content = WeChatDB._friendly_content(content, mtype)
     sender_id = row.get('sender_id')
-    is_self = sender_id == 2 or bool(self_wxid and str(sender_id) == str(self_wxid))
+    sender_wxid = str(row.get('sender_username') or '').strip()
+    if sender_wxid.isdigit():
+        sender_wxid = ''          # 1.2.4 之前兜底遗留：把数字 rowid 冒充成了用户名
+    if not sender_wxid:
+        sender_wxid = _extract_group_sender(content)   # 正文前缀仍然更准的场景
+    # 「编号 2 就是自己」只在**某些分片**成立：同一账号在 message_0/1/2.db 的
+    # Name2Id rowid 实测是 2/4/1（issue #34），写死会把自己发的消息判成对方发的。
+    is_self = bool(self_wxid and (sender_wxid == self_wxid
+                                  or str(sender_id) == str(self_wxid)))
 
     ctrl = _DBMessageControl(content, row.get('local_id'))
     parent = _DBMessageParent(chat)
@@ -278,12 +286,6 @@ def _db_row_to_message(row: dict, chat: 'Chat', self_wxid: str = None,
     msg.sort_seq = row.get('sort_seq')
     msg.create_time = row.get('create_time')
     msg.attr = 'self' if is_self else 'friend'
-
-    sender_wxid = str(row.get('sender_username') or '').strip()
-    if sender_wxid.isdigit():
-        sender_wxid = ''          # 1.2.4 之前兜底遗留：把数字 rowid 冒充成了用户名
-    if not sender_wxid:
-        sender_wxid = _extract_group_sender(content)   # 正文前缀仍然更准的场景
 
     msg.sender_wxid = sender_wxid
     msg.wxid = sender_wxid or (self_wxid if is_self else sender_id)
