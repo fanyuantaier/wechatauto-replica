@@ -17,7 +17,7 @@
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.2.6 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13)
+> **Current version:** 1.2.6.1 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13)
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -217,6 +217,20 @@ Runnable demo: `python -m wechatauto.demo_moments_interact [--like N | --unlike 
 - Performance: parallel export / first-scan, incremental memory-scan cache
 
 ## 📝 Changelog
+
+### v1.2.6.1 (2026-10-10)
+
+- ⚠️ **Important fix: group messages credited the sender to an unrelated contact — `real_sender_id` must be resolved through the `Name2Id` table of the shard the row lives in.** ([issue #34](https://github.com/fanyuantaier/wechatauto-replica/issues/34))
+  - Symptom (found by a user in real use): sender names come out wrong, showing an unrelated contact or a group name.
+  - Cause 1 (wrong table for the id space): `real_sender_id` is a rowid into **the `Name2Id` table of the `message_N.db` shard that holds the row**, while the code resolved it against `SenderName2Id` in `message_resource.db`. The two numbering spaces are unrelated, so the same number is a different person.
+  - Cause 2 (the hard-coded "id 2 means me" is false): on this machine the local account sits at rowid **2/4/1** in `message_0/1/2.db` respectively, so `== 2` only holds in one of them — and the "fall back to 1 when nothing resolves" rule added in 1.2.4 is wrong on the other two.
+  - Oracle (depends on no id table): WeChat writes the sender itself as a `sender:` prefix inside group text rows. Across 12 groups and 3662 comparable rows: **shard-based resolution matched 3662/3662, the old global table matched 0** (3656 attributed to someone else, 6 unresolved). All 856 文件传输助手 rows were sent from this machine: the new path returns the local wxid for 855 of them (the remaining row really is sent by `filehelper` itself), while the old path attributed **639** of them to a frequent contact or to a group.
+  - **Scope: every release from v1.0.0 through v1.2.6** (`_sender_id_index()`, which reads the wrong table, is present in the initial commit; the earliest tagged 1.0.3 already has it). What it touched widened over time: `export_history`'s `sender_name` always used it, `get_messages` / listener `sender_username` since v1.1.8, and "who sent this non-text group message" since v1.2.4.1.
+  - Fix: the per-shard `Name2Id` is now fetched together with the rows (`_name2id_map()` / `_shard_maps()`), and `_msg_row_to_dict`, `get_message_row` and the export-side `_resolve_sender` look the id up in the map of that row's `shard`; `_sender_id_index()` is deleted; new public `WeChatDB.sender_username(shard, sender_id)`; `wx._db_row_to_message` and `MediaDownloader._sent_by_self` now decide "is this mine" by comparing the resolved username with the local wxid, with no `sender_id == 2` and no "fall back to 1". When nothing resolves the field stays an empty string (unknown) instead of guessing from another database — exactly what the report asked for.
+  - Behaviour change: `sender_username` used to be populated for almost every row (often wrongly); now about **0.2% (129 of 60243 rows, concentrated in one shard)** are empty; the same `sender_id` may legitimately resolve to a different person in another shard; and when it cannot be resolved `_sent_by_self` treats the row as not-mine and logs a debug line.
+  - Tests: new `tools/test_sender_namespace.py`, **36 checks** — the two-shard fixture deliberately maps the same number to different people in each shard and collides the row ids, so the assertions can only pass if resolution follows the row's shard; includes a **negative control** (reverting to "both shards share one global table" turns `sid=2` into the same stranger in both) and a live section requiring 文件传输助手 senders ⊆ {local account, `filehelper`} with ≥95% local, plus zero disagreements against the body-prefix oracle in group chats.
+
+- Everything else carries over from v1.2.6 (addressable cross-shard rows via `shard`, and shard read failures no longer treated as "this shard has no messages").
 
 ### v1.2.6 (2026-10-09)
 
@@ -518,6 +532,8 @@ Thanks to [wenjiavv](https://github.com/wenjiavv) for reporting the missing `thr
 Thanks to [dhz1145](https://github.com/dhz1145) for reporting [issue #32](https://github.com/fanyuantaier/wechatauto-replica/issues/32) — auto-detection depended on the working directory whenever WeChat's storage location was a drive root (`d:\`), complete with step-by-step reproductions, the root cause, a `GetFullPathNameW` cross-check and a fix proposal (fixed in v1.2.5.1).
 
 Thanks to [WrenZephyrSol](https://github.com/WrenZephyrSol) for the follow-up on [issue #20](https://github.com/fanyuantaier/wechatauto-replica/issues/20): on the same chat `list_message_chats()` counted 2654 messages while `get_messages()` returned 763, and they pasted a line-by-line source comparison plus a workaround that avoided `get_message_row` for downloads by carrying `server_id` over themselves. The analysis was written against v1.2.1, but following it uncovered the real hole — `local_id` is not unique across shards (fixed in v1.2.6).
+
+Thanks to [tryqylz](https://github.com/tryqylz) for reporting [issue #34](https://github.com/fanyuantaier/wechatauto-replica/issues/34) after noticing it in real use: sender names came out misaligned. Both findings held up — `_sender_id_index()` resolved `real_sender_id` through `SenderName2Id` in the resource database when the number belongs to the shard's own `Name2Id`, and `_resolve_sender()` treated id 2 as the local account unconditionally. The proposed fix (join on `Name2Id.rowid` inside the shard the row lives in, and keep an unknown state when no mapping exists rather than guessing from another database) is exactly what shipped in v1.2.6.1.
 
 ## 📄 License & Disclaimer
 

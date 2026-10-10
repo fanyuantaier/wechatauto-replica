@@ -32,7 +32,7 @@
 本项目复刻上游 wxauto 项目，目标是实现对当前微信 4.x Windows 客户端的自动化
 （读取消息、发送消息、媒体下载、朋友圈），非网页版，直接操作本机客户端。
 
-> 当前版本：1.2.6
+> 当前版本：1.2.6.1
 >
 > **兼容范围**：Windows 10/11 ｜ Python 3.9+（已在 3.12 验证）｜ 微信 **4.1.12+**（已在 4.1.15.13 验证）
 > （数据库读取路线对微信版本不敏感；坐标+OCR 发送路线依赖 4.1.12+ 自绘渲染
@@ -89,10 +89,47 @@ wechatauto 朋友圈 --me              # 看自己发的朋友圈
 > 感谢 [dhz1145](https://github.com/dhz1145) 报告 [issue #32](https://github.com/fanyuantaier/wechatauto-replica/issues/32)：微信存储位置设在盘符根（`d:\`）时自动检测依赖启动目录。附了逐条复现步骤（换启动目录的对照输出）、成因定位、`GetFullPathNameW` 的路径解析复核和修复建议（v1.2.5.1 修复）。
 >
 > 感谢 [WrenZephyrSol](https://github.com/WrenZephyrSol) 在 [issue #20](https://github.com/fanyuantaier/wechatauto-replica/issues/20) 里的复查：同一个会话他拿 `list_message_chats()` 数出 2654 条、走 `get_messages()` 只有 763 条，并贴出逐行源码对照，还给出「下载那一步不能走 `get_message_row`、要自己带 server_id 去语音库捞」的绕行方案。那份分析读的是 v1.2.1，但顺着它挖出了 `local_id` 跨分片重复这个真洞（v1.2.6 修复）。
+>
+> 感谢 [tryqylz](https://github.com/tryqylz) 报告 [issue #34](https://github.com/fanyuantaier/wechatauto-replica/issues/34)：在实际使用中发现「消息发送者编号映射错误，导致名称错位」。人工观察 + 逐处源码定位，两条都成立：`_sender_id_index()` 拿资源库的 `SenderName2Id` 解析本应属于分片 `Name2Id` 的编号，`_resolve_sender()` 把编号 2 固定当成本机账号；给出的改法建议（按消息所在分片以 `Name2Id.rowid` 关联、缺失时保留未知状态）被完整采纳（v1.2.6.1 修复）。
 
 ---
 
 ## 版本记录
+
+### v1.2.6.1（2026-10-10）
+
+- ⚠️ **重要修复：群消息的发送者会被换成无关联系人——`real_sender_id` 必须按「消息所在分片」的 `Name2Id` 解析。**（[issue #34](https://github.com/fanyuantaier/wechatauto-replica/issues/34)）
+  - 现象（实际使用中人工发现）：读取消息时发送者名称错位，显示成无关的联系人或群名称。
+  - 成因一（编号空间用错了表）：`real_sender_id` 是**消息所在分片** `message_N.db` 里
+    `Name2Id` 的 rowid，而代码一直拿 `message_resource.db` 的 `SenderName2Id` 去解析。
+    这两张表的编号互不相干，同一个数字解析成的就是另一个人。
+  - 成因二（「编号 2 就是自己」不成立）：本机自己账号在 `message_0/1/2.db` 里的 rowid
+    实测是 **2/4/1**，写死 `== 2` 只在其中那一片成立；1.2.4 为了绕开它加的
+    「查不到就兜底按 1」在另外两片上同样必错。
+  - 判据（不依赖任何 id 表）：群聊文本行的正文里，微信自己写了 `发送者:` 前缀。本机 12 个群
+    3662 条可比对的行——**按分片解析 3662 条全对，按旧的全局表 0 条对**（3656 条指到别人身上、
+    6 条落空）。文件传输助手 856 行全是这台机器发的：新口径 855 行给出本机 wxid（另 1 行的
+    发送者确实就是 `filehelper` 本身），旧口径会把其中 **639 行**说成某个常联系的好友或一个群。
+  - **影响范围：v1.0.0 ~ v1.2.6 全部版本**（按错表解析的 `_sender_id_index()` 在初始提交里就有，
+    最早带标签的 1.0.3 已含）。可见面随版本变宽：`export_history` 的 `sender_name` 一直受影响；
+    `get_messages` / 监听回调里的 `sender_username` 自 v1.1.8 起走这条解析；群消息
+    「非文本也能认出人」自 v1.2.4.1 起也是它。
+  - 修法：查询时把**每个分片自己的** `Name2Id` 一并取出（`_name2id_map()` / `_shard_maps()`），
+    `_msg_row_to_dict`、`get_message_row` 和导出的 `_resolve_sender` 都按该行的 `shard` 查本片映射；
+    删掉 `_sender_id_index()`；新增公开口 `WeChatDB.sender_username(shard, sender_id)`；
+    `wx._db_row_to_message` 的方向判定与 `MediaDownloader._sent_by_self` 改成
+    「解析出来的 username 等不等于本机 wxid」，去掉 `sender_id == 2` 和「兜底按 1」。
+    解析不到就返回空串（未知），**不回落到别的库去猜**——这正是报告的建议。
+  - 行为变化：`sender_username` 以前几乎每行都有值（其中很多是错的），现在本机 60243 行里约
+    **0.2%（129 行，集中在同一个分片）** 是空串；同一个 `sender_id` 在不同分片可以解析成不同的
+    人（这才是正确行为）；解析不到时 `_sent_by_self` 按「不是本机发的」处理并打一条 debug。
+  - 判据：新增 `tools/test_sender_namespace.py` **36 项**——两片库的 `Name2Id` 对同一个编号刻意
+    给出不同的人、行还故意撞号，所以这些断言只有「按行所在分片解析」才可能全绿；带**反向验**
+    （把命名空间退回「两片共用一张全局表」，`sid=2` 立刻变成同一个陌生人）；真机段要求文件传输
+    助手的发送者 ⊆ {本机, `filehelper`} 且 ≥95% 是本机，群聊按分片解析与正文前缀判据的不一致数
+    必须为 0。
+
+- 其余内容同 v1.2.6（跨分片消息的 `shard` 可寻址 + 分片读失败不再被静默当成「这个分片没消息」）。
 
 ### v1.2.6（2026-10-09）
 
@@ -979,7 +1016,7 @@ quick_send_file(r'D:\资料\报告.pdf', '文件传输助手')
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.2.6 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13)
+> **Current version:** 1.2.6.1 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13)
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -1170,6 +1207,20 @@ Runnable demo: `python -m wechatauto.demo_moments_interact [--like N | --unlike 
 - Performance: parallel export / first-scan, incremental memory-scan cache
 
 ## 📝 Changelog
+
+### v1.2.6.1 (2026-10-10)
+
+- ⚠️ **Important fix: group messages credited the sender to an unrelated contact — `real_sender_id` must be resolved through the `Name2Id` table of the shard the row lives in.** ([issue #34](https://github.com/fanyuantaier/wechatauto-replica/issues/34))
+  - Symptom (found by a user in real use): sender names come out wrong, showing an unrelated contact or a group name.
+  - Cause 1 (wrong table for the id space): `real_sender_id` is a rowid into **the `Name2Id` table of the `message_N.db` shard that holds the row**, while the code resolved it against `SenderName2Id` in `message_resource.db`. The two numbering spaces are unrelated, so the same number is a different person.
+  - Cause 2 (the hard-coded "id 2 means me" is false): on this machine the local account sits at rowid **2/4/1** in `message_0/1/2.db` respectively, so `== 2` only holds in one of them — and the "fall back to 1 when nothing resolves" rule added in 1.2.4 is wrong on the other two.
+  - Oracle (depends on no id table): WeChat writes the sender itself as a `sender:` prefix inside group text rows. Across 12 groups and 3662 comparable rows: **shard-based resolution matched 3662/3662, the old global table matched 0** (3656 attributed to someone else, 6 unresolved). All 856 文件传输助手 rows were sent from this machine: the new path returns the local wxid for 855 of them (the remaining row really is sent by `filehelper` itself), while the old path attributed **639** of them to a frequent contact or to a group.
+  - **Scope: every release from v1.0.0 through v1.2.6** (`_sender_id_index()`, which reads the wrong table, is present in the initial commit; the earliest tagged 1.0.3 already has it). What it touched widened over time: `export_history`'s `sender_name` always used it, `get_messages` / listener `sender_username` since v1.1.8, and "who sent this non-text group message" since v1.2.4.1.
+  - Fix: the per-shard `Name2Id` is now fetched together with the rows (`_name2id_map()` / `_shard_maps()`), and `_msg_row_to_dict`, `get_message_row` and the export-side `_resolve_sender` look the id up in the map of that row's `shard`; `_sender_id_index()` is deleted; new public `WeChatDB.sender_username(shard, sender_id)`; `wx._db_row_to_message` and `MediaDownloader._sent_by_self` now decide "is this mine" by comparing the resolved username with the local wxid, with no `sender_id == 2` and no "fall back to 1". When nothing resolves the field stays an empty string (unknown) instead of guessing from another database — exactly what the report asked for.
+  - Behaviour change: `sender_username` used to be populated for almost every row (often wrongly); now about **0.2% (129 of 60243 rows, concentrated in one shard)** are empty; the same `sender_id` may legitimately resolve to a different person in another shard; and when it cannot be resolved `_sent_by_self` treats the row as not-mine and logs a debug line.
+  - Tests: new `tools/test_sender_namespace.py`, **36 checks** — the two-shard fixture deliberately maps the same number to different people in each shard and collides the row ids, so the assertions can only pass if resolution follows the row's shard; includes a **negative control** (reverting to "both shards share one global table" turns `sid=2` into the same stranger in both) and a live section requiring 文件传输助手 senders ⊆ {local account, `filehelper`} with ≥95% local, plus zero disagreements against the body-prefix oracle in group chats.
+
+- Everything else carries over from v1.2.6 (addressable cross-shard rows via `shard`, and shard read failures no longer treated as "this shard has no messages").
 
 ### v1.2.6 (2026-10-09)
 
@@ -1467,6 +1518,8 @@ Thanks to [wenjiavv](https://github.com/wenjiavv) for reporting the missing `thr
 Thanks to [dhz1145](https://github.com/dhz1145) for reporting [issue #32](https://github.com/fanyuantaier/wechatauto-replica/issues/32) — auto-detection depended on the working directory whenever WeChat's storage location was a drive root (`d:\`), complete with step-by-step reproductions, the root cause, a `GetFullPathNameW` cross-check and a fix proposal (fixed in v1.2.5.1).
 
 Thanks to [WrenZephyrSol](https://github.com/WrenZephyrSol) for the follow-up on [issue #20](https://github.com/fanyuantaier/wechatauto-replica/issues/20): on the same chat `list_message_chats()` counted 2654 messages while `get_messages()` returned 763, and they pasted a line-by-line source comparison plus a workaround that avoided `get_message_row` for downloads by carrying `server_id` over themselves. The analysis was written against v1.2.1, but following it uncovered the real hole — `local_id` is not unique across shards (fixed in v1.2.6).
+
+Thanks to [tryqylz](https://github.com/tryqylz) for reporting [issue #34](https://github.com/fanyuantaier/wechatauto-replica/issues/34) after noticing it in real use: sender names came out misaligned. Both findings held up — `_sender_id_index()` resolved `real_sender_id` through `SenderName2Id` in the resource database when the number belongs to the shard's own `Name2Id`, and `_resolve_sender()` treated id 2 as the local account unconditionally. The proposed fix (join on `Name2Id.rowid` inside the shard the row lives in, and keep an unknown state when no mapping exists rather than guessing from another database) is exactly what shipped in v1.2.6.1.
 
 ## 📄 License & Disclaimer
 
