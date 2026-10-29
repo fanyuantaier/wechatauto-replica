@@ -24,6 +24,8 @@ from wechatauto.db import (  # noqa: E402
     PAGE_SZ,
     RESERVE_SZ,
     WeChatDB,
+    _protect_key_cache,
+    _unprotect_key_cache,
     _verify_enc_key,
 )
 from wechatauto.uia_driver import _aid_hit  # noqa: E402
@@ -152,6 +154,29 @@ class TestSplitLikeNames(unittest.TestCase):
     def test_no_prefix_still_parses(self):
         self.assertEqual(self.moment._split_like_names(self.sep.join(["张三", "李四"])),
                          ["张三", "李四"])
+
+
+class TestKeyCacheCrypto(unittest.TestCase):
+    """密钥缓存 DPAPI 封装：往返、明文兼容、损坏拒绝。"""
+
+    def test_round_trip(self):
+        payload = b'{"chat_a.db": "aabb", "chat_b.db": "ccdd"}'
+        blob = _protect_key_cache(payload)
+        if blob.startswith(b"dpapi1:"):
+            # DPAPI 可用环境：密文不等于明文，且能解回
+            self.assertNotIn(b"aabb", blob)
+            self.assertEqual(_unprotect_key_cache(blob), payload)
+        else:
+            # 无 pywin32 环境：退回明文（与旧版行为一致）
+            self.assertEqual(blob, payload)
+
+    def test_plaintext_passthrough(self):
+        old = b'{"chat.db": "eeff"}'
+        self.assertEqual(_unprotect_key_cache(old), old)
+
+    def test_corrupt_prefixed_rejected(self):
+        self.assertEqual(_unprotect_key_cache(b"dpapi1:not-base64!!"), b"")
+        self.assertEqual(_unprotect_key_cache(b"dpapi1:AAAA"), b"")
 
 
 class TestRhythmInvariants(unittest.TestCase):

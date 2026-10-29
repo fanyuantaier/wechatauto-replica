@@ -126,8 +126,10 @@ try:
     print("keys_file:", db.keys_file, "exists:", os.path.exists(db.keys_file))
     print("account:", db.account)
     if os.path.exists(db.keys_file):
-        with open(db.keys_file, encoding="utf-8") as f:
-            keys = json.load(f)
+        # 缓存可能是 DPAPI 密文（2.8.1+），经 _unprotect_key_cache 解一层
+        from wechatauto.db import _unprotect_key_cache
+        with open(db.keys_file, "rb") as f:
+            keys = json.loads(_unprotect_key_cache(f.read()).decode("utf-8"))
         print("keys cached:", len(keys))
         for k in sorted(keys):
             print("   ", k)
@@ -244,12 +246,14 @@ try:
             db._keys = {}
             if os.path.exists(db.keys_file):
                 try:
-                    with open(db.keys_file, encoding="utf-8") as f:
-                        for rel, hk in json.load(f).items():
-                            try:
-                                db._keys[rel] = bytes.fromhex(hk)
-                            except ValueError:
-                                pass
+                    from wechatauto.db import _unprotect_key_cache
+                    with open(db.keys_file, "rb") as f:
+                        raw = _unprotect_key_cache(f.read()).decode("utf-8")
+                    for rel, hk in json.loads(raw).items():
+                        try:
+                            db._keys[rel] = bytes.fromhex(hk)
+                        except ValueError:
+                            pass
                 except Exception:
                     pass
             ok_cache = sum(1 for rel, _, _ in db._db_files if db._key_works(rel))
@@ -274,12 +278,12 @@ try:
 
     # 一致性：cfg 主密钥能否复现缓存里的库密钥（判定主密钥是否有效）
     try:
-        from wechatauto.db import _pbkdf2, PAGE_SZ
+        from wechatauto.db import _pbkdf2, PAGE_SZ, _unprotect_key_cache
         cf = os.path.join(tempfile.gettempdir(), "wechatauto_db", db.account, "keys.json")
         cached = {}
         if os.path.exists(cf):
-            with open(cf, encoding="utf-8") as f:
-                cached = json.load(f)
+            with open(cf, "rb") as f:
+                cached = json.loads(_unprotect_key_cache(f.read()).decode("utf-8"))
         rel0 = next((r for r, _, _ in db._db_files if r in cached), None)
         if master and rel0:
             with open(db._db_path(rel0), "rb") as f:

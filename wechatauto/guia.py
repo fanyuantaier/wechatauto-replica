@@ -483,6 +483,7 @@ class WeChatGUI:
         self._portrait_sidebar_ratio = PORTRAIT_SIDEBAR_RATIO
         self._send_button_ratio = SEND_BUTTON_RATIO
         self.layout_profile = 'wide'      # 由 _update_layout() 按窗口比例刷新
+        self._main_title = title          # 失联重挂时按同一标题重找
         self.main_hwnd = hwnd or self._find_main_window(title)
         if not self.main_hwnd:
             raise RuntimeError('未找到微信主窗口，请确认微信已登录并运行')
@@ -923,6 +924,22 @@ class WeChatGUI:
         self._update_render_rect()
         return True
 
+    def _reacquire_main_window(self) -> bool:
+        """微信中途退出/更新重启导致 main_hwnd 失效时，重新定位并重挂。
+
+        use_window 是既有重绑原语（换窗清 UIA/输入框/会话缓存的纪律都在
+        里面），这里只补"重新找到新主窗口"这一步——此前长驻进程在这类
+        失联后永远 is_alive()==False，只能整对象重建。
+        """
+        hwnd = self._find_main_window(getattr(self, '_main_title', WX_MAIN_WIN_TITLE))
+        if not hwnd:
+            wxlog.warning('主窗口失联且未能重新定位（微信未运行？）')
+            return False
+        if not self.use_window(hwnd):
+            return False
+        wxlog.info(f'微信主窗口已重挂（新 hwnd 0x{hwnd:x}）——大概率是微信中途重启或更新')
+        return True
+
     def _find_chat_window(self, name: str) -> int:
         """在当前微信进程的所有可见窗口中，找标题含 name 前2字与“聊天记录”的独立聊天窗。"""
         u = self._input._user32
@@ -1135,6 +1152,11 @@ class WeChatGUI:
         可见性仅以主窗口句柄存活判定（不依赖截图白屏采样），
         控件定位走 UIA，不依赖桌面截图。
         """
+        if not self.is_alive():
+            # 句柄已死：微信中途退出/更新重启。先尝试重挂，失败再走原路径
+            # （对死句柄做最小化/置前只会徒劳返回 False）
+            self._last_visible_ok = False
+            self._reacquire_main_window()
         if (getattr(self, '_last_visible_ok', False)
                 and getattr(self, '_last_visible_ts', 0) > time.time() - 15
                 and self.is_alive()):
@@ -2350,14 +2372,20 @@ class WeChatGUI:
                                    box: Optional[Tuple[int, int, int, int]] = None) -> bool:
         """聚焦输入框 → 粘贴文件 → 检测草稿就绪 → 回车发送。
 
-        图片草稿为彩色像素、文件为灰色卡片。图片粘贴偶发失效，
-        采用「重新聚焦 + 重新粘贴」重试循环提升可靠性。
+        4.2.0 起真键盘 Ctrl+V 不再进入输入框（SetFocus 后硬件键盘焦点
+        不落在控件上），粘贴改走 UIA SendKeys（控件级投递，不吃前台）；
+        草稿判据用输入框 Value 读回 U+FFFC（对象替换符），替代旧的
+        彩色像素扫描——4.2.0 里那条扫描带会盖住聊天区彩色气泡恒报 True。
+        UIA 不可用时退回旧的真键盘路径（4.1.x 仍然有效）。
 
         box 可传入已探测好的输入框（连续发送附件时复用，避免重复探测）。
         """
         if not os.path.isfile(path):
             wxlog.debug(f'文件不存在：{path}')
             return False
+        edit = self._uia_edit_control()
+        if edit is not None:
+            return self._paste_attachment_and_send_uia(edit, path)
         is_image = path.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'))
         if box is None:
             box = self.get_input_box()
@@ -2385,6 +2413,64 @@ class WeChatGUI:
         self._input.key(VK_RETURN)
         rhythm.nap(1.5)
         return True
+
+    def _uia_edit_control(self):
+        """拿当前会话输入框的 UIA 控件；多开窗口不匹配或树不可用时 None。"""
+        try:
+            uia = self._get_uia()
+            if uia is None or uia._win is None:
+                return None
+            if int(uia._win.NativeWindowHandle) != self.main_hwnd:
+                return None
+            return uia._chat_input()
+        except Exception as exc:
+            wxlog.debug('读取输入框控件失败：%s', exc)
+            return None
+
+    def _paste_attachment_and_send_uia(self, edit, path: str) -> bool:
+        """UIA 通路粘贴附件并发送（4.2.0 起的主路径）。"""
+        if not self.copy_files_to_clipboard([path]):
+            return False
+        time.sleep(0.3)
+        try:
+            edit.SetFocus()
+            edit.SendKeys('{Ctrl}a{Delete}', waitTime=0.1)
+            for attempt in range(3):
+                edit.SendKeys('{Ctrl}v', waitTime=0.1)
+                draft_ok = self._uia_has_draft(edit, wait=4.0)
+                wxlog.debug(f'UIA 粘贴尝试 {attempt + 1} 草稿检测：{draft_ok}')
+                if draft_ok:
+                    break
+            else:
+                wxlog.warning('UIA 粘贴 3 次仍未检测到附件草稿，不回车')
+                return False
+        except Exception as exc:
+            wxlog.debug('UIA 粘贴投递失败：%s', exc)
+            return False
+        rhythm.gate('send-file')
+        edit.SendKeys('{Enter}', waitTime=0.1)
+        rhythm.nap(1.5)
+        return True
+
+    def _uia_has_draft(self, edit, wait: float = 4.0) -> bool:
+        """轮询输入框 Value 是否出现附件草稿标记 U+FFFC（对象替换符）。
+
+        微信把粘贴的图片/文件作为内嵌对象塞进编辑框，文本层表现为一个
+        U+FFFC；空框读回 ''。控件不暴露 Value 时返回 True（不误拦）。
+        """
+        deadline = time.time() + wait
+        last = None
+        while time.time() < deadline:
+            try:
+                val = edit.GetValuePattern().Value
+                last = val
+                if val and '\ufffc' in val:
+                    return True
+            except Exception:
+                return True
+            time.sleep(0.3)
+        wxlog.debug(f'草稿检测失败：value={last!r}')
+        return False
 
     def _input_box_has_color_draft(self, box: Optional[Tuple[int, int, int, int]] = None,
                                    wait: float = 8.0) -> bool:

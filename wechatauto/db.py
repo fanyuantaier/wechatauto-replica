@@ -22,6 +22,7 @@ import ctypes
 import glob
 import hashlib
 import hmac as hmac_mod
+import base64
 import json
 import os
 import queue
@@ -184,6 +185,41 @@ def _verify_enc_key(enc_key: bytes, page1: bytes, salt: Optional[bytes] = None) 
     hm = hmac_mod.new(mac_key, hmac_data, hashlib.sha512)
     hm.update(struct.pack("<I", 1))
     return hm.digest() == stored_hmac
+
+
+# ---------------------------------------------------------------------------
+# 密钥缓存加密（DPAPI）
+# ---------------------------------------------------------------------------
+# keys.json 曾明文落盘两处（TEMP 工作目录 + 用户目录稳定副本），谁的 SQLCipher
+# 密钥谁能解库 —— 值得按当前 Windows 用户加密。无前缀 = 旧明文缓存，读取时
+# 原样解析（兼容），下一次保存自然升级为密文；没有 pywin32 的环境保存时退回
+# 明文（与旧版行为一致，不新增失败模式）。
+
+_KEY_CACHE_PREFIX = b"dpapi1:"
+
+
+def _protect_key_cache(payload: bytes) -> bytes:
+    try:
+        import win32crypt
+        blob = win32crypt.CryptProtectData(
+            payload, "wechatauto-keys", None, None, None, 0)
+        return _KEY_CACHE_PREFIX + base64.b64encode(blob)
+    except Exception:
+        return payload
+
+
+def _unprotect_key_cache(raw: bytes) -> bytes:
+    if not raw.startswith(_KEY_CACHE_PREFIX):
+        return raw  # 旧明文缓存
+    try:
+        import win32crypt
+        blob = base64.b64decode(raw[len(_KEY_CACHE_PREFIX):])
+        _desc, payload = win32crypt.CryptUnprotectData(blob, None, None, None, 0)
+        return payload
+    except Exception:
+        # 前缀在但解不开（换用户/被拷走/损坏）：按空缓存处理，
+        # 绝不伪装成明文继续解析
+        return b""
 
 
 def _sqlite_text_factory(data: bytes):
@@ -625,15 +661,8 @@ class WeChatDB:
                 self.workdir, self.keys_file = workdir, keys_file
                 self._keys = {}
                 if os.path.exists(keys_file):     # 先用该账号已有缓存
-                    try:
-                        with open(keys_file, encoding="utf-8") as f:
-                            for rel, hexkey in json.load(f).items():
-                                try:
-                                    self._keys[rel] = bytes.fromhex(hexkey)
-                                except ValueError:
-                                    pass
-                    except Exception:
-                        pass
+                    # 走 _load_key_cache：兼容 DPAPI 密文与明文旧缓存
+                    self._keys.update(self._load_key_cache(keys_file))
                 if not any(self._key_works(rel) for rel, _, _ in self._db_files):
                     self._keys.update(self.derive_keys_from_master(master))
                 ok = sum(1 for rel, _, _ in self._db_files if self._key_works(rel))
@@ -1230,16 +1259,17 @@ class WeChatDB:
         return os.path.join(dirs[0], (account or self.account) + ".json")
 
     def _load_key_cache(self, path: str) -> Dict[str, bytes]:
-        """读一个 keys.json（只返回格式合法的条目）。"""
+        """读一个 keys.json（只返回格式合法的条目；兼容明文旧缓存）。"""
         out: Dict[str, bytes] = {}
         try:
-            with open(path, encoding="utf-8") as f:
-                for rel, hexkey in json.load(f).items():
-                    try:
-                        out[rel] = bytes.fromhex(hexkey)
-                    except (ValueError, TypeError):
-                        pass
-        except (OSError, json.JSONDecodeError):
+            with open(path, "rb") as f:
+                raw = _unprotect_key_cache(f.read())
+            for rel, hexkey in json.loads(raw.decode("utf-8")).items():
+                try:
+                    out[rel] = bytes.fromhex(hexkey)
+                except (ValueError, TypeError):
+                    pass
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             pass
         return out
 
@@ -1254,11 +1284,12 @@ class WeChatDB:
         if not self._keys:
             return
         data = {k: v.hex() for k, v in self._keys.items()}
+        blob = _protect_key_cache(json.dumps(data, indent=2).encode("utf-8"))
         try:
             os.makedirs(os.path.dirname(self.keys_file), exist_ok=True)
             tmp = self.keys_file + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
+            with open(tmp, "wb") as f:
+                f.write(blob)
             if os.path.exists(self.keys_file):
                 try:
                     with open(self.keys_file, "rb") as src, \
@@ -1274,8 +1305,8 @@ class WeChatDB:
         if sf:
             try:
                 os.makedirs(os.path.dirname(sf), exist_ok=True)
-                with open(sf, "w", encoding="utf-8") as f:
-                    json.dump(data, f, indent=2)
+                with open(sf, "wb") as f:
+                    f.write(blob)
             except OSError:
                 pass
 
