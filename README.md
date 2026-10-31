@@ -17,7 +17,7 @@
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.2.8.1 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.53)
+> **Current version:** 1.2.9 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.53)
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -232,6 +232,21 @@ the existing HWND/PID checks; closing the target does not select another account
 - Performance: parallel export / first-scan, incremental memory-scan cache
 
 ## 📝 Changelog
+
+
+### v1.2.9 (2026-10-31)
+
+- ⚠️ **Important fix ([PR #46](https://github.com/fanyuantaier/wechatauto-replica/pull/46), reported by [dhz1145](https://github.com/dhz1145), issue #45): image-key validation now uses the target ciphertext, so valid keys are no longer rejected.** The old probe picked the **first** `.dat` found in the attach cache; when that file was not a suitable V2 sample, the correct key failed to decrypt the wrong sample, got marked invalid, and `download_image()` fell into a minutes-long memory scan. `_decrypt_v2` now passes the **target's own first ciphertext block** as the probe through the whole key-resolution chain (config derivation / persisted cache / scan fallback share one target), without overwriting the shared probe (concurrent decryptions can no longer mislead each other); target-less pre-probes skip non-V2 / truncated files. Live comparison on 4.1.15.56: stock 1.2.8.1 entered scanning three times (180/22/22 s), the fix succeeded three times (extraction 76/78/70 ms). Adds `tests/test_media_key_probe.py` (10 cases).
+- **New: wxauto4-style standalone chat window — `wx.ChatWindow("Alice").SendMsg("hi")`.** Double-clicks the contact's row in the session list (on the message-preview zone; the avatar zone does not register), opens the standalone chat window, rebinds to it, and returns a `Chat` that sends inside that window; an already-open window is reused (double-clicking again closes it). Messages go through the same rhythm throttle as main-window sends. Companion `wx.CloseChatWindow(who)`: closes via Alt+F4 **only after verifying the foreground actually switched to the target window** — it retries three times and then fails explicitly, never firing Alt+F4 into whatever the user is doing.
+- **New: WeChat 4.2.0.11 compatibility** (verified item by item on a real 4.2.0.11 client, 2026-10-30/31):
+  - **Attachment paste**: 4.2.0 input boxes no longer accept a hardware-keyboard Ctrl+V (after SetFocus the keyboard focus never lands on the control), so pasting now goes through UIA SendKeys; image-draft detection reads the input box's Value for the U+FFFC object-replacement character instead of counting colored pixels (the 4.2.0 pixel scan was a constant false positive: 1046 colored pixels with no draft vs. a threshold of 30).
+  - **Moments**: 4.2.0 uses new cell class names for image posts and ads (`mmui::TimelineGridImageCell` / `TimelineAd*Cell`); the content parser whitelist covers them, and `SwitchToMoments` re-anchors the UIA root after page switches (stale references used to cause false failures).
+  - **Forwarding**: 4.2.0 message rows span the full window width with the bubble on one side, so right-clicking the row center lands on empty space — right-click position now uses the row's content centroid (`_row_content_point`, column-projection of non-background pixels).
+  - **Session locating**: after 4.2.0's narrower sidebar, the OCR scan band overlapped the chat area, letting chat titles/timestamps pose as session rows — `get_sessions` / `find_session` now filter by the name-column right edge (`sidebar_right*0.55`) and drop pure-timestamp fragments.
+  - **Preview window**: 4.2.0's preview mmui subtree self-demotes to a bare Qt shell seconds after materialization — `_preview_windows` detects the shell and re-activates automatically; `_save_once` uses `accDoDefaultAction` as its primary trigger (`Click()` is a silent no-op on 4.2.0) and presses Enter through the overwrite-confirmation dialog.
+- **New: DPAPI encryption for the key cache + main-window reacquisition.** `keys.json` (work cache and stable copy) is encrypted with `CryptProtectData` bound to the current Windows user (`dpapi1:` prefix); un-prefixed legacy plaintext caches still read fine and upgrade on next save; saving without pywin32 falls back to plaintext (no new failure mode). After WeChat quits or restarts mid-session, `ensure_visible` re-finds the main window and rebinds automatically (previously a long-lived process stayed dead with `is_alive()==False` forever).
+- **Fix: EmojiMessage scrolls the message list back to the bottom after screenshots.** Emoji locating could scroll the list into history; without scrolling back, every message the bot sends afterwards is invisible to the user ("the page scrolled up"). Rolls back even on failure; `max_scrolls` 60→8.
+- Verdict: 37 offline unit tests on the merged tree (10 key-probe from PR #46 + 3 DPAPI + the existing 24 in `test_pure`); all five offline suites green (labels 98 / forward 59 / send_verify 21 / chat_identity 21 / ocr_send_gate 26); `tools/selftest.py` 561/0; verified item by item on a real 4.2.0.11 client (text/image/file send, forwarding, Moments, standalone window, voice, labels — every write path confirmed by an independent DB read-back).
 
 ### v1.2.8.1 (2026-10-25)
 

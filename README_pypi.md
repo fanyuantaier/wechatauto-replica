@@ -49,9 +49,9 @@ discovery still selects main windows, with existing HWND/PID checks preserved.
 本项目复刻上游 wxauto 项目，目标是实现对当前微信 4.x Windows 客户端的自动化
 （读取消息、发送消息、媒体下载、朋友圈），非网页版，直接操作本机客户端。
 
-> 当前版本：1.2.7.0
+> 当前版本：1.2.9
 >
-> **兼容范围**：Windows 10/11 ｜ Python 3.9+（已在 3.12 验证）｜ 微信 **4.1.12+**（已在 4.1.15.53 验证）
+> **兼容范围**：Windows 10/11 ｜ Python 3.9+（已在 3.12 验证）｜ 微信 **4.1.12+**（已在 4.1.15.53 / 4.2.0.11 验证）
 > （数据库读取路线对微信版本不敏感；坐标+OCR 发送路线依赖 4.1.12+ 自绘渲染
 > 布局，UIA 控件树随小版本变化——4.1.15 起搜索入口改为收起式，已适配；
 > 其它小版本可能需校准 `guia.py` 布局常量与 gate RVA 表）。
@@ -114,6 +114,13 @@ wechatauto 朋友圈 --me              # 看自己发的朋友圈
 ---
 
 ## 版本记录
+
+### v1.2.9（2026-10-31）
+
+- ⚠️ **图片密钥校验修复（[PR #46](https://github.com/fanyuantaier/wechatauto-replica/pull/46)，issue #45）**：密钥验证改用本次目标的密文首块，不再错拿缓存目录首个 `.dat` 当样本——此前有效密钥会被误判无效并落入长时间内存扫描（修复后真机提取 76/78/70ms）。
+- **新增 wxauto4 式独立聊天窗**：`wx.ChatWindow("张三").SendMsg("你好")` —— 双击会话行开独立窗并自动绑定，发消息走同一条 rhythm 节流链；`wx.CloseChatWindow` 关窗（前台校验后才发 Alt+F4）。
+- **微信 4.2.0.11 兼容**：附件粘贴改 UIA SendKeys + U+FFFC 草稿判据；朋友圈新 cell 类名；转发右键按内容重心定位；会话定位右缘过滤；预览窗树退化自愈。详细清单见 [README.zh-CN](https://github.com/fanyuantaier/wechatauto-replica/blob/main/README.zh-CN.md)。
+- **密钥缓存 DPAPI 加密**（按 Windows 用户加密，旧明文缓存兼容）；主窗失联自愈；EmojiMessage 截图后滚回底部。
 
 ### v1.2.8.1（2026-10-25）
 
@@ -1072,7 +1079,7 @@ quick_send_file(r'D:\资料\报告.pdf', '文件传输助手')
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.2.8.0 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13)
+> **Current version:** 1.2.9 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13 / 4.2.0.11)
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -1263,6 +1270,13 @@ Runnable demo: `python -m wechatauto.demo_moments_interact [--like N | --unlike 
 - Performance: parallel export / first-scan, incremental memory-scan cache
 
 ## 📝 Changelog
+
+### v1.2.9 (2026-10-31)
+
+- ⚠️ **Image-key validation fix ([PR #46](https://github.com/fanyuantaier/wechatauto-replica/pull/46), issue #45)**: key validation now uses the target's own first ciphertext block instead of the first `.dat` found in the cache — a valid key used to be rejected and fall into a minutes-long memory scan (live extraction after the fix: 76/78/70 ms).
+- **New: wxauto4-style standalone chat window**: `wx.ChatWindow("Alice").SendMsg("hi")` — double-clicks the session row, opens and rebinds the standalone window, sends through the same rhythm throttle; `wx.CloseChatWindow` closes it (Alt+F4 only after the foreground is verified switched).
+- **WeChat 4.2.0.11 compatibility**: attachment paste via UIA SendKeys + U+FFFC draft detection; new Moments cell class names; forwarding right-click on the bubble centroid; session-locating edge filters; preview-window tree self-healing. Full list in the [project README](https://github.com/fanyuantaier/wechatauto-replica).
+- **DPAPI encryption for the key cache** (bound to the current Windows user, legacy plaintext caches compatible); main-window reacquisition after WeChat restarts; EmojiMessage scrolls the list back to the bottom.
 
 ### v1.2.8.1 (2026-10-25)
 
