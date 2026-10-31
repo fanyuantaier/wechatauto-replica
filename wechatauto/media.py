@@ -115,7 +115,7 @@ class MediaDownloader:
             ("%d" % cfg_dword + wxid).encode("utf-8")).hexdigest()[:16]
         return aes_key, xor_key
 
-    def _derive_cfg_key(self) -> Optional[Tuple[str, int]]:
+    def _derive_cfg_key(self, probe: Optional[bytes] = None) -> Optional[Tuple[str, int]]:
         """cfgDword 派生并验证; 优先显式注入, 否则用 db.cfg_dword(自动提取)。"""
         cfg_dword = self._cfg_dword
         if cfg_dword is None:
@@ -123,7 +123,7 @@ class MediaDownloader:
         if not cfg_dword:
             return None
         aes_key, xor_key = self.derive_image_keys(cfg_dword, self.db.wxid)
-        if self._validate_key(aes_key):
+        if self._validate_key(aes_key, probe):
             return aes_key, xor_key
         return None
 
@@ -132,25 +132,29 @@ class MediaDownloader:
     # ------------------------------------------------------------------
     def _probe_ct(self, dat_path: Optional[str] = None) -> bytes:
         """取一张 V2 图片的密文首块，作为密钥反测试样"""
-        if self._key_probe is not None:
+        if dat_path is None and self._key_probe is not None:
             return self._key_probe
         if dat_path is None:
             base = os.path.join(self.db.account_dir, "msg", "attach")
             hits = glob.glob(os.path.join(base, "*", "*", "Img", "*.dat"))
-            if not hits:
-                return b""
-            dat_path = hits[0]
-        with open(dat_path, "rb") as f:
-            head = f.read(32)
-        if head[:6] == V2_MAGIC:
-            self._key_probe = head[15:31]
         else:
-            self._key_probe = head[V1_HEADER_SZ: V1_HEADER_SZ + 16]
-        return self._key_probe
+            hits = [dat_path]
+        for path in hits:
+            try:
+                with open(path, "rb") as f:
+                    head = f.read(32)
+            except OSError:
+                continue
+            # 旧格式或未下载完整的文件不能用来否定图片 AES 密钥。
+            if head[:6] == V2_MAGIC and len(head) >= 31:
+                self._key_probe = head[15:31]
+                return self._key_probe
+        return b""
 
-    def _validate_key(self, aes_key: str) -> bool:
+    def _validate_key(self, aes_key: str, probe: Optional[bytes] = None) -> bool:
         """用真实密文首块反测密钥是否有效"""
-        probe = self._probe_ct()
+        if probe is None:
+            probe = self._probe_ct()
         if not probe:
             return False
         try:
@@ -163,14 +167,14 @@ class MediaDownloader:
     def _key_store(self) -> str:
         return os.path.join(self.db.workdir, "image_keys.json")
 
-    def _load_persisted_key(self) -> Optional[str]:
+    def _load_persisted_key(self, probe: Optional[bytes] = None) -> Optional[str]:
         try:
             with open(self._key_store(), "r", encoding="utf-8") as f:
                 saved = json.load(f)
             key = saved.get(self.db.account)
         except (OSError, ValueError, json.JSONDecodeError):
             return None
-        if key and self._validate_key(key):
+        if key and self._validate_key(key, probe):
             return key
         return None
 
@@ -245,7 +249,7 @@ class MediaDownloader:
 
         return 0x88
 
-    def _install_xor_key(self) -> int:
+    def _install_xor_key(self, probe: Optional[bytes] = None) -> int:
         """账号级单字节 XOR 密钥：cfgDword 低字节(权威) → 缩略图统计 → 0x88。
 
         缓存到 ``self._xor_key``。逐文件猜尾部只作兜底，因为带页脚的容器
@@ -253,7 +257,7 @@ class MediaDownloader:
         """
         if self._xor_key is not None:
             return self._xor_key
-        derived = self._derive_cfg_key()
+        derived = self._derive_cfg_key(probe)
         if derived:
             self._xor_key = derived[1]
         else:
@@ -263,7 +267,8 @@ class MediaDownloader:
         return self._xor_key
 
     def _scan_aes_key(self, monitor: bool = False,
-                      monitor_timeout: float = 120.0) -> Optional[str]:
+                      monitor_timeout: float = 120.0,
+                      probe: Optional[bytes] = None) -> Optional[str]:
         """扫描 Weixin.exe 内存穷举候选密钥, AES-ECB 解密探针验证。
 
         候选两类模式(YARA 思路):
@@ -271,7 +276,8 @@ class MediaDownloader:
           每候选取前 16 字节作 AES-128 key 解密探针, 明文为 JPEG SOI 命中;
         - UTF-16LE: 字母数字与 0x00 交错形式。
         """
-        probe = self._probe_ct()
+        if probe is None:
+            probe = self._probe_ct()
         if not probe:
             return None
         pids = self.db._find_weixin_pids()
@@ -423,18 +429,18 @@ class MediaDownloader:
                 return out
         raise ValueError("无法识别的图片加密格式: %s" % dat_path)
 
-    def _resolve_aes_key(self) -> Optional[str]:
+    def _resolve_aes_key(self, probe: Optional[bytes] = None) -> Optional[str]:
         """统一密钥解析：显式注入 → cfgDword派生 → 本地缓存 → 内存扫描"""
-        if self._image_key and self._validate_key(self._image_key):
+        if self._image_key and self._validate_key(self._image_key, probe):
             return self._image_key
         # 尝试cfgDword派生
-        derived = self._derive_cfg_key()
+        derived = self._derive_cfg_key(probe)
         if derived:
             return derived[0]
-        cached = self._load_persisted_key()
+        cached = self._load_persisted_key(probe)
         if cached:
             return cached
-        key = self._scan_aes_key(monitor=True)
+        key = self._scan_aes_key(monitor=True, probe=probe)
         if key:
             self._persist_key(key)
         return key
@@ -443,11 +449,15 @@ class MediaDownloader:
                     aes_key: Optional[str], xor_key: Optional[int]) -> bytes:
         from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
+        if len(data) < 31:
+            raise ValueError("V2 图片密文首块不完整")
+        # 始终验证本次目标；不覆盖共享探针，避免连续或并发解图相互误导。
+        probe = data[15:31]
         aes_size, xor_size = struct.unpack_from("<LL", data, 6)
         if xor_key is None:
-            xor_key = self._install_xor_key()
+            xor_key = self._install_xor_key(probe)
         if aes_key is None:
-            aes_key = self._resolve_aes_key()
+            aes_key = self._resolve_aes_key(probe)
             if not aes_key:
                 raise RuntimeError(
                     "无法获取图片 AES 密钥：请保持微信登录，并先在微信聊天中"
