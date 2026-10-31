@@ -1308,6 +1308,10 @@ class WeChatGUI:
         rel = (SIDEBAR_LEFT, int(self.render_h * SIDEBAR_TOP),
                self.sidebar_right, self.render_h)
         lines = self.ocr_zoomed(rel, scale=3) if zoomed else self.ocr(rel)
+        # 会话名字列的右边界：4.2.0 的 OCR 扫描框（sidebar_right，按 4.1 校准的
+        # 0.20）盖到了聊天区左缘，聊天标题（"26级…" x=539）和时间戳（x≈385）
+        # 会混进来。名字列实测 x≈204-263（wide），阈值 0.55 与 find_session 一致。
+        name_col_right = int(self.sidebar_right * 0.55)
         rows = []
         for text, x, y, w, h in lines:
             t = (text or '').strip()
@@ -1315,7 +1319,13 @@ class WeChatGUI:
                 continue
             if x < self.sidebar_right * NAME_COL_MIN_RATIO:   # 头像/图标/角标区
                 continue
+            if x > name_col_right:                            # 聊天区标题/时间戳
+                continue
             if any(k in t for k in ('搜索', '聊天', '通讯录')):
+                continue
+            # 纯时间戳/数字碎片（"00：14"、"[999+条]"）不是会话名；
+            # 4.2.0 侧栏右缘外的时间标记更容易混进 OCR 结果
+            if re.fullmatch(r'[\d０-９\s:：.\-+()\[\]]+', t):
                 continue
             rows.append({'name': t, 'x': x, 'y': y, 'w': w, 'h': h})
         return rows
@@ -1357,9 +1367,16 @@ class WeChatGUI:
         """
         u = self._input._user32
 
+        # 4.2.0 起 OCR 扫描框（sidebar_right）可能盖到聊天区左缘，聊天标题
+        # 与目标会话同名时会混进候选（实测「文件传输助手」标题 x=538 vs
+        # 侧栏名字列 x≈204-263）。会话行只在名字列，按 x 上限剔除标题区。
+        name_col_right = int(self.sidebar_right * 0.55)
+
         def _scan(zoomed: bool = False) -> Optional[Tuple[int, int]]:
             # 按 y 排序，OCR 返回顺序不可靠，保证点击视觉上正确的行
             for row in sorted(self.get_sessions(zoomed=zoomed), key=lambda r: r['y']):
+                if row['x'] > name_col_right:
+                    continue
                 if self._name_matches(row['name'], name):
                     # 行内取随机点，不每次都点正中（rhythm.point 内缩 15%，off 档回正中）
                     return rhythm.point((row['x'], row['y'],
@@ -1380,6 +1397,8 @@ class WeChatGUI:
                 # 每轮只取 y 最靠前的一个命中，避免同轮多个误配行干扰
                 for row in sorted(self.get_sessions(zoomed=zoomed),
                                   key=lambda r: r['y']):
+                    if row['x'] > name_col_right:
+                        continue
                     if self._name_matches(row['name'], name):
                         hits.append((row['y'], row['x'], row['w'], row['h']))
                         break

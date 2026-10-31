@@ -837,11 +837,17 @@ class MediaDownloader:
     _PREVIEW_TITLES = ("图片和视频",)
 
     @staticmethod
-    def _preview_windows():
+    def _preview_windows(recheck: bool = True):
         """当前所有预览窗 ``[(窗口句柄, 控件), ...]``。
 
         句柄用来分辨「新出现的」和「本来就开着的」；控件一律给 ``mmui::PreviewWindow``
         那一层（两种形状都能对齐到同一层，调用方按子树找按钮）。
+
+        4.2.0 实测：预览窗的 mmui 子树**物化后几秒内会自行退化成 Qt 空壳**
+        （主窗不受影响）——退化后这里会扫到一个没有工具栏按钮的壳。
+        ``recheck=True`` 时检测到退化就重新热激活一次主窗 gate 再扫一遍，
+        给调用方抢回几秒钟的「物化窗口期」（该窗口期内键盘事件有效、
+        鼠标/UIA 按钮触发在 4.2.0 上仍未恢复，见 download_image_original）。
         """
         import uiautomation as auto
         out = []
@@ -869,6 +875,29 @@ class MediaDownloader:
             except Exception:
                 h = id(w)
             out.append((h, inner))
+        if out and recheck:
+            # 4.2.0 退化检测：控件存在但整棵树只剩壳（没有任何命名按钮）
+            import uiautomation as auto
+            dead = True
+            for _h, ctrl in out:
+                try:
+                    for _c, _d in auto.WalkControl(ctrl, max_depth=8):
+                        if "Button" in (_c.ControlTypeName or "") \
+                                and (_c.Name or "").strip():
+                            dead = False
+                            break
+                except Exception:
+                    pass
+                if not dead:
+                    break
+            if dead:
+                try:
+                    from wechatauto.uia_driver import WeChatUIA
+                    WeChatUIA().ensure_materialized(force=True)
+                    time.sleep(0.3)
+                    return MediaDownloader._preview_windows(recheck=False)
+                except Exception:
+                    pass
         return out
 
     def _write_decrypted(self, data: bytes, stem: str, save_dir: Optional[str]) -> str:
@@ -1553,14 +1582,36 @@ class MediaDownloader:
         before = {}
         for r in roots:
             before.update(self._recent_images(r, since))
+        # 4.2.0 预览窗：Click() 不抛异常但**事件被吞、永远无效**（假成功），
+        # 所以主通道直接用 accDoDefaultAction；Click 降级为异常兜底。
+        sent = False
         try:
-            btn.Click()
+            btn.GetLegacyIAccessiblePattern().DoDefaultAction()
+            sent = True
         except Exception:
+            pass
+        if not sent:
             try:
-                btn.GetInvokePattern().Invoke()
-            except Exception as e:
-                wxlog.debug("「保存」点不动：%s", type(e).__name__)
-                return None
+                btn.Click()
+            except Exception:
+                try:
+                    btn.GetInvokePattern().Invoke()
+                except Exception as click_err:
+                    # 末路：焦点+空格（键盘通道在 4.2.0 预览窗实测有效）。
+                    try:
+                        btn.SetFocus()
+                        time.sleep(0.2)
+                        VK_SPACE = 0x20
+                        user32 = ctypes.windll.user32
+                        user32.keybd_event(VK_SPACE, 0, 0, 0)
+                        time.sleep(0.05)
+                        user32.keybd_event(VK_SPACE, 0, 2, 0)
+                        sent = True
+                    except Exception as e:
+                        wxlog.debug("「保存」点不动：%s / %s",
+                                    type(click_err).__name__, type(e).__name__)
+                        return None
+                wxlog.debug("「保存」经 4.2.0 退让通道触发（accDoDefaultAction/Space）")
         until = min(deadline, time.time() + 12.0)
         dialog_seen = False
         while time.time() < until:
@@ -1574,12 +1625,24 @@ class MediaDownloader:
                 # 点完「保存」，对话框**必须关掉**——这是唯一能证明那一下点中的是按钮的
                 # 信号。实机就点到过旁边那颗「选择文件格式」下拉框：模态框还开着、文件
                 # 根本没写，而那时目标文件要等 8 秒才判失败，看起来像「点了没反应」。
+                # 同名重跑会先弹「文件已存在，是否覆盖」确认框——焦点默认在「是」上，
+                # 直接 Enter 确认（2026-10-30 真机：4.2.0 另存框与覆盖框都吃 Enter）。
                 closed = False
                 end2 = time.time() + 4.0
+                enter_sent = 0
                 while time.time() < end2:
-                    if self._save_dialog() is None:
+                    dlg2 = self._save_dialog()
+                    if dlg2 is None:
                         closed = True
                         break
+                    if enter_sent < 2 and (dlg2 is not dlg):
+                        # 主另存框已换成第二只模态框 = 覆盖确认，Enter 放行
+                        user32k = ctypes.windll.user32
+                        user32k.keybd_event(0x0D, 0, 0, 0)
+                        time.sleep(0.05)
+                        user32k.keybd_event(0x0D, 0, 2, 0)
+                        enter_sent += 1
+                        wxlog.debug("「文件已存在」确认框，已 Enter 放行")
                     time.sleep(0.3)
                 if not closed:
                     wxlog.warning("点了「保存」之后对话框还开着：那一下没点中按钮"

@@ -129,8 +129,9 @@ class ForwardOps(LabelOps):
             if hit is None:
                 return _result(False, "no-message：可视区里找不到包含「%s」的消息"
                                % match, match=match)
-            x = (hit[2].left + hit[2].right) // 2
-            y = (hit[2].top + hit[2].bottom) // 2
+            # 4.2.0 行铺满整窗宽，行中心落在气泡外的空白处，右键弹不出菜单；
+            # 用行内内容重心（气泡实际位置）当右键点
+            x, y = self.uia._row_content_point(hit[2])
             self.uia._set_cursor(x, y)
             time.sleep(0.2)
             self.uia._right_click()

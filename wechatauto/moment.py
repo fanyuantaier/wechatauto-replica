@@ -181,10 +181,13 @@ def _is_layout_decoration_cell(class_name: str, name: str) -> bool:
     """判断一个 ListItem 是否为合并布局的装饰性 cell（非动态正文）。
 
     合并布局下每条动态在时间线里摊成同一层的 3 个 ListItem：正文
-    （``TimelineContentCell``）、评论区（Name ``评论区``）、余下计数
-    （Name ``余下N条``）。这里识别并剔除后两者，避免污染动态列表。
+    （``TimelineContentCell``；4.2.0 起带图帖的正文并入
+    ``TimelineGridImageCell``，广告帖为 ``TimelineAdNormalCell`` /
+    ``TimelineAdBaseCardImageCell``）、评论区（Name ``评论区``）、
+    余下计数（Name ``余下N条``）。这里识别并剔除后两者，避免污染动态列表。
     """
-    if 'ContentCell' in class_name:
+    if any(k in class_name for k in ('ContentCell', 'GridImageCell',
+                                     'AdNormalCell', 'AdBaseCard')):
         return False
     name = (name or '').strip()
     if not name:

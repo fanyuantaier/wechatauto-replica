@@ -1447,6 +1447,33 @@ class WeChatUIA:
                     return True
         return False
 
+    @staticmethod
+    def _row_content_point(r) -> Tuple[int, int]:
+        """消息行内「气泡内容重心」点：self 靠右、friend 靠左。
+
+        4.2.0 的消息行（ChatTextItemView 等）铺满整窗宽而气泡只占一侧，
+        行中心 x 落在空白处，右键弹不出菜单——右键必须落在气泡像素上。
+        用背景色列投影找内容重心 x；失败退回行中心。
+        """
+        try:
+            from PIL import ImageGrab as IG
+            img = IG.grab(bbox=(r.left, r.top, r.right, r.bottom))
+            import numpy as np
+            arr = np.array(img.convert("RGB"))
+            bg = (arr.max(axis=2) > 235) & ((arr.max(axis=2) - arr.min(axis=2)) < 22)
+            colc = (~bg).sum(axis=0)
+            total = int(colc.sum())
+            if total >= 20:
+                cx = sum(x * colc[x] for x in range(len(colc))) / total
+                cx = int(r.left + cx)
+            else:
+                cx = (r.left + r.right) // 2
+        except Exception:
+            cx = (r.left + r.right) // 2
+        cy = int(rhythm.spread(r.top + r.height() * 0.35,
+                               r.top + r.height() * 0.65))
+        return cx, cy
+
     def _right_click_latest_row(self, who: Optional[str] = None) -> Optional[Tuple[int, int]]:
         """打开会话并右键最新一条消息行，返回气泡内右键坐标 (x, y)；失败返回 None。"""
         if not self.ensure_window():
@@ -1479,23 +1506,7 @@ class WeChatUIA:
         target = max(candidates, key=lambda t: t[1].bottom)
         ch, r = target
         # 消息行内取内容重心 x（self 靠右、friend 靠左），y 在行的中段随机取
-        try:
-            from PIL import ImageGrab as IG
-            img = IG.grab(bbox=(r.left, r.top, r.right, r.bottom))
-            import numpy as np
-            arr = np.array(img.convert("RGB"))
-            bg = (arr.max(axis=2) > 235) & ((arr.max(axis=2) - arr.min(axis=2)) < 22)
-            colc = (~bg).sum(axis=0)
-            total = int(colc.sum())
-            if total >= 20:
-                cx = sum(x * colc[x] for x in range(len(colc))) / total
-                cx = int(r.left + cx)
-            else:
-                cx = (r.left + r.right) // 2
-        except Exception:
-            cx = (r.left + r.right) // 2
-        cy = int(rhythm.spread(r.top + r.height() * 0.35,
-                               r.top + r.height() * 0.65))
+        cx, cy = self._row_content_point(r)
         self._set_cursor(cx, cy)
         rhythm.nap(0.2)
         self._right_click()
@@ -1717,6 +1728,49 @@ class WeChatUIA:
             return None
 
         return walk(win)
+
+    def scroll_message_list_to_bottom(self, max_rounds: int = 20) -> bool:
+        """把消息列表滚回最底部（最新消息），返回列表是否发生过回滚。
+
+        find_in_message_list 会把列表停在中途，调用方（表情截图等）截完图
+        必须把视口还回去，否则机器人后面发的消息用户根本看不见。判停依据
+        是「最后一行控件的底边不再下沉」：到底后微信会回弹/停在原地，底边
+        连续两轮不变即认为到底。
+        """
+        lst = self._message_list()
+        if lst is None:
+            return False
+        try:
+            r = lst.BoundingRectangle
+            cx = (r.left + r.right) // 2
+            cy = (r.top + r.bottom) // 2
+        except Exception:
+            return False
+        self._set_cursor(cx, cy)
+        moved = False
+        last_bottom = None
+        stable = 0
+        for _ in range(max_rounds):
+            bottom = None
+            try:
+                kids = lst.GetChildren()
+                if kids:
+                    bottom = kids[-1].BoundingRectangle.bottom
+            except Exception:
+                bottom = None
+            if bottom is not None and last_bottom is not None:
+                if bottom > last_bottom + 1:
+                    moved = True
+                    stable = 0
+                else:
+                    stable += 1
+                    if stable >= 2:
+                        break
+            if bottom is not None:
+                last_bottom = bottom
+            self._mouse_wheel(-360)
+            rhythm.nap(0.25)
+        return moved
 
     def find_in_message_list(self, predicate, match_last: bool = False,
                              max_scrolls: int = 40) -> Optional[Tuple]:

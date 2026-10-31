@@ -1377,10 +1377,13 @@ class WeChat(Chat, Listener):
 
         def _has_timeline() -> bool:
             try:
-                tl = _find_descendant(root, lambda c: getattr(c, 'ClassName', '') == 'mmui::TimeLineListView', max_depth=30)
+                # 页面切换会重排控件树：每次探测都重新锚定根节点，
+                # 复用导航前的旧引用会撞 COMError 被 _find_descendant 吞掉而假报「没有时间线」。
+                fresh = _uia.ControlFromHandle(hwnd) or root
+                tl = _find_descendant(fresh, lambda c: getattr(c, 'ClassName', '') == 'mmui::TimeLineListView', max_depth=30)
                 if tl is not None:
                     return True
-                sc = _find_descendant(root, lambda c: getattr(c, 'ClassName', '') == 'mmui::SNSContentView', max_depth=30)
+                sc = _find_descendant(fresh, lambda c: getattr(c, 'ClassName', '') == 'mmui::SNSContentView', max_depth=30)
                 return sc is not None
             except Exception as exc:
                 wxlog.debug(f'朋友圈控件探测失败：{exc!r}')
@@ -1751,6 +1754,150 @@ class WeChat(Chat, Listener):
     def GetAllSubWindow(self) -> List['Chat']:
         """获取所有子窗口实例（GUI 模式下无独立子窗口，返回空列表）。"""
         return []
+
+    # -- 独立聊天窗（wxauto4 式）-------------------------------------------
+
+    def _list_top_windows(self) -> List[dict]:
+        """枚举本微信进程的可见顶层窗口 ``[{hwnd, cls, title}]``。"""
+        import ctypes
+        from ctypes import wintypes as w
+
+        out: List[dict] = []
+        pid = ctypes.c_ulong()
+        ctypes.windll.user32.GetWindowThreadProcessId(
+            ctypes.c_void_p(self._gui.main_hwnd), ctypes.byref(pid))
+        target_pid = pid.value
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, w.HWND, w.LPARAM)
+        def cb(h, _l):
+            p = ctypes.c_ulong()
+            ctypes.windll.user32.GetWindowThreadProcessId(h, ctypes.byref(p))
+            if p.value != target_pid:
+                return True
+            if not ctypes.windll.user32.IsWindowVisible(h):
+                return True
+            cls = ctypes.create_unicode_buffer(64)
+            ctypes.windll.user32.GetClassNameW(h, cls, 64)
+            t = ctypes.create_unicode_buffer(128)
+            ctypes.windll.user32.GetWindowTextW(h, t, 128)
+            out.append({"hwnd": h, "cls": cls.value, "title": t.value})
+            return True
+        ctypes.windll.user32.EnumWindows(cb, 0)
+        return out
+
+    def _open_chat_window(self, who: str, timeout: float = 10.0) -> Optional[int]:
+        """双击会话列表里 ``who`` 那一行，打开独立聊天窗，返回其 HWND。
+
+        4.2.0 实测：双击必须点在行的**消息预览区**（行内 x≈60%），点头像区
+        无效；两次 Click 间隔 ≤120ms 才构成双击。若同名独立窗已开则直接
+        复用（不重复双击——再双击一次会把它关掉）。
+        """
+        import ctypes
+        import time as _t
+
+        # 已开着的独立窗（顶层、非主窗、标题恰为 who）直接复用
+        for w in self._list_top_windows():
+            if w["hwnd"] != self._gui.main_hwnd and w["title"] == who:
+                return w["hwnd"]
+
+        uia = self._gui._get_uia()
+        if uia is None:
+            return None
+        if not uia.ensure_window():
+            return None
+        # 先把会话在主窗打开：行被选中/置顶后才接受双击（未激活的行双击偶发无效）
+        if not uia.open_chat(who):
+            wxlog.debug("独立窗：主窗里打不开会话 %r", who)
+            return None
+        import time as _tt
+        _tt.sleep(0.8)
+        main = uia._find_main()
+        if main is None:
+            return None
+        # 会话列表行：aid = session_item_<who>
+        import uiautomation as _uia
+        cell = None
+        for c, _d in _uia.WalkControl(main, maxDepth=20):
+            if (c.AutomationId or "") == f"session_item_{who}":
+                cell = c
+                break
+        if cell is None:
+            wxlog.debug("独立窗：会话列表里找不到 %r 的行", who)
+            return None
+        r = cell.BoundingRectangle
+        cx = int(r.left + (r.right - r.left) * 0.6)   # 消息预览区，点头像无效
+        cy = int((r.top + r.bottom) // 2)
+        user32 = ctypes.windll.user32
+        before = {w["hwnd"] for w in self._list_top_windows()}
+        # 会话行在主窗内，落点必属微信；双击目标=行的消息预览区（头像区无效）
+        uia._set_cursor(cx, cy)
+        _t.sleep(0.2)
+        uia._click_at(cx, cy)
+        _t.sleep(0.06)
+        uia._click_at(cx, cy)
+        deadline = _t.time() + timeout
+        while _t.time() < deadline:
+            for w in self._list_top_windows():
+                if w["hwnd"] not in before and w["title"] == who \
+                        and w["cls"].startswith("Qt"):
+                    return w["hwnd"]
+            _t.sleep(0.25)
+        wxlog.debug("独立窗：双击后 %ss 内没出现标题为 %r 的窗口", timeout, who)
+        return None
+
+    def ChatWindow(self, who: str) -> Optional['Chat']:
+        """wxauto4 式独立聊天窗：双击会话列表打开独立窗，返回绑定它的 Chat。
+
+        用法与 wxauto4 对齐：``wx.ChatWindow("张三").SendMsg("你好")``。
+        独立窗已开着时直接复用；发完消息窗口保持打开，由调用方决定是否关闭。
+        消息经 GUI 层（rhythm 节流）落进独立窗输入框，与主窗发送同一条 rhythm 链。
+        """
+        who = (who or "").strip()
+        if not who:
+            return None
+        hwnd = self._open_chat_window(who)
+        if hwnd is None:
+            wxlog.debug("ChatWindow：打不开 %r 的独立窗", who)
+            return None
+        gui = self._gui
+        if not gui.use_window(hwnd):
+            wxlog.debug("ChatWindow：GUI 重绑到独立窗 %s 失败", hwnd)
+            return None
+        return Chat(who, gui, self._db)
+
+    def CloseChatWindow(self, who: str) -> bool:
+        """关掉 ``who`` 的独立聊天窗（Alt+F4；窗口级的合成关闭消息 4.2.0 不吃）。
+
+        Alt+F4 打到**当前前台窗口**上——切不到目标前台时绝不能盲发，
+        否则会把 Alt+F4 送进用户正在用的窗口（实测会把别的应用关掉）。
+        校验失败重试三次（ALT 辅助 SetForegroundWindow），仍失败则返回
+        False 并由调用方决定，不降级到别的关闭手段。
+        """
+        import ctypes
+        import time as _t
+        user32 = ctypes.windll.user32
+        for w in self._list_top_windows():
+            if w["hwnd"] != self._gui.main_hwnd and w["title"] == who:
+                hwnd = w["hwnd"]
+                for attempt in range(3):
+                    user32.keybd_event(0x12, 0, 0, 0)   # ALT tap 解前台锁
+                    _t.sleep(0.05)
+                    user32.keybd_event(0x12, 0, 2, 0)
+                    user32.SetForegroundWindow(hwnd)
+                    _t.sleep(0.5)
+                    if user32.GetForegroundWindow() == hwnd:
+                        user32.keybd_event(0x12, 0, 0, 0)   # ALT down
+                        user32.keybd_event(0x73, 0, 0, 0)   # F4 down
+                        _t.sleep(0.06)
+                        user32.keybd_event(0x73, 0, 2, 0)   # F4 up
+                        user32.keybd_event(0x12, 0, 2, 0)   # ALT up
+                        _t.sleep(1.2)
+                        if not user32.IsWindow(hwnd):
+                            return True
+                wxlog.warning("CloseChatWindow：%s 的独立窗拿不到前台，Alt+F4 未发送"
+                              "（避免误关别的窗口）", who)
+                return False
+        return True
 
     # -- 路径 / 生命周期 ---------------------------------------------------
 

@@ -118,6 +118,11 @@ class FakeUIA:
         return ("mmui::ChatItemView", self.sim.match_hit,
                 Rect(1800, 900, 2600, 980))
 
+    @staticmethod
+    def _row_content_point(r):
+        # 与真实现同语义：4.2.0 行中心在气泡外，右键点要落在内容上
+        return ((r.left + r.right) // 2, (r.top + r.bottom) // 2)
+
     def _set_cursor(self, x, y):
         pass
 
