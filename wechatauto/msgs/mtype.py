@@ -185,6 +185,7 @@ class EmojiMessage(BaseMessage):
             # / ChatBubbleItemView 等控件，BoundingRectangle 即精确行坐标，
             # 替代「截图全消息区+连通域猜气泡」的脆弱裁剪。
             uia_path = None
+            eng = None
             try:
                 eng = gui._get_uia()
                 if eng is not None and eng.ensure_window():
@@ -195,7 +196,10 @@ class EmojiMessage(BaseMessage):
                         lambda cn, nm: (nm == '动画表情'
                                         or (cn == 'mmui::ChatBubbleItemView'
                                             and '[动画表情' in nm)),
-                        match_last=True, max_scrolls=60)
+                        match_last=True, max_scrolls=8)
+                    # 最新一条表情 99% 在底部可视区；可视区没有就别翻 60 屏
+                    # 历史了——翻完列表停在旧消息上，机器人接下去发的每条
+                    # 消息用户都看不到（表观症状就是「页面向上滚走了」）。
                     if found:
                         cn, nm, rect = found
                         # 消息行是全宽（含头像/空白），按方向裁出气泡本身
@@ -210,6 +214,13 @@ class EmojiMessage(BaseMessage):
                             uia_path = bubble
             except Exception as e:
                 wxlog.debug('UIA 表情定位失败，退回连通域方案：%s', e)
+            # 定位途中列表可能被滚到历史区；不管截没截到都把视口滚回底部，
+            # 不然机器人后面发的消息用户看不到（「页面向上滚走了」就是这来的）。
+            if eng is not None:
+                try:
+                    eng.scroll_message_list_to_bottom()
+                except Exception as e:
+                    wxlog.debug('表情截图后回滚底部失败：%s', e)
             if uia_path is not None:
                 save_dir = save_dir or os.path.join(
                     tempfile.gettempdir(), PROJECT_NAME, 'emoji')
@@ -748,14 +759,19 @@ class EmojiMessage(BaseMessage):
             return img
 
     def _scroll_to_bottom(self, gui, ry0: int) -> None:
-        """将鼠标悬停在消息区中部并向下滚动，确保最后一条消息可见。"""
+        """将鼠标悬停在消息区中部并向下滚动，确保最后一条消息可见。
+
+        微信滚轮只吃小 delta，一把 -300 常一格不动；改成小步多轮。
+        滚轮在底部会原地空转，所以不需要判停，预算给足即可。
+        """
         try:
             import win32api
             mx = gui.origin_x + (gui.right_pane_left + gui.render_w) // 2
             my = gui.origin_y + (115 + ry0) // 2
             win32api.SetCursorPos((mx, my))
-            for _ in range(3):
-                gui._input.wheel(-300)
+            for _ in range(10):
+                gui._input.wheel(-120)
+                time.sleep(0.2)
         except Exception:
             pass
 
