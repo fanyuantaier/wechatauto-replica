@@ -16,6 +16,13 @@ def control(cls, name='', aid='', children=(), hwnd=22):
                            NativeWindowHandle=hwnd, ControlTypeName='EditControl',
                            IsOffscreen=False, GetChildren=lambda: list(children))
     node.EditControl = Mock(return_value=SimpleNamespace(Exists=lambda *a: False))
+    def first_child():
+        items = node.GetChildren()
+        for index, child in enumerate(items):
+            child._next_sibling = items[index+1] if index+1 < len(items) else None
+        return items[0] if items else None
+    node.GetFirstChildControl = first_child
+    node.GetNextSiblingControl = lambda: getattr(node, '_next_sibling', None)
     return node
 
 

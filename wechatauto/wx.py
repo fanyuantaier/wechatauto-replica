@@ -47,25 +47,11 @@ if TYPE_CHECKING:
 def _find_descendant(control, predicate, max_depth: int = 12):
     """在 UIA 控件子树中递归查找第一个满足 ``predicate`` 的后代。
 
-    用树遍历（``GetChildren``）替代 ``uiautomation`` 的名称模式匹配，
+    用按 RuntimeId 去重的树遍历替代 ``uiautomation`` 的名称模式匹配，
     避免兼容层对 Name 的模糊匹配在“朋友圈”等中文按钮上失配。
     """
-    try:
-        if predicate(control):
-            return control
-    except Exception:
-        return None
-    if max_depth <= 0:
-        return None
-    try:
-        children = control.GetChildren()
-    except Exception:
-        return None
-    for child in children:
-        found = _find_descendant(child, predicate, max_depth - 1)
-        if found is not None:
-            return found
-    return None
+    from wechatauto.uia_driver import _find_by
+    return _find_by(control, predicate, max_depth, preorder=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1289,7 +1275,7 @@ class WeChat(Chat, Listener):
             return None
         try:
             from wechatauto.ui.main import WeChatMainWnd
-            self._moment_api = WeChatMainWnd()
+            self._moment_api = WeChatMainWnd(hwnd=self._gui.main_hwnd)
         except Exception as e:
             _wxlog.debug('获取微信主窗口 UIA 封装失败：%s', e)
             self._moment_api = None
@@ -1369,7 +1355,7 @@ class WeChat(Chat, Listener):
         if root is not None and not _tree_ready(root):
             try:
                 from wechatauto.uia_driver import WeChatUIA
-                if WeChatUIA().ensure_materialized(timeout=6.0):
+                if WeChatUIA(hwnd=hwnd).ensure_materialized(timeout=6.0):
                     root = _uia.ControlFromHandle(hwnd) or root
                     wxlog.debug('进朋友圈前已唤醒 mmui 树')
             except Exception as exc:

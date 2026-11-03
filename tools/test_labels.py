@@ -86,6 +86,14 @@ class Node:
     def GetChildren(self):
         return list(self._kids)
 
+    def GetFirstChildControl(self):
+        for index, child in enumerate(self._kids):
+            child._next_sibling = self._kids[index+1] if index+1 < len(self._kids) else None
+        return self._kids[0] if self._kids else None
+
+    def GetNextSiblingControl(self):
+        return getattr(self, '_next_sibling', None)
+
     def add(self, *kids):
         self._kids.extend(kids)
 
