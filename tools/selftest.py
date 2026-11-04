@@ -1775,6 +1775,15 @@ def t_tree() -> None:
         def GetChildren(self):
             return list(self._kids)
 
+        def GetFirstChildControl(self):
+            items = self.GetChildren()
+            for index, child in enumerate(items):
+                child._next_sibling = items[index + 1] if index + 1 < len(items) else None
+            return items[0] if items else None
+
+        def GetNextSiblingControl(self):
+            return getattr(self, "_next_sibling", None)
+
     o_rhythm, o_log = ud.rhythm, ud.wxlog
     warns = []
     ud.wxlog = types.SimpleNamespace(
