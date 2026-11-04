@@ -158,22 +158,58 @@ def _aid_hit(aid: str, candidates) -> bool:
     return False
 
 
-def _find_by(root, pred, max_depth: int = 40):
-    """子树里找第一个满足 pred 的控件（新旧版结构差异的兜底定位手段）。"""
+def _control_key(control):
+    """不同 Python 包装对象仍可能指向同一个 UIA 元素。"""
+    try:
+        runtime_id = tuple(control.GetRuntimeId())
+        if runtime_id:
+            return ('uia', runtime_id)
+    except Exception:
+        pass
+    return ('object', id(control))
+
+
+def _find_by(root, pred, max_depth: int = 40, *, deadline=None, preorder=False):
+    """按 RuntimeId 去重；deadline 限制遍历，不中断单次底层 COM 调用。"""
     if root is None:
         return None
     stack = [(root, 0)]
+    seen = set()
     while stack:
+        if deadline is not None and time.monotonic() >= deadline:
+            break
         el, d = stack.pop()
         if d > max_depth:
             continue
+        key = _control_key(el)
+        if key in seen:
+            wxlog.debug('跳过重复 UIA 节点，避免控件树循环')
+            continue
+        seen.add(key)
         try:
             if pred(el):
                 return el
         except Exception:
             pass
+        if d >= max_depth or (deadline is not None and time.monotonic() >= deadline):
+            continue
         try:
-            for k in el.GetChildren():
+            # GetChildren 内部无界读取 NextSibling，必须在同级枚举时也检查循环。
+            children = []
+            siblings = set()
+            child = el.GetFirstChildControl()
+            while child is not None:
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
+                child_key = _control_key(child)
+                if child_key in siblings:
+                    wxlog.debug('终止循环的 UIA 兄弟节点枚举')
+                    break
+                siblings.add(child_key)
+                if child_key not in seen:
+                    children.append(child)
+                child = child.GetNextSiblingControl()
+            for k in reversed(children) if preorder else children:
                 stack.append((k, d + 1))
         except Exception:
             pass
@@ -987,33 +1023,60 @@ class WeChatUIA:
         except Exception:
             return None
 
+    def _search_popup_hwnds(self, hwnd: int, pid: int) -> List[int]:
+        """只接受绑定窗口所属、且仍由同一微信进程拥有的顶层弹窗。"""
+        if not _HAS_WIN32:
+            return []
+        targets = []
+
+        def collect(candidate, _):
+            if candidate == hwnd or not win32gui.IsWindowVisible(candidate):
+                return True
+            if self._pid_from_hwnd(candidate) != pid:
+                return True
+            owner = win32gui.GetWindow(candidate, win32con.GW_OWNER)
+            seen = set()
+            while owner and owner not in seen:
+                if owner == hwnd:
+                    targets.append(candidate)
+                    break
+                seen.add(owner)
+                owner = win32gui.GetWindow(owner, win32con.GW_OWNER)
+            return True
+
+        win32gui.EnumWindows(collect, None)
+        return targets
+
     def _find_search_list(self, timeout: float = 3.0):
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            # 1) 旧版：aid 短名。``Exists`` 会自己走一遍桌面树，微信重绘时会抛
-            #    COMError（元素不可用），不能让这一下把 open_chat 整个打断。
-            try:
-                lst = auto.ListControl(searchDepth=0xFFFFFFFF, AutomationId=SEARCH_LIST_AID)
-                if lst.Exists(0.2, 0.1):
-                    return lst
-            except Exception as e:
-                wxlog.debug("搜索下拉(旧锚点)读取失败：%s", e)
-            # 2) 新版：aid 点分路径 → 从根节点按属性容错匹配
-            try:
-                root = auto.GetRootControl()
-            except Exception:
-                root = None
-            try:
-                hit = _find_by(root, lambda c: (c.ControlTypeName == "ListControl"
-                                                and _aid_hit(getattr(c, "AutomationId", ""),
-                                                             SEARCH_LIST_AIDS)),
-                               max_depth=25)
-            except Exception as e:
-                wxlog.debug("搜索下拉(新锚点)读取失败：%s", e)
-                hit = None
-            if hit is not None:
-                return hit
-            time.sleep(0.2)
+        # 全桌面、近乎无限深度的 Exists 无法兑现超时，也会进入另一账号的异常树。
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            root = self._find_main()
+            if root is None:
+                return None
+            hwnd = int(root.NativeWindowHandle)
+            pid = self._pid_from_hwnd(hwnd)
+            if not pid or (self._bound_pid is not None and pid != self._bound_pid):
+                return None
+            roots = [root]
+            for popup in self._search_popup_hwnds(hwnd, pid):
+                if self._pid_from_hwnd(popup) != pid:
+                    continue
+                try:
+                    control = auto.ControlFromHandle(popup)
+                    if control is not None and int(control.NativeWindowHandle) == popup:
+                        roots.append(control)
+                except Exception as exc:
+                    wxlog.debug('搜索弹窗已失效：%s', exc)
+            for candidate in roots:
+                hit = _find_by(candidate, lambda c: (c.ControlTypeName == 'ListControl'
+                               and _aid_hit(getattr(c, 'AutomationId', ''), SEARCH_LIST_AIDS)),
+                               max_depth=25, deadline=deadline)
+                if hit is not None:
+                    return hit
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(0.2, remaining))
         return None
 
     def _collect_results(self, keyword: str, settle: float = 1.5) -> List[dict]:
