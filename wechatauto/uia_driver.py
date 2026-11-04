@@ -1537,13 +1537,12 @@ class WeChatUIA:
                                r.top + r.height() * 0.65))
         return cx, cy
 
-    def _right_click_latest_row(self, who: Optional[str] = None) -> Optional[Tuple[int, int]]:
-        """打开会话并右键最新一条消息行，返回气泡内右键坐标 (x, y)；失败返回 None。"""
-        if not self.ensure_window():
-            return None
-        if who and not self.current_chat() == who:
-            if not self.open_chat(who):
-                return None
+    def _latest_message_point(self) -> Optional[Tuple[int, int]]:
+        """最新一条消息行内气泡内容的重心（绝对屏幕坐标）；不可用时 None。
+
+        消息行控件铺满整窗宽而气泡只占一侧，行中心落在空白处点不出菜单；
+        表情/贴纸/图片行同样有控件与像素，不依赖 OCR 文字（issue #49）。
+        """
         lst = self._message_list()
         if lst is None:
             return None
@@ -1560,16 +1559,25 @@ class WeChatUIA:
                 r = ch.BoundingRectangle
                 if r.bottom - r.top < 40:
                     continue
-                candidates.append((ch, r))
+                candidates.append(r)
             except Exception:
                 continue
         if not candidates:
             return None
         # 最新消息在可视区底部（消息列表打开即定位在最新），取 bottom 最大者
-        target = max(candidates, key=lambda t: t[1].bottom)
-        ch, r = target
-        # 消息行内取内容重心 x（self 靠右、friend 靠左），y 在行的中段随机取
-        cx, cy = self._row_content_point(r)
+        return self._row_content_point(max(candidates, key=lambda r: r.bottom))
+
+    def _right_click_latest_row(self, who: Optional[str] = None) -> Optional[Tuple[int, int]]:
+        """打开会话并右键最新一条消息行，返回气泡内右键坐标 (x, y)；失败返回 None。"""
+        if not self.ensure_window():
+            return None
+        if who and not self.current_chat() == who:
+            if not self.open_chat(who):
+                return None
+        pos = self._latest_message_point()
+        if pos is None:
+            return None
+        cx, cy = pos
         self._set_cursor(cx, cy)
         rhythm.nap(0.2)
         self._right_click()

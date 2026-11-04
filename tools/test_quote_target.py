@@ -85,6 +85,50 @@ class QuoteTargetTests(unittest.TestCase):
         self.assertEqual(self.gui.quote_msg('回复')['status'], '成功')
         self.gui._locate_last_message_pt.assert_called_once_with(600)
 
+    def test_omitted_target_uses_uia_latest_row_instead_of_ocr(self):
+        # 最后一条是表情/图片时 OCR 带内只剩上一行昵称（issue #49），
+        # UIA 可用时必须改走消息行控件矩形 + 像素重心
+        uia = SimpleNamespace(_win=SimpleNamespace(NativeWindowHandle=42),
+                              _latest_message_point=Mock(return_value=(750, 800)),
+                              _uia_find_menu_item=Mock(return_value=None))
+        self.gui._get_uia.return_value = uia
+        self.gui.ocr = Mock(return_value=[('引用', 450, 550, 40, 20)])
+        self.assertEqual(self.gui.quote_msg('回复')['status'], '成功')
+        uia._latest_message_point.assert_called_once()
+        self.gui._last_message_y.assert_not_called()
+        self.gui._locate_last_message_pt.assert_not_called()
+        self.gui._input.send_input_click.assert_called_once_with(750, 800, right=True)
+
+    def test_uia_point_from_foreign_window_is_ignored(self):
+        uia = SimpleNamespace(_win=SimpleNamespace(NativeWindowHandle=99),
+                              _latest_message_point=Mock(return_value=(750, 800)))
+        self.gui._get_uia.return_value = uia
+        self.gui.ocr = Mock(return_value=[('引用', 450, 550, 40, 20)])
+        self.assertEqual(self.gui.quote_msg('回复')['status'], '成功')
+        uia._latest_message_point.assert_not_called()
+        self.gui._locate_last_message_pt.assert_called_once_with(600)
+
+    def test_uia_without_latest_row_falls_back_to_ocr(self):
+        uia = SimpleNamespace(_win=SimpleNamespace(NativeWindowHandle=42),
+                              _latest_message_point=Mock(return_value=None),
+                              _uia_find_menu_item=Mock(return_value=None))
+        self.gui._get_uia.return_value = uia
+        self.gui.ocr = Mock(return_value=[('引用', 450, 550, 40, 20)])
+        self.assertEqual(self.gui.quote_msg('回复')['status'], '成功')
+        self.gui._locate_last_message_pt.assert_called_once_with(600)
+        self.gui._input.send_input_click.assert_called_once_with(500, 600, right=True)
+
+    def test_reply_without_target_also_uses_uia_latest_row(self):
+        uia = SimpleNamespace(_win=SimpleNamespace(NativeWindowHandle=42),
+                              _latest_message_point=Mock(return_value=(750, 800)),
+                              _uia_find_menu_item=Mock(return_value=None))
+        self.gui._get_uia.return_value = uia
+        self.gui.ocr = Mock(return_value=[('引用', 450, 550, 40, 20)])
+        self.assertEqual(self.gui.reply_msg('回复正文')['status'], '成功')
+        uia._latest_message_point.assert_called_once()
+        self.gui.input_text.assert_called_once_with('回复正文')
+        self.gui._locate_last_message_pt.assert_not_called()
+
     def test_real_menu_control_precedes_ocr_and_reports_click_failure(self):
         item = object()
         uia = SimpleNamespace(_win=SimpleNamespace(NativeWindowHandle=42),

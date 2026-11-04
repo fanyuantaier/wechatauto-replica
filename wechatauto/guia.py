@@ -2715,13 +2715,24 @@ class WeChatGUI:
                 return WxResponse.failure('多条可见文字匹配引用目标，无法唯一定位要引用的消息')
             pt = matches[0]
         else:
-            y = self._last_message_y()
-            if y is None:
-                return WxResponse.failure('未检测到消息区域')
-            hit = self._locate_last_message_pt(y)
-            if hit is None:
-                return WxResponse.failure('未定位到最近一条消息')
-            pt = hit
+            # UIA 优先：最新消息行取真实控件矩形 + 像素重心（表情/贴纸/图片
+            # 同样有行控件与像素）；OCR 方案在最后一条是表情时带内只剩上一行
+            # 昵称，右键点空到气泡左上角（issue #49）。
+            uia = self._get_uia()
+            pos = None
+            if (uia is not None and uia._win is not None
+                    and int(uia._win.NativeWindowHandle) == self.main_hwnd):
+                pos = uia._latest_message_point()
+            if pos is not None:
+                pt = (pos[0] - self.origin_x, pos[1] - self.origin_y)
+            else:
+                y = self._last_message_y()
+                if y is None:
+                    return WxResponse.failure('未检测到消息区域')
+                hit = self._locate_last_message_pt(y)
+                if hit is None:
+                    return WxResponse.failure('未定位到最近一条消息')
+                pt = hit
         # 右键点击目标消息，弹出操作菜单
         # 用 SendInput（而非 mouse_event）：微信渲染窗口对 mouse_event 的
         # 右键不响应，SendInput 可直接命中弹出菜单（原图那次的同类修复）。
