@@ -1164,10 +1164,21 @@ class MediaDownloader:
             elif 'thumb' in files:
                 pick, suffix = files['thumb'], '_thumb'
             else:
+                wxlog.debug("图片 %s/%s 本机三档副本都没有（.dat/_h.dat/_t.dat）：%s",
+                            user, local_id,
+                            "要让微信去下载用 download_image_original()")
                 return None
         elif tier == 'original':
             hit = files.get('original')
             if not hit or not self.original_ready(hit[1], mid_sz):
+                # 最高频的误会（issue #30）：把 .dat 当完整图、或以为解密能变出原件。
+                # _h.dat 只有点过「查看原图」（或发送方勾了原图）才会落盘；
+                # 本机没有这一档时解密无能为力，必须驱动界面去要。
+                wxlog.debug(
+                    "图片 %s/%s 本机没有可用的 _h.dat（原图档）：tier='original' 只认"
+                    "已有原件、不悄悄降级。解密变不出原件——要让微信去下载请改用"
+                    " download_image_original()（会点开气泡触发），或先用 image_status()"
+                    " 看本机实际有哪几档。", user, local_id)
                 return None
             pick, suffix = hit, '_h'
         elif tier == 'best':

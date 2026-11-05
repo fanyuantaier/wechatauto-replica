@@ -159,11 +159,20 @@ try:
         print("no Weixin.exe running - open WeChat and log in first")
     else:
         keys = db.extract_keys()
-        print("extracted:", len(keys))
+        # 注意：extract_keys 返回的是「已对当前选中账号的库页 1 校验通过」的密钥，
+        # 不是原始候选数（原始候选见下面 5c 段的「内存扫描候选密钥数」）。
+        # extracted=20 而 verify=0/20 在旧版日志里同时出现过——那是**两个不同账号
+        # 目录**（选中账号 ≠ 内存里登录的账号），不是「新版微信读不了内存」。
+        print("extracted（对选中账号 %s 校验通过）:" % db.account, len(keys))
         for k in sorted(keys):
             print("   ", k)
         missing2 = [rel for rel, _, _ in db._db_files if rel not in keys]
         print("still missing:", missing2)
+        if not keys:
+            print("   ⚠ extracted=0 且下面 verify 也是 0 时，先核对：")
+            print("     1) 上面「account dir」列表里哪个目录最近修改（=当前登录账号）")
+            print("     2) 「picked account」是否就是那个目录——选错账号时密钥全部校验不过")
+            print("     3) 5b 段 FileVersion 与本库适配版本（README 版本表）")
 except Exception as e:
     print("extract error:", repr(e))
     traceback.print_exc()
@@ -315,6 +324,13 @@ try:
         if db._key_works(rel):
             works += 1
     print("keys that verify: %d / %d" % (works, len(db._db_files)))
+    if works == 0 and db._db_files:
+        print("   ⚠ 0 个密钥通过校验 ≠ 内存读不了。按 lazyalex616 的实测（4.2.0.13，")
+        print("   24/25 库过 HMAC）：扫描方法在最新版微信上仍有效。最常见的三个原因：")
+        print("   1) 选中账号目录 ≠ 当前登录账号（看 5c 段哪个目录标了「属于此账号」）")
+        print("   2) 运行的库版本与 pip 装的不一致（看开头 lib version 与 db.py 路径）")
+        print("   3) key 缓存是旧账号残留——删除临时目录后重跑：")
+        print("      %s" % os.path.join(tempfile.gettempdir(), "wechatauto_db"))
 except Exception as e:
     print("verify error:", repr(e))
 

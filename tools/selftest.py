@@ -1888,7 +1888,8 @@ def t_image() -> None:
     import time as _time
 
     from wechatauto.media import MediaDownloader
-
+    import wechatauto.media as media_mod
+    import types as _types
     MD5 = 'a' * 32
     tmpdirs = []
 
@@ -2025,6 +2026,29 @@ def t_image() -> None:
           md3.download_image('wxid_img', 7, save_dir=md3.save_dir,
                              tier='thumb').endswith('_thumb.jpg')
           and md3.download_image('wxid_img', 7, tier='whatever') is None)
+
+    print("[image] 失败路径的说明日志（issue #30：调用方把 .dat 当完整图、以为解密能变原件）")
+    warns3 = []
+    o_media_log = media_mod.wxlog
+    media_mod.wxlog = _types.SimpleNamespace(
+        debug=lambda f, *a: warns3.append(('debug', f % a if a else f)),
+        info=lambda f, *a: warns3.append(('info', f % a if a else f)))
+    try:
+        md4 = newmd({'mid': 100000, 'thumb': 5000})
+        md4.decrypt_image = stub_decrypt(md4, used)
+        check("tier=original 本机没有 _h → None 且日志写明「解密变不出原件 / 用 original」",
+              md4.download_image('wxid_img', 7, save_dir=md4.save_dir,
+                                 tier='original') is None
+              and any('download_image_original' in w and '变不出' in w
+                      for _lvl, w in warns3), "%d 条" % len(warns3))
+        md5 = newmd({})
+        md5.decrypt_image = stub_decrypt(md5, used)
+        check("三档全缺 → None 且日志点名三档与出路",
+              md5.download_image('wxid_img', 7, save_dir=md5.save_dir) is None
+              and any('download_image_original' in w for _lvl, w in warns3),
+              "%d 条" % len(warns3))
+    finally:
+        media_mod.wxlog = o_media_log
 
     print("[image] tier='full'：只要「不是 _t.dat 档」的那一份")
     pf = MediaDownloader._pick_full
