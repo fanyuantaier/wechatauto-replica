@@ -355,6 +355,18 @@ def cmd_forward(args):
     _apply_verify_interval(args)
     wx = WeChat()
     dry = not args.go
+    if args.fav:
+        who = [w.strip() for w in (args.to or "").replace("，", ",").split(",")
+               if w.strip()]
+        if not who:
+            return _die("转发给谁？--to 名字1,名字2")
+        r = wx.ForwardFavorite(who, match=args.match, index=args.index,
+                               scroll=args.scroll,
+                               dry_run=dry, chunk=args.chunk,
+                               verify=not args.no_verify)
+        print("[%s] %s" % (r["status"], r.get("message")))
+        _print_forward_data(r, dry)
+        return 0 if r["status"] == "成功" else 1
     if args.label:
         r = wx.ForwardToLabel(args.label, chat=args.chat, match=args.match,
                               text=args.text,
@@ -370,6 +382,11 @@ def cmd_forward(args):
                               dry_run=dry, chunk=args.chunk,
                               verify=not args.no_verify)
     print("[%s] %s" % (r["status"], r.get("message")))
+    _print_forward_data(r, dry)
+    return 0 if r["status"] == "成功" else 1
+
+
+def _print_forward_data(r, dry):
     data = r.get("data") or {}
     if data.get("seed"):
         print("  先发给：%s（原件）" % data["seed"])
@@ -388,7 +405,6 @@ def cmd_forward(args):
                                         for x in got[:20])))
     if dry and r["status"] == "成功":
         print("  （预演：一条都没发出去。加 --go 才真发）")
-    return 0 if r["status"] == "成功" else 1
 
 
 def cmd_remark(args):
@@ -667,8 +683,15 @@ def build_parser():
     s.add_argument("--text", help="正文：给了就先发给名单里第一个人，再把这条转发给剩下的")
     s.add_argument("--to", help="逗号分隔的收件人，例：文件传输助手,送你挖银子")
     s.add_argument("--label", help="按标签转发：标签名（收件人=该标签全部成员）")
+    s.add_argument("--fav", action="store_true",
+                   help="转发收藏：点左侧「收藏」→ 右键一条收藏 → 转发"
+                        "（条目用 --match 或 --index 定位，--chat 无效）")
+    s.add_argument("--index", type=int, default=0,
+                   help="（--fav）取可视区第几条完整露出的收藏，默认 0")
+    s.add_argument("--scroll", type=int, default=0,
+                   help="（--fav）先在收藏列表上滚几格再找，负数向上")
     s.add_argument("--chat", help="在哪个会话里右键；不给就用当前打开的会话")
-    s.add_argument("--match", help="按文字定位那一条消息；不给就右键最新一条")
+    s.add_argument("--match", help="按文字定位那一条消息/收藏；不给就右键最新一条/第一条")
     s.add_argument("--chunk", type=int, help="一个转发窗勾几个人（默认 9）")
     s.add_argument("--limit", type=int, help="按标签时最多转发给几个人")
     s.add_argument("--dry-run", action="store_true",
@@ -713,6 +736,7 @@ ALIASES = {
     "朋友圈": "moments",
     "标签": "labels", "打标签": "labels", "设标签": "labels",
     "转发": "forward", "转给": "forward",
+    "收藏转发": "forward", "转收藏": "forward",
     "备注": "remark", "改备注": "remark", "设置备注和标签": "remark",
     "加好友": "addfriend", "加群友": "addfriend", "群加好友": "addfriend",
 }

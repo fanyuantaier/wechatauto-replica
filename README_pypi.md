@@ -49,7 +49,7 @@ discovery still selects main windows, with existing HWND/PID checks preserved.
 本项目复刻上游 wxauto 项目，目标是实现对当前微信 4.x Windows 客户端的自动化
 （读取消息、发送消息、媒体下载、朋友圈），非网页版，直接操作本机客户端。
 
-> 当前版本：1.2.9
+> 当前版本：1.2.10
 >
 > **兼容范围**：Windows 10/11 ｜ Python 3.9+（已在 3.12 验证）｜ 微信 **4.1.12+**（已在 4.1.15.53 / 4.2.0.11 验证）
 > （数据库读取路线对微信版本不敏感；坐标+OCR 发送路线依赖 4.1.12+ 自绘渲染
@@ -114,6 +114,13 @@ wechatauto 朋友圈 --me              # 看自己发的朋友圈
 ---
 
 ## 版本记录
+
+### v1.2.10（2026-11-08）
+
+- **新增：转发收藏内容 `wx.ForwardFavorite(to, match=…)`**：点左侧「收藏」→ 右键一条收藏 →「转发...」，之后与转发消息共用同一个「微信发送给」窗口（分块多选、按钮人数对数闸、逐人数据库回读）。条目按 `match=` 文字子串或 `index=` 定位（默认 0；被页头压住的第一条自动跳过），`scroll=` 先滚几格。CLI：`wechatauto 转发 --fav --to 文件传输助手 --match 关键词`（默认预演，`--go` 真发）。4.2.0.13 真机整链验证（文件/链接卡片各一条，独立 DB 回读）。
+- ⚠️ **修复（[PR #52](https://github.com/fanyuantaier/wechatauto-replica/pull/52)）**：`_find_by` RuntimeId 去重 + deadline 限时（修复真机 16s+ 卡死）；`_find_search_list` 不再全桌面找（旧写法会进别的账号的树）。
+- **修复（#49）**：引用/回复优先走 UIA 消息行 + 像素重心定位（最后一条是表情/图片时不再右键点空）。
+- **改进（#23/#30）**：`diagnose_keys` 分开标注 extracted / verify 数、0 通过给核对提示；原图下载失败路径补 debug 日志。
 
 ### v1.2.9（2026-10-31）
 
@@ -691,6 +698,7 @@ wechatauto 朋友圈 --me              # 看自己发的朋友圈
 | 搜索联系人 | ✅ 已完成并验证 | 同上 |
 | 发送消息 | ✅ 已完成并验证 | UIA + 坐标+OCR 混合（`wechatauto/guia.py`） |
 | 发送文件/图片/回复/艾特 | ✅ 已完成并验证 | 剪贴板 CF_HDROP + OCR |
+| 转发消息 / 转发收藏 | ✅ 已实现；收藏转发 4.2.0.13 真机验证过，按标签批量真发**未验** | `ForwardMessage` / `ForwardFavorite`（条目按 `match=`/`index=` 定位），CLI `forward`（`--fav`） |
 | 语音通话 / 拍一拍 | ✅ 已完成并验证 | UIA 按钮 + OCR 菜单（`Chat.VoiceCall` / `Chat.Poke`） |
 | UI 自动化（UIAutomation） | ✅ 热激活后可用 | 写 Weixin.dll Qt accessibility gate，物化 `mmui::*` 树 |
 
@@ -1079,7 +1087,7 @@ quick_send_file(r'D:\资料\报告.pdf', '文件传输助手')
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.2.9 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13 / 4.2.0.11)
+> **Current version:** 1.2.10 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13 / 4.2.0.13)
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -1270,6 +1278,13 @@ Runnable demo: `python -m wechatauto.demo_moments_interact [--like N | --unlike 
 - Performance: parallel export / first-scan, incremental memory-scan cache
 
 ## 📝 Changelog
+
+### v1.2.10 (2026-11-08)
+
+- **New: forward favorite items — `wx.ForwardFavorite(to, match=…)`.** Click the Favorites tab → right-click an item → Forward; afterwards it is the exact same「微信发送给」picker as message forwarding (chunked multi-select, send-button count gate, per-recipient database read-back). Items are located by `match=` (text substring) or `index=` (default 0; the first row, often clamped under the page header, is skipped automatically); `scroll=` pages first. CLI: `wechatauto forward --fav --to 文件传输助手 --match keyword` (dry-run by default, `--go` to send). Verified end-to-end on a real 4.2.0.13 client (file card and link card, independent DB read-back).
+- ⚠️ **Fix ([PR #52](https://github.com/fanyuantaier/wechatauto-replica/pull/52))**: `_find_by` deduplicates by RuntimeId, honors a deadline, and detects sibling-enumeration loops (fixes a 16s+ live hang); `_find_search_list` no longer searches the whole desktop (it could walk into **another account's** tree).
+- **Fix (#49)**: quote/reply now targets the latest message via the UIA row control + pixel centroid (no longer right-clicks empty space when the last message is an emoji/image).
+- **Improvements (#23/#30)**: `diagnose_keys` reports "extracted" vs "verified" separately with hints when zero keys verify; debug logs on the original-image failure paths.
 
 ### v1.2.9 (2026-10-31)
 
@@ -1623,5 +1638,8 @@ Thanks to [dhz1145](https://github.com/dhz1145) for the fix round spanning [issu
 ## 📄 License & Disclaimer
 
 Apache-2.0. This project is for personal learning and automation research only — please respect the WeChat software license agreement and applicable laws.
+
+> [!WARNING]
+> **用就别怕。** 本库驱动的是微信官方客户端的本地接口（数据库解密 + UI 自动化），从 1.0.0 到现在没有任何账号被封的先例，但风险自担：**这个仓库随时可能消失**（被 DMCA、被限流、被作者删库都可能）。用就珍惜——装版本前把 wheel/sdist 留一份本地副本，更新前先看完 changelog。
 
 Contact: fanyuantaier@163.com

@@ -17,7 +17,7 @@
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.2.9 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.53)
+> **Current version:** 1.2.10 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13 / 4.2.0.13)
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -42,7 +42,7 @@ Automate the **WeChat 4.x Windows desktop client** (not the web version): read m
 | Send text / file / image / reply / @member | ✅ verified | UIA-first, coordinate + OCR fallback |
 | Voice call / Poke (拍一拍) | ✅ verified | UIA buttons + OCR menus |
 | UIAutomation tree | ✅ after hot-activation | Writes the Qt accessibility gate inside Weixin.dll |
-| Contact labels / forward a message | ✅ implemented; the live batch send is **not** verified | `ListLabels` / `CreateLabel` / `AddLabelMembers` / `SendToLabel(dry_run=)` / `ForwardMessage`, CLI `labels` / `forward` |
+| Contact labels / forward a message / forward a favorite item | ✅ implemented; favorites-forward verified live on 4.2.0.13 (batch label send still **not** verified) | `ListLabels` / `CreateLabel` / `AddLabelMembers` / `SendToLabel(dry_run=)` / `ForwardMessage` / `ForwardFavorite`, CLI `labels` / `forward` (`--fav`) |
 | Read-back gate before Enter + master OCR switch | ✅ verified (89 offline checks + verbatim live read-back) | `WxParam.SEND_CONTENT_RATIO` (0.6), `WxParam.ENABLE_OCR` (on) |
 
 ## 🚀 Quick Start
@@ -233,6 +233,14 @@ the existing HWND/PID checks; closing the target does not select another account
 
 ## 📝 Changelog
 
+
+### v1.2.10 (2026-11-08)
+
+- **New: forward favorite items — `wx.ForwardFavorite(to, match=…)`.** Click the Favorites tab → right-click an item → Forward; afterwards it is the exact same「微信发送给」picker as message forwarding (chunked multi-select, send-button count gate, per-recipient database read-back). Items are located by `match=` (text substring) or `index=` (default 0; the first row, often clamped under the page header, is skipped automatically); `scroll=` pages first. CLI: `wechatauto forward --fav --to 文件传输助手 --match keyword` (dry-run by default, `--go` to send). Verified end-to-end on a real 4.2.0.13 client (file card and link card, independent DB read-back). Offline suite `tools/test_favorite_forward.py` 27 checks + 5 mutations, all mutations biting.
+- ⚠️ **Fix ([PR #52](https://github.com/fanyuantaier/wechatauto-replica/pull/52), [dhz1145](https://github.com/dhz1145))**: `_find_by` deduplicates by RuntimeId, honors a deadline, and detects sibling-enumeration loops — fixes a 16s+ live hang; `_find_search_list` no longer searches the whole desktop (the old code could walk into **another account's** tree), it searches the main window + same-process owner chain; Moments wrappers pin to the bound HWND. Live comparison on 4.2.0.13: before the fix `_find_search_list(3.0)` did not return within 180 s; after, it returns None at 3.000 s on the dot.
+- **Fix (#49)**: quote/reply targets the latest message via the UIA message-row control + row-content pixel centroid (`_latest_message_point`), OCR only as fallback — the failure where the last message was an emoji/image and OCR read no body, so the right-click hit empty space. Verified live on 4.2.0.13 (text / quote-text / image / quote-image, all four green).
+- **Improvements (#23/#30 feedback, [lazyalex616](https://github.com/lazyalex616))**: `diagnose_keys` reports "extracted (validated against the selected account)" separately from "keys that verify", with three concrete hints when zero keys verify (account directory / picked account / library version); debug logs on the image `tier='original'` and all-tiers-missing failure paths pointing at `download_image_original`.
+- Verdict: `tools/test_favorite_forward.py` 27/0 (5 mutations all red); `tools/selftest.py` 562/0; the favorites-forward chain verified live on 4.2.0.13 including independent DB read-back.
 
 ### v1.2.9 (2026-10-31)
 
@@ -612,5 +620,8 @@ Thanks to [dhz1145](https://github.com/dhz1145) for the fix round spanning [issu
 ## 📄 License & Disclaimer
 
 Apache-2.0. This project is for personal learning and automation research only — please respect the WeChat software license agreement and applicable laws.
+
+> [!WARNING]
+> **用就别怕。** 本库驱动的是微信官方客户端的本地接口（数据库解密 + UI 自动化），从 1.0.0 到现在没有任何账号被封的先例，但风险自担：**这个仓库随时可能消失**（被 DMCA、被限流、被作者删库都可能）。用就珍惜——装版本前把 wheel/sdist 留一份本地副本，更新前先看完 changelog。
 
 Contact: fanyuantaier@163.com

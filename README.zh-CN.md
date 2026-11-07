@@ -19,7 +19,7 @@
 本项目复刻上游 wxauto 项目，目标是实现对当前微信 4.x Windows 客户端的自动化
 （读取消息、发送消息、媒体下载、朋友圈），非网页版，直接操作本机客户端。
 
-> 当前版本：1.2.9
+> 当前版本：1.2.10
 >
 > **兼容范围**：Windows 10/11 ｜ Python 3.9+（已在 3.12 验证）｜ 微信 **4.1.12+**（已在 4.1.15.53 / 4.2.0.11 验证）
 > （数据库读取路线对微信版本不敏感；坐标+OCR 发送路线依赖 4.1.12+ 自绘渲染
@@ -95,6 +95,14 @@ wechatauto 朋友圈 --me              # 看自己发的朋友圈
 ---
 
 ## 版本记录
+
+### v1.2.10（2026-11-08）
+
+- **新增：转发收藏内容——`wx.ForwardFavorite(to, match=…)`。** 点左侧导航「收藏」→ 右键一条收藏 →「转发...」，之后与「转发消息」完全同一个「微信发送给」窗口：选人、分块多选（默认 9 人/块）、发送按钮三方对数闸（`发送`/`分别发送(N)`）、逐人数据库回读确认，整条后链原样复用。条目定位：`match=` 文字子串（子串匹配「类型+标题+来源+日期」拼串），或 `index=` 可视区第几条**矩形完整露出**的收藏（默认 0；第一条常被页头压住、右键点不进去，自动跳过），`scroll=` 先滚几格翻页。CLI：`wechatauto 转发 --fav --to 文件传输助手 --match 关键词`（默认预演，`--go` 真发）。4.2.0.13 真机验证：开窗链全通 + 两条收藏（文件卡片/链接卡片）分别转发给文件传输助手并独立回读落库。离线 `tools/test_favorite_forward.py` 27 项 + 5 变异全红。
+- ⚠️ **修复（[PR #52](https://github.com/fanyuantaier/wechatauto-replica/pull/52)，[dhz1145](https://github.com/dhz1145)）**：`_find_by` 按 RuntimeId 去重 + deadline 限时 + 兄弟枚举循环检测——修复真机上 16s+ 卡死；`_find_search_list` 不再全桌面找（旧写法会进**别的账号**的树），改从主窗 + 同进程 owner 链找；朋友圈封装钉到绑定 HWND。真机对照（4.2.0.13）：修复前 `_find_search_list(3.0)` 180s 不返回，修复后 3.000s 准时返回。
+- **修复（#49）**：引用/回复最新消息时优先走 UIA 消息行控件 + 行内容像素重心定位（`_latest_message_point`），OCR 只兜底——最后一条是表情/图片时 OCR 读不到正文导致右键点空的场景修复。4.2.0.13 真机四步全绿（文字/引用文字/图片/引用图片）。
+- **改进（#23/#30 反馈，[lazyalex616](https://github.com/lazyalex616)）**：`diagnose_keys` 把「extracted（对选中账号校验过）」与「keys that verify」分开标注，0 通过时给三条核对提示（账号目录 / picked account / 库版本）；图片 `tier='original'` 与三档全缺的失败路径补 debug 日志，说明「解密变不出原件时用 download_image_original」。
+- 判定：`tools/test_favorite_forward.py` 27/0（5 变异全红）；`tools/selftest.py` 562/0；真机 4.2.0.13 收藏转发整链验证（含独立 DB 回读）。
 
 ### v1.2.9（2026-10-31）
 
@@ -687,7 +695,7 @@ wechatauto 朋友圈 --me              # 看自己发的朋友圈
 | 发送消息 | ✅ 已完成并验证 | UIA + 坐标+OCR 混合（`wechatauto/guia.py`） |
 | 发送文件/图片/回复/艾特 | ✅ 已完成并验证 | 剪贴板 CF_HDROP + OCR |
 | 语音通话 / 拍一拍 | ✅ 已完成并验证 | UIA 按钮 + OCR 菜单（`Chat.VoiceCall` / `Chat.Poke`） |
-| 通讯录标签 / 右键转发 | ✅ 已实现；批量真发（会发给别人）**未验** | `ListLabels` / `CreateLabel` / `AddLabelMembers` / `SendToLabel(dry_run=)` / `ForwardMessage`，CLI `labels` / `forward` |
+| 通讯录标签 / 右键转发 / 转发收藏 | ✅ 已实现；收藏转发 4.2.0.13 真机验证过，批量真发（会发给别人）**未验** | `ListLabels` / `CreateLabel` / `AddLabelMembers` / `SendToLabel(dry_run=)` / `ForwardMessage` / `ForwardFavorite`，CLI `labels` / `forward`（`--fav`） |
 | 发送前回读校验 + OCR 总开关 | ✅ 已验证（离线 89 项 + 真机逐字回读） | `WxParam.SEND_CONTENT_RATIO`（默认 0.6）、`WxParam.ENABLE_OCR`（默认开） |
 | UI 自动化（UIAutomation） | ✅ 热激活后可用 | 写 Weixin.dll Qt accessibility gate，物化 `mmui::*` 树 |
 
@@ -1055,6 +1063,9 @@ quick_send_file(r'D:\资料\报告.pdf', '文件传输助手')
 
 本项目仅用于个人学习与自动化研究，请遵守微信软件许可协议及当地法律法规，
 勿用于任何违反规定的用途。
+
+> [!WARNING]
+> **用就别怕。** 本库驱动的是微信官方客户端的本地接口（数据库解密 + UI 自动化），从 1.0.0 到现在没有任何账号被封的先例，但风险自担：**这个仓库随时可能消失**（被 DMCA、被限流、被作者删库都可能）。用就珍惜——装版本前把 wheel/sdist 留一份本地副本，更新前先看完 changelog。
 
 
 注：本库完全由AI（opencode+deepseek-v4-flash）生成
