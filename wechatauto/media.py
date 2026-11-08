@@ -9,8 +9,8 @@ server_id、packed_info），本模块负责把媒体内容从本地取回/解�
     local_type 3   图片     → 会话目录 msg/attach/<会话md5>/<YYYY-MM>/Img/<md5>.dat
     local_type 34  语音     → message/media_0.db VoiceInfo.voice_data（SILK 二进制）
     local_type 43  视频     → msg/video/<YYYY-MM>/<id>.mp4（未落地时返回 None）
-    local_type 49  文件     → msg/file/<YYYY-MM>/<原文件名>，原名取自
-                            message_resource.db MessageResourceDetail.packed_info
+    local_type 49 / (6<<32)|49 文件 → msg/file/<YYYY-MM>/<原文件名>，原名优先取
+                            文件消息 XML，兼容资源库中的旧版纯文件名
 
 图片加密（v2 格式，本库已在本机验证）::
 
@@ -44,6 +44,7 @@ import re
 import struct
 import tempfile
 import time
+import xml.etree.ElementTree as ET
 from typing import List, Optional, Tuple
 from wechatauto.logger import wxlog
 
@@ -52,6 +53,8 @@ V2_MAGIC = b"\x07\x08\x56\x32\x08\x07"
 V1_HEADER_SZ = 22  # 6B sig + 16B xor key
 AES16_RE = re.compile(rb"[0-9a-zA-Z]{16,32}")
 DEFAULT_SAVE_PATH = os.path.join(os.path.expanduser("~"), "Documents", "wechatauto_media")
+# 49 是旧版文件码；复合应用消息只接受 subtype=6，不能把链接/引用也当文件。
+_FILE_TYPES = (49, (6 << 32) | 49)
 
 
 def _jpeg_like(pt: bytes) -> bool:
@@ -1889,7 +1892,57 @@ class MediaDownloader:
                     return out
         return None
 
-    def _file_name(self, row: dict) -> Optional[str]:
+    def _file_info(self, row: dict) -> Optional[Tuple[str, Optional[int], Optional[str]]]:
+        """同一文件消息的原名、长度和摘要；非法元数据不能降级为按名猜测。"""
+        def text(parent, tag, required=False):
+            nodes = parent.findall(tag)
+            if len(nodes) > 1 or (required and not nodes):
+                raise ValueError(tag)
+            if not nodes:
+                return None
+            value = nodes[0].text or ""
+            if not value.strip() or len(nodes[0]):
+                raise ValueError(tag)
+            return value if tag == "title" else value.strip()
+
+        for field in ("content", "compress_content"):
+            content = row.get(field)
+            if isinstance(content, bytes):
+                content = self.db._friendly_content(content, "文件")
+            if not isinstance(content, str) or not content:
+                continue
+            # 只剥离群发送者前缀，不从引用卡片内部寻找另一个 msg。
+            match = re.fullmatch(r"(?:[^<\r\n]+:\s*)?(<.*)", content.strip(), re.S)
+            if not match:
+                continue
+            content = match.group(1)
+            if len(content) > 2 * 1024 * 1024 or re.search(r"<!\s*(?:DOCTYPE|ENTITY)", content, re.I):
+                return None
+            try:
+                root = ET.fromstring(content)
+            except ET.ParseError:
+                continue
+            apps = [root] if root.tag == "appmsg" else root.findall("appmsg") if root.tag == "msg" else []
+            try:
+                if len(apps) != 1 or text(apps[0], "type", True) != "6":
+                    return None
+                appmsg = apps[0]
+                name = text(appmsg, "title", True).split("/")[-1].split("\\")[-1]
+                if name in ("", ".", "..") or any(ord(char) < 32 for char in name):
+                    return None
+                attachments = appmsg.findall("appattach")
+                if len(attachments) > 1:
+                    return None
+                size = text(attachments[0], "totallen") if attachments else None
+                md5 = text(appmsg, "md5")
+                if size is not None and not re.fullmatch(r"[0-9]+", size):
+                    return None
+                if md5 is not None and not re.fullmatch(r"[0-9a-fA-F]{32}", md5):
+                    return None
+                return name, int(size) if size is not None else None, md5.lower() if md5 else None
+            except ValueError:
+                return None
+        # 旧库可直接保存纯文件名；protobuf 的字段标签不能当文件名。
         if not row["server_id"]:
             return None
         for rel, path, _ in self.db._db_files:
@@ -1906,37 +1959,99 @@ class MediaDownloader:
             finally:
                 conn.close()
             if r and r["packed_info"]:
-                name = r["packed_info"].decode("utf-8", "replace").strip()
+                try:
+                    name = r["packed_info"].decode("utf-8").strip()
+                except UnicodeDecodeError:
+                    return None
                 name = re.sub(r"[\r\n\x00]+", "", name)
+                if any(ord(char) < 32 for char in name):
+                    return None
                 if "/" in name or "\\" in name:
                     name = name.split("/")[-1].split("\\")[-1]
-                return name or None
+                return (name, None, None) if name and name not in (".", "..") else None
             break
         return None
 
+    def _file_name(self, row: dict) -> Optional[str]:
+        info = self._file_info(row)
+        return info[0] if info else None
+
+    @staticmethod
+    def _file_matches(path, size, md5):
+        try:
+            if size is not None and os.path.getsize(path) != size:
+                return False
+            if md5:
+                digest = hashlib.md5()
+                with open(path, "rb") as source:
+                    for block in iter(lambda: source.read(1024 * 1024), b""):
+                        digest.update(block)
+                return digest.hexdigest() == md5
+            return True
+        except OSError:
+            return False
+
     def download_file(self, user: str, local_id: int, save_dir: Optional[str] = None,
                       shard: Optional[str] = None) -> Optional[str]:
-        """文件：msg/file/<YYYY-MM>/<原文件名>，原文件名来自 message_resource
+        """文件：msg/file/<YYYY-MM>/<原文件名>，原名取自文件 XML 或旧版资源库。
 
         ``shard``：把消息行里的 ``shard``（分片库文件名）原样传回，用于跨分片
             同号时锁定那一条；不传则按 ``sort_seq`` 取最新并告警。
         """
-        row = self.db.get_message_row(user, local_id, local_type=49, shard=shard)
-        if not row or row["local_type"] != 49:
+        rows = [r for r in self.db.get_message_rows_for_media(user, local_id)
+                if r["local_type"] in _FILE_TYPES and (not shard or r.get("shard") == shard)]
+        if not rows:
             return None
-        name = self._file_name(row)
-        if not name:
+        row = rows[0]  # 公开候选接口已按 sort_seq 降序排列。
+        if not shard and len({r["local_type"] for r in rows}) > 1:
+            # 精确类型查询看不到跨类型冲突；候选已齐全，直接用最新行且只告警一次。
+            wxlog.warning("文件 local_id=%s（会话 %s）在 %d 个分片命中不同文件类型，"
+                          "取 sort_seq 最新的一条；要精确请带 shard=", local_id, user, len(rows))
+        else:
+            # 同类型冲突仍由 DB 负责排序与歧义告警。
+            row = self.db.get_message_row(user, local_id, local_type=row["local_type"], shard=shard)
+        if not row:
             return None
+        info = self._file_info(row)
+        if not info:
+            wxlog.warning("文件 local_id=%s 元数据缺失或非法，未导出", local_id)
+            return None
+        name, size, md5 = info
         base = os.path.join(self.db.account_dir, "msg", "file")
+        stem, extension = os.path.splitext(name)
+        family = re.compile(r"%s(?:\([1-9][0-9]*\))?%s" % (re.escape(stem), re.escape(extension)))
+        candidates = []
         for root, _, files in os.walk(base):
             for f in files:
-                if f == name:
-                    out = self._out(save_dir, "%s_%s_%s" % (user, local_id, name))
-                    with open(out, "wb") as w:
-                        with open(os.path.join(root, f), "rb") as r:
-                            w.write(r.read())
-                    return out
-        return None
+                if family.fullmatch(f):
+                    candidates.append(os.path.join(root, f))
+        # 无摘要的旧消息仅保留唯一精确原名兼容，不能凭大小/时间猜数字后缀。
+        if not md5 and (len(candidates) != 1 or os.path.basename(candidates[0]) != name):
+            wxlog.warning("文件 local_id=%s 无摘要且缓存缺失或有歧义，未导出", local_id)
+            return None
+        source = next((p for p in candidates if self._file_matches(p, size, md5)), None)
+        if not source:
+            wxlog.warning("文件 local_id=%s 缓存与消息长度/摘要不符或不存在，未导出", local_id)
+            return None
+        import shutil
+        # 内容目录隔离跨分片同号；basename 仍保留消息原名。
+        directory = os.path.join(save_dir or self.save_dir, md5) if md5 else save_dir
+        out = self._out(directory, "%s_%s_%s" % (user, local_id, name))
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=os.path.dirname(out), delete=False) as destination:
+                temporary = destination.name
+                with open(source, "rb") as original:
+                    shutil.copyfileobj(original, destination)
+            # 缓存可能在读取期间变化；只发布实际复制后仍通过校验的完整文件。
+            if not self._file_matches(temporary, size, md5):
+                wxlog.warning("文件 local_id=%s 复制后校验失败，未导出", local_id)
+                return None
+            os.replace(temporary, out)
+            return out
+        finally:
+            if temporary and os.path.exists(temporary):
+                os.remove(temporary)
 
     @staticmethod
     def _find_preview_button(ctrl, name, max_depth=8):
@@ -2331,7 +2446,7 @@ class MediaDownloader:
                                      "%s_%s" % (user, local_id), save_dir)
 
     def download_media(self, user: str, local_id: int, save_dir: Optional[str] = None) -> Optional[str]:
-        """按消息类型自动分发：3 图片 / 34 语音 / 43 视频 / 49 文件。
+        """按消息类型自动分发：3 图片 / 34 语音 / 43 视频 / 49 或复合 subtype=6 文件。
 
         跨分片下 local_id 可能对应多类型，逐个尝试下载直到成功。
         分发时会带上候选行的 ``shard``，所以拿到的是候选行本身而不是别的分片的同号行。
@@ -2347,6 +2462,6 @@ class MediaDownloader:
                 return self.download_voice(user, local_id, save_dir, shard=sd)
             if t == 43:
                 return self.download_video(user, local_id, save_dir, shard=sd)
-            if t == 49:
+            if t in _FILE_TYPES:
                 return self.download_file(user, local_id, save_dir, shard=sd)
         return None
