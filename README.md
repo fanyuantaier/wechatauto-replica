@@ -203,6 +203,18 @@ the existing HWND/PID checks; closing the target does not select another account
 - **Sending** — WeChat 4.x chat UI is self-drawn (no accessibility nodes), so sending uses a hybrid driver: hot-activate the **Qt accessibility gate** inside Weixin.dll (RVA scan, writes the screen-reader flag) to materialize the `mmui::*` UIA tree — search box, `chat_input_field`, etc. Sending is **UIA-first, coordinate + OCR fallback**: auto-calibrating layout (`~/.wechatauto/layout-<machine>.json`), zoomed OCR (3x) with multi-round voting for rare Chinese characters, clipboard + Ctrl+V input to dodge IME interception.
 - **Media** — image `.dat` files are `[6B sig][4B aes_size][4B xor_size] + AES-ECB + plaintext + xor` chunks. The account-level AES key is transient (only resident in memory while viewing an image); `MediaDownloader` scans for it, validates via JPEG/PNG magic, and **persists it to `image_keys.json`** so later runs need no scanning (or pass `image_key=` explicitly). Voice is plain SILK read from `media_0.db`; files are read from `msg/file/` with original names resolved from `message_resource.db`.
 
+### Why this is not a hook / injection
+
+None of the following techniques are used or needed — verifiable by grepping the source:
+
+| Common assumption | Fact |
+|---|---|
+| "It injects a DLL / code into WeChat" | The codebase contains **zero** occurrences of `CreateRemoteThread` / `LoadLibrary` / `VirtualAllocEx` / `SetWindowsHookEx` — WeChat never executes any non-WeChat code |
+| "It hooks WeChat's message callbacks" | Zero occurrences of `SetWindowsHookEx`; messages are read by polling the **decrypted on-disk database files**, never via in-process callbacks |
+| "Cross-process write = injection" | The only cross-process write is a `WriteProcessMemory` of **one single byte** (turning on WeChat's built-in Qt accessibility flag, original value restored on a wrong candidate) — flipping a switch, not writing executable content |
+
+Three real technical routes: **read** = decrypt local SQLite/SQLCipher files (`ReadProcessMemory` is used only to fetch the 32-byte decryption key from your own logged-in session); **send** = standard system automation interfaces (UIA + `SendInput` + clipboard + OCR); **switch** = that single accessibility byte. All data stays on the local machine — there is no upload path.
+
 ## ⚖️ vs wxauto
 
 | | wxauto | wechatauto-replica |
@@ -216,7 +228,7 @@ the existing HWND/PID checks; closing the target does not select another account
 ## ⚠️ Known Limitations
 
 1. **WeChat must be logged in** — DB keys live in process memory; cached after first extraction, re-extracted automatically after re-login.
-2. **Image AES key is transient** — only resident while viewing an image; persisted to `image_keys.json` once found, or inject via `image_key=`.
+2. **Image AES key is transient** — only resident while viewing an image; persisted to `image_keys.json` once found, or pass it explicitly via `image_key=`.
 3. **Sending is a GUI operation** — fails cleanly when the window is locked/unresponsive (operations return a clear failure).
 4. **Videos** are downloadable only when the mp4 already exists on disk (`msg/video/`).
 5. **A group-chat image exists in up to three tiers** — `<md5>_t.dat` thumbnail, `<md5>.dat` the copy WeChat pushes by default, `<md5>_h.dat` the **real original**, which is only written after the image has been opened with 「查看原图 / 图片原始大小」 in WeChat. Ask before you retry: `MediaDownloader.image_status(user, local_id)` / `list_image_status(user)` report which tiers exist and why (`ok` / `mid_only` / `only_thumbnail` / `original_partial` / …), and `download_image(user, local_id, tier='original'|'best'|'mid'|'thumb')` picks a tier explicitly — `tier='original'` returns `None` instead of quietly handing back the compressed copy, and the tier is written into the filename (`_h` / none / `_thumb`). Not passing `tier` keeps the pre-1.2.4.2 behaviour verbatim. Measured over 4271 image messages in 211 sessions here: 2210 `mid_only`, 1428 `only_thumbnail`, 626 with a real original on disk — roughly **1 in 7**, so "cannot download the original" is usually WeChat's storage policy, not a decryption failure. `download_image_original()` still exists to trigger the fetch through the UI.
@@ -619,9 +631,15 @@ Thanks to [dhz1145](https://github.com/dhz1145) for the fix round spanning [issu
 
 ## 📄 License & Disclaimer
 
-Apache-2.0. This project is for personal learning and automation research only — please respect the WeChat software license agreement and applicable laws.
+Apache-2.0. This project is for **personal learning and automation research** only — please respect the WeChat software license agreement and applicable laws.
+
+**Hard usage boundaries:**
+
+1. **Operate only your own logged-in WeChat account.** The library reads data your own account produced on your own machine and drives your own logged-in client. It does not provide — and must not be used for — operating anyone else's account or collecting other people's information without their consent.
+2. **No bulk marketing, multi-account cluster control, automated friend-adding for marketing, or scraping other people's personal data.** Those uses violate WeChat's personal account policy and can trigger the PRC Anti-Unfair Competition Law, the Personal Information Protection Law, or Articles 285/286 of the PRC Criminal Law — WeChat cluster-control tools have been sued for unfair competition (¥2.6M judgment) and providers of harvesting tools have been prosecuted for "providing intrusion programs".
+3. By using this library you acknowledge that **automating WeChat violates its user agreement**; your account may be rate-limited, restricted, or banned, and all consequences are on you.
 
 > [!WARNING]
-> **用就别怕。** 本库驱动的是微信官方客户端的本地接口（数据库解密 + UI 自动化），从 1.0.0 到现在没有任何账号被封的先例，但风险自担：**这个仓库随时可能消失**（被 DMCA、被限流、被作者删库都可能）。用就珍惜——装版本前把 wheel/sdist 留一份本地副本，更新前先看完 changelog。
+> **Risk is yours.** This library drives the local interfaces of the official WeChat client (database decryption + UI automation); a risk-control forced re-login has occurred during development, and account restriction is always possible. **This repository may disappear at any time** (DMCA, throttling, or the author deleting it). Keep a local copy of the wheel/sdist before installing, and read the changelog before updating.
 
 Contact: fanyuantaier@163.com

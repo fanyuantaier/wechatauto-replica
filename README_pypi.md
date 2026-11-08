@@ -429,7 +429,7 @@ wechatauto 朋友圈 --me              # 看自己发的朋友圈
 ### v1.2.1（2026-09-06）
 
 - **新增「引用消息并发送」（测试版）**：`WeChatGUI.quote_msg(text, who, target_text=None, verify=False)` 右键定位消息 → 弹出菜单选择「引用」→ 输入内容并发送；`target_text` 省略时引用最近一条。`quick_quote()` 提供一行式入口，示例脚本 `wechatauto/demo_quote.py`。
-  - **测试版说明**：引用功能走「坐标 + OCR + SendInput」模拟点击路线，依赖微信 4.1.x 自绘渲染布局；随窗口尺寸/DPI/会话内容不同可能存在定位偏差。右键采用 `SendInput` 注入（微信渲染窗口对 `mouse_event` 右键不响应），光标先 `SetCursorPos` 移至目标再注入，避免“只移动不点击 / 只点击不移动”的错位。使用中发现定位不准时请调整会话内消息布局后重试。
+  - **测试版说明**：引用功能走「坐标 + OCR + SendInput」模拟点击路线，依赖微信 4.1.x 自绘渲染布局；随窗口尺寸/DPI/会话内容不同可能存在定位偏差。右键采用 `SendInput` 投递（微信渲染窗口对 `mouse_event` 右键不响应），光标先 `SetCursorPos` 移至目标再投递，避免“只移动不点击 / 只点击不移动”的错位。使用中发现定位不准时请调整会话内消息布局后重试。
 - **移除 `desktop_available()` 桌面白屏判定**：控件定位已全面走 UIA，不再依赖整窗截图白色占比采样——该判定在微信窗口正常时曾误报「窗口不可见」。`ensure_visible()` 现以窗口句柄存活判定可见性，保留「最小化遮挡窗口 + 置顶微信」的前置动作。
 
 ### v1.2.0.3（2026-08-31）
@@ -777,10 +777,22 @@ D:\微信文件\xwechat_files\<wxid>_xxxx\db_storage\
 - **AES 密钥**：16 字节 ASCII，账户级稳定密钥，但仅在微信查看图片时驻留
   进程内存。`MediaDownloader` 通过内存扫描反测（AES 解首块后校验 JPEG/PNG
   魔数）获取，**命中后持久化到 `image_keys.json`**；也支持 `image_key=` 参数
-  显式注入。本机实测：单一密钥稳定解密 35/40 张随机图片（其余为微信动画
+  显式传入。本机实测：单一密钥稳定解密 35/40 张随机图片（其余为微信动画
   表情容器 `wxgf`）。
 - **XOR 密钥**：单字节，从同图缩略图 `<md5>_t.dat` 尾部 JPEG 结束标记
   `FF D9` 反推（`key = tail[0] ^ 0xFF`）。
+
+### 2.6 为什么这不是 hook / 注入
+
+本库不使用、也不需要下面这三类技术，源码可审计验证（`grep` 即可复核）：
+
+| 常见误解 | 事实 |
+|---|---|
+| 「往微信里注入了 DLL/代码」 | 全库**没有** `CreateRemoteThread` / `LoadLibrary` / `VirtualAllocEx` / `SetWindowsHookEx` 中任何一个——从未让微信执行过任何非微信自身的代码 |
+| 「挂钩了微信的消息回调」 | 全库**没有** `SetWindowsHookEx`；消息读取靠轮询解密**落盘的本地数据库文件**，不走任何进程内回调 |
+| 「跨进程写 = 注入」 | 唯一的跨进程写入是 `WriteProcessMemory` 写 **1 个字节**（打开微信自带的 Qt accessibility 开关，候选地址不对时写回原值）——是「拨开关」，不是写入可执行内容 |
+
+三条真实的技术路线：**读** = 解密本机 SQLite/SQLCipher 文件（`ReadProcessMemory` 仅用于从你自己已登录的会话里读取 32 字节解密密钥）；**写** = 系统标准自动化接口（UIA + `SendInput` + 剪贴板 + OCR）；**开关** = 上述 1 字节 accessibility 标志。所有数据留在本机，没有上传通道。
 
 ---
 
@@ -823,7 +835,7 @@ for m in db.get_messages(who, limit=10):      # 最近消息
 from wechatauto import WeChatDB, MediaDownloader
 
 db = WeChatDB()
-md = MediaDownloader(db)                      # 可传 image_key="..." 注入图片密钥
+md = MediaDownloader(db)                      # 可传 image_key="..." 手动指定图片密钥
 key = md.detect_image_key()                   # 内存扫描/缓存取 AES+XOR 密钥
 print(key)
 
@@ -1059,10 +1071,15 @@ quick_send_file(r'D:\资料\报告.pdf', '文件传输助手')
 └── pyproject.toml
 ```
 
-## 九、免责声明
+## 九、免责声明与使用边界
 
-本项目仅用于个人学习与自动化研究，请遵守微信软件许可协议及当地法律法规，
-勿用于任何违反规定的用途。
+本项目仅用于**个人学习与自动化研究**，请遵守《腾讯微信软件许可及服务协议》及当地法律法规。
+
+**使用边界（硬性限定）：**
+
+1. **仅限操作用户本人已登录的微信账号**——不提供、也不应被用于操作任何他人账号或未经同意采集他人信息。
+2. **禁止用于批量营销、群控多账号、自动加好友营销、未经他人同意收集他人个人信息**等场景——这些用途既违反微信个人账号使用规范，也可能触犯《反不正当竞争法》《个人信息保护法》乃至《刑法》第二百八十五/二百八十六条（已有群控工具被判赔 260 万、获客工具提供者被追刑责的先例）。
+3. 使用本库即表示你已理解：**使用第三方自动化工具违反微信用户协议**，账号可能被风控、限制或封禁，全部后果由使用者自担。
 
 
 注：本库完全由AI（opencode+deepseek-v4-flash）生成
@@ -1248,6 +1265,18 @@ Runnable demo: `python -m wechatauto.demo_moments_interact [--like N | --unlike 
 - **Reading** — WeChat 4.x stores everything in SQLCipher 4 encrypted SQLite databases under `xwechat_files/<wxid>/db_storage/` (`contact.db`, `message_*.db`, `media_0.db`, `sns.db`, …). Each DB has its own 32-byte key living in the Weixin.exe process memory (`com.Tencent.WCDB.Config.Cipher` config objects). The library locates them with a **read-only memory scan**, validates candidates with SQLCipher HMAC rules, decrypts pages to a temp dir and caches the result (first decrypt ~6s, then instant). WAL incremental merging with frame-salt filtering prevents `database disk image is malformed` corruption.
 - **Sending** — WeChat 4.x chat UI is self-drawn (no accessibility nodes), so sending uses a hybrid driver: hot-activate the **Qt accessibility gate** inside Weixin.dll (RVA scan, writes the screen-reader flag) to materialize the `mmui::*` UIA tree — search box, `chat_input_field`, etc. Sending is **UIA-first, coordinate + OCR fallback**: auto-calibrating layout (`~/.wechatauto/layout-<machine>.json`), zoomed OCR (3x) with multi-round voting for rare Chinese characters, clipboard + Ctrl+V input to dodge IME interception.
 - **Media** — image `.dat` files are `[6B sig][4B aes_size][4B xor_size] + AES-ECB + plaintext + xor` chunks. The account-level AES key is transient (only resident in memory while viewing an image); `MediaDownloader` scans for it, validates via JPEG/PNG magic, and **persists it to `image_keys.json`** so later runs need no scanning (or pass `image_key=` explicitly). Voice is plain SILK read from `media_0.db`; files are read from `msg/file/` with original names resolved from `message_resource.db`.
+
+### Why this is not a hook / injection
+
+None of the following techniques are used or needed — verifiable by grepping the source:
+
+| Common assumption | Fact |
+|---|---|
+| "It injects a DLL / code into WeChat" | The codebase contains **zero** occurrences of `CreateRemoteThread` / `LoadLibrary` / `VirtualAllocEx` / `SetWindowsHookEx` — WeChat never executes any non-WeChat code |
+| "It hooks WeChat's message callbacks" | Zero occurrences of `SetWindowsHookEx`; messages are read by polling the **decrypted on-disk database files**, never via in-process callbacks |
+| "Cross-process write = injection" | The only cross-process write is a `WriteProcessMemory` of **one single byte** (turning on WeChat's built-in Qt accessibility flag, original value restored on a wrong candidate) — flipping a switch, not writing executable content |
+
+Three real technical routes: **read** = decrypt local SQLite/SQLCipher files (`ReadProcessMemory` is used only to fetch the 32-byte decryption key from your own logged-in session); **send** = standard system automation interfaces (UIA + `SendInput` + clipboard + OCR); **switch** = that single accessibility byte. All data stays on the local machine — there is no upload path.
 
 ## ⚖️ vs wxauto
 
@@ -1637,9 +1666,15 @@ Thanks to [dhz1145](https://github.com/dhz1145) for the fix round spanning [issu
 
 ## 📄 License & Disclaimer
 
-Apache-2.0. This project is for personal learning and automation research only — please respect the WeChat software license agreement and applicable laws.
+Apache-2.0. This project is for **personal learning and automation research** only — please respect the WeChat software license agreement and applicable laws.
+
+**Hard usage boundaries:**
+
+1. **Operate only your own logged-in WeChat account.** No operating anyone else's account, no collecting other people's information without consent.
+2. **No bulk marketing, multi-account cluster control, automated friend-adding for marketing, or scraping other people's personal data.** Those uses violate WeChat's personal account policy and can trigger the PRC Anti-Unfair Competition Law, the Personal Information Protection Law, or Articles 285/286 of the PRC Criminal Law (a WeChat cluster-control tool was fined ¥2.6M for unfair competition; providers of harvesting tools have been prosecuted).
+3. By using this library you acknowledge that **automating WeChat violates its user agreement**; your account may be rate-limited, restricted, or banned, and all consequences are on you.
 
 > [!WARNING]
-> **用就别怕。** 本库驱动的是微信官方客户端的本地接口（数据库解密 + UI 自动化），从 1.0.0 到现在没有任何账号被封的先例，但风险自担：**这个仓库随时可能消失**（被 DMCA、被限流、被作者删库都可能）。用就珍惜——装版本前把 wheel/sdist 留一份本地副本，更新前先看完 changelog。
+> **Risk is yours.** This library drives the local interfaces of the official WeChat client (database decryption + UI automation); a risk-control forced re-login has occurred during development, and account restriction is always possible. **This repository may disappear at any time** (DMCA, throttling, or the author deleting it). Keep a local copy of the wheel/sdist before installing, and read the changelog before updating.
 
 Contact: fanyuantaier@163.com
