@@ -73,6 +73,7 @@ FOLDER_ROW_CLS = "mmui::ContactsManagerControlFolderCell"   # '朋友权限' / '
 GROUP_FOLDER = "标签"        # 折叠时整组标签行（含「新建标签」）都不在树里
 DETAIL_CELL_CLS = "mmui::ContactsManagerDetailCell"       # name='昵称  标签'
 DETAIL_LIST_CLS = "mmui::ContactsManagerDetailView"
+DETAIL_HEADER_CLS = "mmui::ContactsManagerHBoxlayoutClickArea"
 PICKER_ROW_CLS = "mmui::SPSelectionContactRow"            # CheckBoxControl
 # 在选择框里**搜过之后**，结果行换了个类名（实测 4.1.15.13：容器也从
 # StickyHeaderRecyclerListView 变成 SearchContactView/XTableView）
@@ -92,7 +93,6 @@ BTN_CONFIRM_DELETE = "删除"
 BTN_REMOVE_MEMBER = "移出标签"
 BTN_SET_LABEL = "设置标签"
 BTN_UNCHECK = "取消选择"
-CHECKBOX_INSET_PX = 70        # 成员行左侧圆形复选框：实测在行左边缘 +70px
 
 VK_CONTROL, VK_V, VK_RETURN = 0x11, 0x56, 0x0D
 KEYEVENTF_KEYUP = 0x0002
@@ -952,18 +952,55 @@ class LabelOps:
             time.sleep(0.5)
 
     def _selected_count(self, picker) -> Optional[int]:
-        """读「已选择N个联系人」；读不到返回 None（表示这条判据不可用，不猜 0）。"""
-        for nm in self._names(picker, 300):
-            m = SELECTED_RE.search(nm)
-            if m:
-                return int(m.group(1))
-        return None
+        """读取合并文案或管理窗同一行的「已选择 / N / 人」；不明时不猜 0。"""
+        counts = set()
+        stack = [(picker, 0)]
+        while stack:
+            control, depth = stack.pop()
+            if control is None or depth > 30:
+                continue
+            try:
+                match = SELECTED_RE.search((control.Name or "").strip())
+                if match:
+                    counts.add(int(match.group(1)))
+                children = list(control.GetChildren())
+                for index, child in enumerate(children[:-1]):
+                    if (child.Name or "").strip() != "已选择":
+                        continue
+                    number = children[index + 1]
+                    text = (number.Name or "").strip()
+                    if number.ControlTypeName == "ButtonControl" and text.isdecimal():
+                        counts.add(int(text))
+                stack.extend((child, depth + 1) for child in children)
+            except Exception as exc:
+                wxlog.debug("读取选择人数失败：%s", exc)
+                return None
+        return next(iter(counts)) if len(counts) == 1 else None
+
+    def _detail_checkbox_point(self, win, cell) -> Optional[Tuple[int, int]]:
+        """选择框不进 UIA，用行左界和昵称列左界之间的选择列定位，避免点到头像。"""
+        try:
+            headers = [header for header in self._rows(win, DETAIL_HEADER_CLS)
+                       if (header.Name or "").strip() == "昵称"]
+            if len(headers) != 1:
+                return None
+            row = cell.BoundingRectangle
+            header = headers[0].BoundingRectangle
+            width = header.left - row.left
+            if (row.width() <= 0 or row.height() <= 0 or header.width() <= 0
+                    or header.height() <= 0 or header.bottom > row.top
+                    or not 0 < width < row.width() or width > row.height() * 2):
+                return None
+            return (row.left + header.left) // 2, (row.top + row.bottom) // 2
+        except Exception as exc:
+            wxlog.debug("读取成员选择列失败：%s", exc)
+            return None
 
     def remove_members(self, label: str, members: Sequence[str]) -> Dict:
         """选中标签 → 勾成员行左侧复选框 → 底部「移出标签」。
 
-        复选框**不进 UIA**（成员行是叶子节点），实测位置在行左边缘 +70px；
-        选中后底部会浮出「已选择 N 人 / 取消选择 / 设置标签 / 移出标签 / 删除」。
+        复选框不进 UIA，依据当前选择列定位；每次点击后核实选择人数增加，
+        不能把点击投递成功或已有操作栏当作勾选成功。
         """
         label = (label or "").strip()
         names = [str(m).strip() for m in (members or []) if str(m).strip()]
@@ -984,8 +1021,14 @@ class LabelOps:
             return r
         time.sleep(1.2)
         ph, win = self._root(MGR_TITLE)
+        selected = self._selected_count(win)
+        if selected not in (None, 0) or (selected is None and self._find(
+                win, (BTN_REMOVE_MEMBER,), contains=False) is not None):
+            return _result(False, "selection-not-empty：已有选择或选择人数读不到，不移出",
+                           label=label, selected=selected)
+        selected = 0
         clicked, missing = [], []
-        for nm in names:
+        for nm in dict.fromkeys(names):
             cell = None
             for c in self._rows(win, DETAIL_CELL_CLS):
                 raw = (c.Name or "").strip()
@@ -995,13 +1038,26 @@ class LabelOps:
             if cell is None:
                 missing.append(nm)
                 continue
-            rr = cell.BoundingRectangle
-            # 复选框是**窄目标**而且不进 UIA（只能按实测锚点打：行左边缘 +70px），
-            # 抖 x 就直接点空了——这一击故意留在固定点上，不跟着 rhythm.point 抖。
-            got = self._click(ph, cell,
-                              at=(rr.left + CHECKBOX_INSET_PX, (rr.top + rr.bottom) // 2))
-            (clicked if got["ok"] else missing).append(nm)
-            ph, win = self._root(MGR_TITLE)
+            point = self._detail_checkbox_point(win, cell)
+            if point is None:
+                return _result(False, "no-checkbox：选择列位置不明确，不点击成员行",
+                               label=label, clicked=clicked, missing=missing, member=nm)
+            got = self._click(ph, cell, at=point)
+            if not got["ok"]:
+                return dict(got, label=label, clicked=clicked, missing=missing, member=nm)
+            deadline = time.monotonic() + self.appear_timeout
+            while True:
+                ph, win = self._root(MGR_TITLE)
+                actual = self._selected_count(win)
+                if actual == selected + 1:
+                    selected = actual
+                    clicked.append(nm)
+                    break
+                if time.monotonic() >= deadline or actual not in (None, selected):
+                    return _result(False, "not-selected：点击后选择人数未按预期增加，不移出",
+                                   label=label, clicked=clicked, missing=missing, member=nm,
+                                   selected_before=selected, selected_after=actual)
+                time.sleep(0.2)
         if not clicked:
             return _result(False, "no-member：一个都没勾上（成员只列可视区，"
                                   "或者名字和显示名不一致）", label=label,
@@ -1020,6 +1076,10 @@ class LabelOps:
         count_after = now["count"] if now else None
         if count_after is None or count_after >= count_before:
             return _result(False, "count-unchanged：点了移出但人数没变",
+                           label=label, clicked=clicked, missing=missing,
+                           count_before=count_before, count_after=count_after)
+        if count_after != count_before - len(clicked):
+            return _result(False, "count-mismatch：人数变化与已选成员数不一致",
                            label=label, clicked=clicked, missing=missing,
                            count_before=count_before, count_after=count_after)
         return _result(True, "ok", label=label, clicked=clicked, missing=missing,

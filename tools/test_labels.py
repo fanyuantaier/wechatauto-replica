@@ -130,7 +130,7 @@ def label_cell(name, count):
 def detail_cell(nick, label="同学", remark=""):
     """成员行：``昵称 备注 标签`` 三段拼，空段留空格（实测就是这个格式）。"""
     return Node("%s %s %s" % (nick, remark, label),
-                L.DETAIL_CELL_CLS, "ListItemControl")
+                L.DETAIL_CELL_CLS, "ListItemControl", rect=(816, 700, 1216, 748))
 
 
 def main_window(mgr_row=True, tab=True):
@@ -170,9 +170,11 @@ def mgr_window(labels=(("同学", 63), ("大人", 18)), members=("小明", "小�
     for i, r in enumerate(rows):          # 一行一格，80px（实测就是这个间距）
         at(r, 432 + i * 80)
     panel = Node("", "mmui::ContactsManagerControlView", "ListControl", rows)
+    header = Node("昵称", L.DETAIL_HEADER_CLS, "ButtonControl",
+                  rect=(880, 664, 997, 696))
     detail = Node("", L.DETAIL_LIST_CLS, "ListControl",
-                  [detail_cell(m) for m in members])
-    win = Node("通讯录管理", L.MGR_WIN_CLS, "WindowControl", [panel, detail])
+                  [detail_cell(m) for m in members], rect=(816, 700, 1216, 940))
+    win = Node("通讯录管理", L.MGR_WIN_CLS, "WindowControl", [panel, header, detail])
     win.hidden_group = [] if not collapsed else group     # 点开分组时插回去
     return win
 
@@ -247,7 +249,11 @@ class WechatSim:
         self.counter = picker[1] if picker else None
         self.popup = None           # 当前弹层：(hwnd, control)
         self.bar = None             # 底部动作条（勾了成员才出现）
+        self.selection_status = self.selection_counter = None
         self.checked = []           # 成员行里勾上的
+        self.last_click_point = None
+        self.member_click_points = []
+        self.profile_open = False
         self.picked = []            # 选择框里勾上的
         self.clip = None
         self.rename_pending = False
@@ -319,6 +325,8 @@ class WechatSim:
         det = self.first_detail()
         if det is not None:
             det._kids = self.pool[self.page:self.page + self.PAGE]
+            for index, cell in enumerate(det._kids):
+                cell.BoundingRectangle = Rect(816, 700 + index * 48, 1216, 748 + index * 48)
 
     def wheel(self, delta):
         """滚一小格：虚拟化列表换掉顶上的行（不滚就永远只看到第一屏）。
@@ -426,18 +434,32 @@ class WechatSim:
             self.editing = new          # 微信把新行直接放行内编辑态
             return
         if L.DETAIL_CELL_CLS in cls:
+            point = self.last_click_point
+            self.member_click_points.append(point)
+            rect = ctrl.BoundingRectangle
+            # 实测选择圆直径16px、距行左侧24px；头像区域不能当成已勾选。
+            if point is None or not in_rect(point, rect.left + 24, rect.top + 16,
+                                            rect.left + 40, rect.top + 32):
+                self.profile_open = True
+                return
             who = (ctrl.Name or "").split("  ")[0].strip()
-            if who and who not in self.checked:
+            if who in self.checked:
+                self.checked.remove(who)
+            elif who:
                 self.checked.append(who)
             if self.bar is None:
                 self.bar = Node(L.BTN_REMOVE_MEMBER, "mmui::XMouseEventView",
                                 "ButtonControl")
-                self.mgr.add(
+                self.selection_counter = Node("0", "mmui::XButton", "ButtonControl")
+                self.selection_status = Node("", "mmui::XHBoxView", kids=[
                     Node("已选择", "mmui::XTextView", "TextControl"),
-                    Node(str(len(self.checked)), "mmui::XButton", "ButtonControl"),
+                    self.selection_counter,
+                    Node("人", "mmui::XTextView", "TextControl"),
                     Node(L.BTN_UNCHECK, "mmui::XTextView", "TextControl"),
                     Node(L.BTN_SET_LABEL, "mmui::XMouseEventView", "ButtonControl"),
-                    self.bar)
+                    self.bar])
+                self.mgr.add(self.selection_status)
+            self.selection_counter.Name = str(len(self.checked))
             return
         if nm == L.BTN_REMOVE_MEMBER:
             self.set_count("同学", -len(self.checked))
@@ -446,6 +468,8 @@ class WechatSim:
             if det is not None:
                 det.drop(lambda k: (k.Name or "").split("  ")[0].strip() in gone)
             self.checked = []
+            self.mgr.drop(lambda k: k is self.selection_status)
+            self.bar = self.selection_status = self.selection_counter = None
             return
         if (L.PICKER_ROW_CLS in cls or L.PICKER_SEARCH_ROW_CLS in cls) and nm:
             if nm not in self.picked:
@@ -573,6 +597,7 @@ class Ops(L.LabelOps):
         r = L.LabelOps._click(self, hwnd, ctrl, right=right, at=at,
                               raise_it=raise_it)
         if r["ok"]:
+            self.sim.last_click_point = r["point"]
             self.sim.click(ctrl, right)
         return r
 
@@ -660,7 +685,8 @@ def _nap(sec):
                 w.left_pending = []
 
 
-L.time = types.SimpleNamespace(sleep=_nap, time=__import__("time").time)
+L.time = types.SimpleNamespace(sleep=_nap, time=__import__("time").time,
+                               monotonic=__import__("time").monotonic)
 if L._USER32 is None:
     print("非 Windows：取不到 user32，落点归属那几条测不了，本套件不适用")
     sys.exit(2)
@@ -1071,12 +1097,17 @@ o, sim = build(labels=(("同学", 63),), db_names=("同学",))
 r = o.remove_members("同学", ["小明", "小红"])
 check("G1 勾复选框 → 底部「移出标签」→ 人数 63 → 61",
       (code(r), r.get("count_before"), r.get("count_after")), ("ok", 63, 61))
-check("G2 复选框点的是行左边缘 +70px（不是行中心）",
-      [c[0] for c in o.uia_obj.clicks if c[0] == 816 + L.CHECKBOX_INSET_PX][:1],
-      [886])
+check("G2 两个落点均命中实际选择圆，而非头像或行中心",
+      sim.member_click_points, [(848, 724), (848, 772)])
 check("G3 移走的人不再出现在成员列表里",
       [(c.Name or "").split("  ")[0] for c in sim.first_detail().GetChildren()],
       ["小刚"])
+
+o, sim = build(labels=(("同学", 63),), db_names=("同学",))
+cell = sim.first_detail().GetChildren()[0]
+o._click(sim.MGR, cell, at=(886, 724))
+check("G3b 旧落点只打开资料，不选中成员或生成操作栏",
+      (sim.profile_open, sim.checked, sim.bar), (True, [], None))
 
 o, sim = build(labels=(("同学", 63),), db_names=("同学",))
 r = o.remove_members("同学", ["查无此人"])
@@ -1281,9 +1312,8 @@ check("L2 每个落点都还在这一行的矩形里（归属校验照旧成立�
 o, sim = build()
 cell = first(sim.mgr, lambda c: L.LABEL_ROW_CLS in (c.ClassName or "")
              and (c.Name or "").startswith("同学"))
-check("L3 窄目标（复选框）那一击仍然钉在实测锚点上",
-      o._click(sim.MGR, cell, at=(816 + L.CHECKBOX_INSET_PX, 700))["point"][0],
-      816 + L.CHECKBOX_INSET_PX)
+check("L3 调用者明确给出的窄目标坐标不随机偏移",
+      o._click(sim.MGR, cell, at=(840, 850))["point"], (840, 850))
 
 print()
 print("通过 %d，失败 %d" % (len(PASSED), len(FAILED)))
