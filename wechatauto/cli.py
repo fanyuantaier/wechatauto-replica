@@ -261,21 +261,27 @@ def cmd_send(args):
 def cmd_images(args):
     db = _db()
     user, display = resolve_chat(db, args.chat)
-    from wechatauto.media import MediaDownloader
-    md = MediaDownloader(db, save_dir=args.out)
-    if not md.detect_image_key():
-        return _die("拿不到图片 AES 密钥：在微信里点开任意一张图片，让它驻留内存几秒"
-                    "后重跑（`doctor` 会显示当前状态）")
+    from wechatauto.media import ImageKeyUnavailable, MediaDownloader
+    md = MediaDownloader(db, save_dir=args.out, image_key_scan_timeout=8.0)
     rows = db.get_image_rows(user, limit=args.limit) or []
     got = miss = bad = 0
     for r in rows:
-        lid = r.get("local_id")
-        if args.original:
-            # 驱动真实界面去要原件：会点气泡、可能弹预览窗，走完一轮才回。
-            out = md.download_image_original(user, lid, save_dir=args.out,
-                                             chat_name=display)
-        else:
-            out = md.download_image(user, lid, save_dir=args.out, tier=args.tier)
+        lid, shard = r["local_id"], r.get("shard")
+        try:
+            if args.original:
+                out = md.download_image_original(user, lid, save_dir=args.out,
+                                                 chat_name=display, shard=shard)
+            else:
+                out = md.download_image(user, lid, save_dir=args.out,
+                                        tier=args.tier, shard=shard)
+        except ImageKeyUnavailable:
+            out = None
+            if not args.original and args.tier is None:
+                out = md.save_visible_image(user, lid, display, save_dir=args.out, shard=shard)
+            if not out:
+                bad += 1
+                print("  · local_id=%s 未取得图片密钥，未导出" % lid)
+                continue
         if out:
             got += 1
             print("  ✓ %s" % out)
@@ -283,14 +289,14 @@ def cmd_images(args):
             bad += 1
         else:
             miss += 1
-            st = md.image_status(user, lid)
+            st = md.image_status(user, lid, shard=shard)
             print("  · local_id=%s 本机档位=%s reason=%s"
                   % (lid, st.get("tiers"), st.get("reason")))
     print("%s：%d 张已存 / %d 张本机没有 / %d 张没拿到"
           % (display or user, got, miss, bad))
     if miss and not args.original:
         print("提示：本机没有的那些，加 --original 会驱动微信界面去下载（会真的动你的微信窗口）")
-    return 0
+    return 1 if bad else 0
 
 
 def cmd_listen(args):
@@ -640,7 +646,7 @@ def build_parser():
     s.add_argument("--limit", type=int, default=50)
     s.add_argument("--out", help="保存目录（默认库里的 DEFAULT_SAVE_PATH）")
     s.add_argument("--tier", choices=["original", "full", "best", "mid", "thumb"],
-                   help="本机有哪一档给哪一档；不传 = 旧行为")
+                   help="只读取指定的本机档位；省略时若未取得密钥，可从当前会话的微信预览窗保存可见图片")
     s.add_argument("--original", action="store_true",
                    help="本机没有原件就驱动微信界面去下载（真的会动你的窗口）")
 
