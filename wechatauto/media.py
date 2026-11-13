@@ -92,12 +92,17 @@ def strip_container_footer(plain: bytes) -> Tuple[bytes, int]:
     return plain, 0
 
 
+class ImageKeyUnavailable(RuntimeError):
+    """本次没有找到可验证的图片密钥。"""
+
+
 class MediaDownloader:
     """微信 4.x 媒体下载器"""
 
     def __init__(self, db, save_dir: Optional[str] = None,
                  image_key: Optional[str] = None,
-                 cfg_dword: Optional[int] = None):
+                 cfg_dword: Optional[int] = None, *,
+                  image_key_scan_timeout: Optional[float] = None):
         self.db = db
         self.save_dir = save_dir or DEFAULT_SAVE_PATH
         self._image_key = image_key  # 显式注入的图片 AES 密钥
@@ -105,6 +110,8 @@ class MediaDownloader:
         self._xor_key: Optional[int] = None
         self._img_key: Optional[Tuple[str, int]] = None
         self._key_probe: Optional[bytes] = None
+        self._image_key_scan_timeout = image_key_scan_timeout
+        self._image_key_scan_deadline: Optional[float] = None
 
     @staticmethod
     def derive_image_keys(cfg_dword: int, wxid: str) -> Tuple[str, int]:
@@ -286,6 +293,11 @@ class MediaDownloader:
         pids = self.db._find_weixin_pids()
         if not pids:
             return None
+        deadline = time.monotonic() + max(0.0, monitor_timeout)
+        if self._image_key_scan_timeout is not None:
+            if self._image_key_scan_deadline is None:
+                self._image_key_scan_deadline = time.monotonic() + self._image_key_scan_timeout
+            deadline = min(deadline, self._image_key_scan_deadline)
         from . import db as _dbmod
         k32 = _dbmod._k32
         MBI = _dbmod._MBI
@@ -321,12 +333,14 @@ class MediaDownloader:
         def _scan_once() -> Optional[str]:
             # 保持微信进程原顺序扫描(主进程靠前, 命中率高)
             for pid in pids:
+                if time.monotonic() >= deadline:
+                    return None
                 h = k32.OpenProcess(0x0010 | 0x0400, False, pid)
                 if not h:
                     continue
                 try:
                     addr = 0
-                    while True:
+                    while time.monotonic() < deadline:
                         mbi = MBI()
                         r = k32.VirtualQueryEx(h, ctypes.c_void_p(addr), ctypes.byref(mbi), ctypes.sizeof(mbi))
                         if r == 0:
@@ -340,6 +354,8 @@ class MediaDownloader:
                             buf = read_mem(h, mbi.BaseAddress or 0, mbi.RegionSize)
                             if buf:
                                 for key in _candidates(buf):
+                                    if time.monotonic() >= deadline:
+                                        return None
                                     if _try_key(key):
                                         return key.decode("ascii", "replace")
                         addr = (mbi.BaseAddress or 0) + mbi.RegionSize
@@ -348,17 +364,16 @@ class MediaDownloader:
             return None
 
         found = _scan_once()
-        if found or not monitor:
+        if found or not monitor or time.monotonic() >= deadline:
             return found
 
         print(
             "未在微信进程内存中找到图片 AES 密钥。\n"
             "请现在打开微信，进入任意聊天，点击一张图片查看大图，\n"
-            f"本程序将在 {monitor_timeout:.0f} 秒内自动捕获密钥..."
+            f"本程序将再等待最多 {max(0, deadline - time.monotonic()):.0f} 秒..."
         )
-        start = time.time()
-        while time.time() - start < monitor_timeout:
-            time.sleep(2.0)
+        while (remaining := deadline - time.monotonic()) > 0:
+            time.sleep(min(2.0, remaining))
             found = _scan_once()
             if found:
                 return found
@@ -462,7 +477,7 @@ class MediaDownloader:
         if aes_key is None:
             aes_key = self._resolve_aes_key(probe)
             if not aes_key:
-                raise RuntimeError(
+                raise ImageKeyUnavailable(
                     "无法获取图片 AES 密钥：请保持微信登录，并先在微信聊天中"
                     "打开（点击查看大图）任意一张图片，再重试 detect_image_key()；"
                     "或通过 MediaDownloader(image_key='...') 手动传入密钥。"
@@ -1213,6 +1228,155 @@ class MediaDownloader:
             return None
         data = self.decrypt_image(pick[0], aes_key, xor_key)
         return self._write_decrypted(data, "%s_%s%s" % (user, local_id, suffix), save_dir)
+
+    def save_visible_image(self, user: str, local_id: int, display: str,
+                           save_dir: Optional[str] = None,
+                           shard: Optional[str] = None) -> Optional[str]:
+        """通过微信的保存对话框导出当前会话里能唯一定位的图片。"""
+        import win32api
+        import win32con
+        import win32gui
+        import win32process
+        from comtypes import COMError
+        from .guia import WeChatGUI
+        from .uia_driver import WeChatUIA
+
+        names = (display, "文件传输助手", "File Transfer") if user == "filehelper" else (display,)
+        try:
+            gui = WeChatGUI()
+            hwnd = gui.main_hwnd
+            uia = WeChatUIA(hwnd=hwnd)
+            if not uia.ensure_window(wake=False) or uia.current_chat() not in names:
+                return None
+            if gui._get_db().account != self.db.account:
+                return None
+            if self._preview_windows(recheck=False) or not gui.bring_to_front():
+                return None
+            lst = uia._message_list()
+            if lst is None or uia.current_chat() not in names:
+                return None
+            visible = self._visible_rows(lst)
+        except (COMError, OSError, RuntimeError, win32gui.error) as exc:
+            wxlog.debug("无法定位当前微信会话：%s", type(exc).__name__)
+            return None
+        recent = self.db.get_messages(user, limit=400)
+        db_rows = [{"kind": self._DB_ROW_KIND[r["type"]], "content": r["content"],
+                    "local_id": (r["local_id"], r["shard"])}
+                   for r in reversed(recent) if r["type"] in self._DB_ROW_KIND]
+        index = self._align_index(visible, db_rows, (local_id, shard), min_score=1.0)
+        if index is None:
+            return None
+        row = self.db.get_message_row(user, local_id, local_type=3, shard=shard)
+        if not row:
+            return None
+        shard_suffix = "_" + hashlib.sha256(shard.encode()).hexdigest()[:12] if shard else ""
+        stem = "%s_%s%s_preview" % (user, local_id, shard_suffix)
+        rect = visible[index][2].BoundingRectangle
+        y = (rect.top + rect.bottom) // 2
+        cursor = win32gui.GetCursorPos()
+        try:
+            for x in self._bubble_click_xs(rect, self._sent_by_self(row)):
+                if win32gui.GetForegroundWindow() != hwnd or not gui.point_belongs_to_wechat(x, y):
+                    break
+                gui.wx_click(x, y)
+                until = time.monotonic() + 2.0
+                while time.monotonic() < until:
+                    for preview, control in self._preview_windows(recheck=False):
+                        if win32process.GetWindowThreadProcessId(preview)[1] != gui.pid:
+                            continue
+                        try:
+                            return self._save_visible_preview(gui, preview, control, stem, save_dir)
+                        finally:
+                            if win32gui.IsWindow(preview):
+                                win32gui.PostMessage(preview, win32con.WM_CLOSE, 0, 0)
+                    time.sleep(.15)
+        except (COMError, OSError, win32gui.error) as exc:
+            wxlog.debug("微信图片预览失败：%s", type(exc).__name__)
+        finally:
+            win32api.SetCursorPos(cursor)
+        return None
+
+    def _save_visible_preview(self, gui, preview, control, stem, save_dir):
+        import uiautomation as auto
+        from comtypes import COMError
+        import win32con
+        import win32gui
+        from PIL import Image
+
+        def click(rect, owner):
+            x = (rect.left + rect.right) // 2
+            y = (rect.top + rect.bottom) // 2
+            point_window = win32gui.WindowFromPoint((x, y))
+            if (win32gui.GetForegroundWindow() != owner or not point_window
+                    or win32gui.GetAncestor(point_window, 2) != owner):
+                return False
+            gui._input.real_click(x, y)
+            return True
+
+        save = self._find_preview_button(control, ("保存", "Save"))
+        if save is None or not click(save.BoundingRectangle, preview):
+            return None
+        until = time.monotonic() + 4.0
+        dialog = 0
+        while time.monotonic() < until:
+            fg = win32gui.GetForegroundWindow()
+            if (fg and win32gui.GetClassName(fg) == "#32770"
+                    and win32gui.GetWindow(fg, win32con.GW_OWNER) == preview):
+                dialog = fg
+                break
+            time.sleep(.15)
+        if not dialog:
+            return None
+
+        output_dir = os.path.abspath(save_dir or self.save_dir)
+        os.makedirs(output_dir, exist_ok=True)
+        try:
+            dlg = auto.ControlFromHandle(dialog)
+            edit = dlg.EditControl(AutomationId="1001", searchDepth=8)
+            if not edit.Exists(1.0):
+                return None
+            ok = win32gui.GetDlgItem(dialog, 1)
+            value = edit.GetValuePattern()
+            with tempfile.TemporaryDirectory(prefix=".wa-image-", dir=output_dir) as directory:
+                suffix = os.path.splitext(value.Value or "")[1]
+                target = os.path.join(directory, "image" + (suffix if suffix.lower() in self._SAVE_EXT else ".jpg"))
+                edit_handle = edit.NativeWindowHandle
+                if not edit_handle or win32gui.GetAncestor(edit_handle, win32con.GA_ROOT) != dialog:
+                    return None
+                edit.SetFocus()
+                if win32gui.GetForegroundWindow() != dialog or not edit.HasKeyboardFocus:
+                    return None
+                win32gui.SendMessage(edit_handle, win32con.EM_SETSEL, 0, -1)
+                win32gui.SendMessage(edit_handle, win32con.EM_REPLACESEL, 0, target)
+                if value.Value != target:
+                    wxlog.debug("微信保存对话框未接受目标文件名")
+                    return None
+                if not click(auto.ControlFromHandle(ok).BoundingRectangle, dialog):
+                    return None
+                until = time.monotonic() + 6.0
+                while time.monotonic() < until:
+                    if os.path.isfile(target) and not win32gui.IsWindowVisible(dialog):
+                        with Image.open(target) as image:
+                            image.load()
+                            extension = {"JPEG": ".jpg", "PNG": ".png", "GIF": ".gif",
+                                         "WEBP": ".webp", "BMP": ".bmp"}.get(image.format)
+                        if extension:
+                            out = os.path.join(output_dir, stem + extension)
+                            os.replace(target, out)
+                            return out
+                        return None
+                    fg = win32gui.GetForegroundWindow()
+                    if fg and win32gui.GetWindow(fg, win32con.GW_OWNER) == dialog:
+                        # 新路径无需确认覆盖；有二级弹窗时退出，不确认未知操作。
+                        win32gui.PostMessage(fg, win32con.WM_CLOSE, 0, 0)
+                        return None
+                    time.sleep(.15)
+        except (COMError, OSError, win32gui.error) as exc:
+            wxlog.debug("微信预览保存失败：%s", type(exc).__name__)
+        finally:
+            if win32gui.IsWindow(dialog):
+                win32gui.PostMessage(dialog, win32con.WM_CLOSE, 0, 0)
+        return None
 
     @staticmethod
     def _scroll_list(lst, delta: int, times: int, uia, hwnd, pid) -> bool:
