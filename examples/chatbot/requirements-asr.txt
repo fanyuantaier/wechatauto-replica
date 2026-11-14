@@ -1,0 +1,2 @@
+pysilk-mod==1.6.4
+faster-whisper==1.2.1
