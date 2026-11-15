@@ -110,18 +110,17 @@ python -m wechatauto 备注 小明 --to 新备注          # 改联系人备注�
 | 坑 | 不吸收会怎样 | CLI 怎么做 |
 |---|---|---|
 | 读库要 `username`，驱动界面要显示名（微信搜索框不认 wxid） | 把 wxid 填进搜索框 → 搜不到 → 白等几十秒返回 `None`，日志里也看不出为什么 | `resolve_chat()`：`filehelper` / `wxid_*` / `*@chatroom` 直通；给昵称/备注就查 `contact.db` 补成 username；**同名多人时明确报错要你用 wxid，不随便挑一个**；通讯录里没有（群）就照原样传 |
-| 下载图片要先有图片 AES 密钥 | 每张都返回 `None`，看起来像「库坏了」 | `images` 进门先 `detect_image_key()`，拿不到就直接说「在微信里点开任意一张图后重跑」，并提示 `doctor` 能看状态 |
+| V2 图片缓存需要 AES 密钥 | 扫描候选密钥可能拖住导出 | `images` 按目标图片读取缓存，并为命令内的密钥扫描共用 8 秒预算。省略 `--tier` 和 `--original` 时，如果没拿到密钥，可尝试保存微信当前会话中能唯一定位的可见图片 |
 | Windows 控制台是 GBK | 中文正文/箭头直接 `UnicodeEncodeError`，或打印成 `?` | `main()` 第一件事把 stdout/stderr 重设为 UTF-8（`errors="replace"`）；`export` 永远写 UTF-8 文件 |
 
 另外两条是显示层的：视频/文件/引用这类正文是整段 XML，CLI 刮成 `[非文本正文] playlength=151
 length=4211669` 这种一行提示（原文要用 `--json` 看）；`--type` 中英文都收（`image` 和 `图片`
 等价），因为库里类型名是中文，只收中文会让人以为「这个会话没有图片」。
 
-**边界要说清**：`send` / `listen` / `images --original` 会驱动真实客户端，走 `rhythm`
+**边界要说清**：`send` / `listen` / `images --original` 会驱动真实客户端。默认 `images` 的预览保存也会操作微信窗口，文件名带 `_preview`。只读缓存可指定 `--tier best`。界面操作走 `rhythm`
 节流档（默认 `natural`），和直接用那些对象没有区别——CLI 不会绕过任何闸门，也不会替你
 点「进入微信」。退出码：0 成功、非 0 失败、2 是没给子命令（打印帮助）。
-`doctor` 是排查入口：它把「数据库密钥几张能用 / 图片密钥有没有 / 控件树物化没有」三件事
-一次说完，这三件里任何一件为 0，后面的命令都会失败，而且失败原因各不相同。
+`doctor` 会报告可用的数据库密钥、图片密钥和 UIA 控件树状态。
 
 ---
 
