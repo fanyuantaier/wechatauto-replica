@@ -10,6 +10,9 @@
 import os
 import re
 import sys
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 SRC = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, SRC)
@@ -182,6 +185,26 @@ for letter in ("c", "d"):
           % (letter.upper(), probe_a, probe_b), probe_a == probe_b, False)
     check("%s 盘上新写法恒为 %sxwechat_files" % (letter.upper(), drv),
           os.path.join(_abs_root(drv), "xwechat_files"), drv + "xwechat_files")
+
+print("\n--- H. Windows 文档重定向：保留注册表优先级和原有回退路径 ---")
+with TemporaryDirectory() as directory:
+    redirected = Path(directory) / "redirected"
+    profile = Path(directory) / "profile"
+    redirected_root = redirected / "xwechat_files"
+    legacy_root = profile / "Documents" / "xwechat_files"
+    registry_root = Path(directory) / "configured"
+    for root in (redirected_root, legacy_root, registry_root):
+        (root / "test_account" / "db_storage").mkdir(parents=True)
+    with patch.dict(os.environ, {"USERPROFILE": str(profile)}), \
+         patch.object(dbmod, "_config_candidates", return_value=[]), \
+         patch.object(dbmod, "_registry_data_dirs", return_value=[]) as registry, \
+         patch.object(dbmod, "_windows_documents_dir", return_value=str(redirected)) as documents:
+        check("从重定向的文档目录定位", dbmod.auto_detect_db_dir(), str(redirected_root))
+        registry.return_value = [str(registry_root)]
+        check("微信的注册表设置优先", dbmod.auto_detect_db_dir(), str(registry_root))
+        registry.return_value = []
+        documents.return_value = None
+        check("系统目录不可用时回退原路径", dbmod.auto_detect_db_dir(), str(legacy_root))
 
 print("\n结果：%d 通过 / %d 失败" % (len(PASSED), len(FAILED)))
 for n in FAILED:

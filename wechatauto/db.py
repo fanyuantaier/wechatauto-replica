@@ -3332,13 +3332,26 @@ def _locate_account_root(root: Optional[str]) -> Optional[str]:
     return None
 
 
+def _windows_documents_dir() -> Optional[str]:
+    """读取 Windows 当前「文档」目录，兼容共享盘及文件夹重定向。"""
+    try:
+        from pywintypes import error as ShellError
+        from win32com.shell import shell
+    except ImportError:
+        return None
+    try:
+        return shell.SHGetKnownFolderPath(shell.FOLDERID_Documents)
+    except (ShellError, OSError):
+        return None
+
+
 def auto_detect_db_dir() -> Optional[str]:
     """自动定位微信 4.x 数据目录（不同电脑存储位置不同）。
 
     探测顺序：
       1. 微信配置文件（%APPDATA%/%LOCALAPPDATA%，支持 JSON/纯路径/任意文本）；
       2. 注册表；
-      3. 常见默认目录（Documents / 用户主目录）。
+      3. Windows 当前「文档」目录，再回退到用户目录下的 Documents 和用户主目录。
     """
     # 1) 配置文件
     for cfg_dir in _config_candidates():
@@ -3367,7 +3380,8 @@ def auto_detect_db_dir() -> Optional[str]:
             return hit
     # 3) 常见默认目录兜底
     userprofile = os.environ.get("USERPROFILE", "")
-    for base in (os.path.join(userprofile, "Documents"), userprofile):
+    documents = _windows_documents_dir()
+    for base in (documents, os.path.join(userprofile, "Documents"), userprofile):
         hit = _locate_account_root(base)
         if hit:
             return hit
