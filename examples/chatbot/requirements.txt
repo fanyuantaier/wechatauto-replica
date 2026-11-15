@@ -1,0 +1,4 @@
+# 从仓库根目录先执行 python -m pip install -e .
+requests>=2.31.0
+pycaw>=20240210
+imageio-ffmpeg>=0.5

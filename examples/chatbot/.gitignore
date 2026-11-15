@@ -1,0 +1,22 @@
+# 本地身份、密钥及运行数据：禁止提交
+config.json
+.env
+.env.*
+data/*
+!data/README.md
+stickers/*
+!stickers/README.md
+images/
+logs/
+models/
+ocr_models/
+wechatauto_logs/
+wechatauto_db/
+__pycache__/
+*.py[cod]
+*.db
+*.sqlite*
+*.zip
+*.bak
+*.bad
+*.tmp

@@ -1092,3 +1092,6 @@ quick_send_file(r'D:\资料\报告.pdf', '文件传输助手')
 ## 十、联系方式
 
 - 邮箱：fanyuantaier@163.com
+# 可选机器人示例
+
+独立示例见 [`examples/chatbot/`](examples/chatbot/README.md)：群聊机器人、可选视觉/本地语音/视频处理和本地记忆。需自行配置接口及获授权的会话，默认不含密钥或真实联系人，不改变库默认行为。
