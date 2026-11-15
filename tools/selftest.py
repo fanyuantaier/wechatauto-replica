@@ -3525,7 +3525,7 @@ def t_cli() -> None:
         made = []
         calls = []
 
-        def __init__(self, db, save_dir=None):
+        def __init__(self, db, save_dir=None, image_key_scan_timeout=None):
             self.save_dir = save_dir
             FakeMD.made.append(self)
 
@@ -3534,15 +3534,21 @@ def t_cli() -> None:
 
         no_key = False
 
-        def download_image(self, user, lid, save_dir=None, tier=None):
+        def download_image(self, user, lid, save_dir=None, tier=None, shard=None):
             FakeMD.calls.append(("local", lid))
+            if self.no_key:
+                raise media_mod.ImageKeyUnavailable("无密钥")
             return "%s/%s_%s.jpg" % (save_dir, user, lid)
 
-        def download_image_original(self, user, lid, save_dir=None, chat_name=None):
+        def save_visible_image(self, user, lid, display, save_dir=None, shard=None):
+            FakeMD.calls.append(("preview", lid))
+            return None
+
+        def download_image_original(self, user, lid, save_dir=None, chat_name=None, shard=None):
             FakeMD.calls.append(("ui", lid, chat_name))
             return None
 
-        def image_status(self, user, lid):
+        def image_status(self, user, lid, shard=None):
             return {"tiers": {"thumb": 900}, "reason": "only_thumbnail"}
 
     class ImgDB(FakeDB):
@@ -3559,8 +3565,8 @@ def t_cli() -> None:
                                                    original=False))
         finally:
             cli._db = o_db
-        check("拿不到图片密钥 → 非零退出并说清怎么办（点开一张图）",
-              rc != 0 and "密钥" in txt and "点开" in txt, txt.strip()[:60])
+        check("拿不到图片密钥 → 非零退出并说清未导出",
+              rc != 0 and "未取得图片密钥" in txt, txt.strip()[:60])
         FakeMD.no_key = False
         FakeMD.calls = []
         o_db = cli._db
