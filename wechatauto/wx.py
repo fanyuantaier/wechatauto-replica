@@ -1861,7 +1861,36 @@ class WeChat(Chat, Listener):
                         and w["cls"].startswith("Qt"):
                     return w["hwnd"]
             _t.sleep(0.25)
-        wxlog.debug("独立窗：双击后 %ss 内没出现标题为 %r 的窗口", timeout, who)
+        # 4.2.0.53：双击不再打开独立窗，但会话行右键菜单的「独立窗口显示」仍可靠
+        # （4.2.0.11/4.2.0.53 双平台验证）。重物化树 → 右键 → 点菜单项。
+        uia.ensure_materialized(force=True)
+        main = uia._find_main()
+        if main is None:
+            wxlog.debug("独立窗：双击无效且树重物化失败")
+            return None
+        uia._set_cursor(cx, cy)
+        _t.sleep(0.2)
+        uia._right_click()
+        _t.sleep(1.4)
+        menu_item = None
+        for c, _d in _uia.WalkControl(main, maxDepth=22):
+            if (c.ClassName or "") == "mmui::XMenuView" \
+                    and (c.Name or "").strip() == "独立窗口显示":
+                menu_item = c
+                break
+        if menu_item is None:
+            wxlog.debug("独立窗：右键菜单里没有「独立窗口显示」")
+            return None
+        mr = menu_item.BoundingRectangle
+        uia._click_at(int((mr.left + mr.right) // 2), int((mr.top + mr.bottom) // 2))
+        deadline = _t.time() + timeout
+        while _t.time() < deadline:
+            for w in self._list_top_windows():
+                if w["hwnd"] not in before and w["title"] == who \
+                        and w["cls"].startswith("Qt"):
+                    return w["hwnd"]
+            _t.sleep(0.25)
+        wxlog.debug("独立窗：右键菜单后 %ss 内没出现标题为 %r 的窗口", timeout, who)
         return None
 
     def ChatWindow(self, who: str) -> Optional['Chat']:
