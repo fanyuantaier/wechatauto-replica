@@ -92,6 +92,7 @@ VK_CONTROL = 0x11
 VK_SHIFT = 0x10
 VK_RETURN = 0x0D
 _OCR_OFF_LOGGED = False          # 停用 OCR 的提示只播一次
+_OCR_BACKEND_LOGGED = False      # winsdk/winrt 双缺的提示只播一次
 VK_SPACE = 0x20
 VK_ESCAPE = 0x1B
 VK_DELETE = 0x2E
@@ -412,7 +413,30 @@ class ScreenOCR:
     所有依赖 OCR 的功能（guia 的侧栏/搜索/发送按钮兜底、朋友圈元素识别、
     uia_driver 内部的 OCR 兜底）自动退化为「找不到」。这是总闸，放在引擎入口
     是因为调用点分散在三个模块，逐处加开关迟早会漏。
+
+    WinRT 桥双后端（issue #63）：``winsdk`` 停更在 1.0.0b10（wheel 只到
+    cp310，Python 3.11+ 装不上），官方后继 pywinrt 的分包 ``winrt-*`` 与它
+    API 同构、仅模块前缀不同（winsdk.* → winrt.*）。两个都装了优先 winsdk，
+    只装其一就用那个，都没有则 OCR 明确停用。
     """
+
+    @staticmethod
+    def _winrt_modules():
+        """返回 (OcrEngine, BitmapDecoder, StorageFile)；双包都不可用时 None。"""
+        try:
+            from winsdk.windows.media.ocr import OcrEngine
+            from winsdk.windows.graphics.imaging import BitmapDecoder
+            from winsdk.windows.storage import StorageFile
+            return OcrEngine, BitmapDecoder, StorageFile
+        except ImportError:
+            pass
+        try:
+            from winrt.windows.media.ocr import OcrEngine
+            from winrt.windows.graphics.imaging import BitmapDecoder
+            from winrt.windows.storage import StorageFile
+            return OcrEngine, BitmapDecoder, StorageFile
+        except ImportError:
+            return None
 
     @staticmethod
     def available() -> bool:
@@ -427,9 +451,15 @@ class ScreenOCR:
                 wxlog.info('WxParam.ENABLE_OCR=False：OCR 全部停用，相关功能改走 UIA，'
                            '没有 UIA 等价物的操作会明确失败（不盲点坐标）')
             return []
-        from winsdk.windows.media.ocr import OcrEngine
-        from winsdk.windows.graphics.imaging import BitmapDecoder
-        from winsdk.windows.storage import StorageFile
+        mods = ScreenOCR._winrt_modules()
+        if mods is None:
+            global _OCR_BACKEND_LOGGED
+            if not _OCR_BACKEND_LOGGED:
+                _OCR_BACKEND_LOGGED = True
+                wxlog.info('winsdk/winrt 都不可用：OCR 停用（Python 3.11+ 请安装 '
+                           'winrt-runtime 与 winrt-Windows.Media.Ocr 等分包）')
+            return []
+        OcrEngine, BitmapDecoder, StorageFile = mods
 
         async def _run() -> List[Tuple[str, int, int, int, int]]:
             # 每次唯一临时文件：固定名在并发 OCR（发送校验 × 朋友圈观察）时会互相覆盖
