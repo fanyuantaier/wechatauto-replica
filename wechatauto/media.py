@@ -41,9 +41,12 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import struct
+import subprocess
 import tempfile
 import time
+import wave
 import xml.etree.ElementTree as ET
 from typing import List, Optional, Tuple
 from wechatauto.logger import wxlog
@@ -94,6 +97,22 @@ def strip_container_footer(plain: bytes) -> Tuple[bytes, int]:
 
 class ImageKeyUnavailable(RuntimeError):
     """本次没有找到可验证的图片密钥。"""
+
+
+def _find_silkdec() -> Optional[str]:
+    """定位 SILK 解码器 silkdec.exe（微信语音转 PCM 用）。
+
+    查找顺序：环境变量 WECHATAUTO_SILKDEC → 包内 wechatauto/bin/silkdec.exe → PATH。
+    找不到返回 None（调用方退回 .silk 原文件）。二进制来源与重建见
+    wechatauto/bin/README.md。
+    """
+    env = os.environ.get("WECHATAUTO_SILKDEC")
+    if env and os.path.isfile(env):
+        return env
+    bundled = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin", "silkdec.exe")
+    if os.path.isfile(bundled):
+        return bundled
+    return shutil.which("silkdec") or shutil.which("silkdec.exe")
 
 
 class MediaDownloader:
@@ -1991,12 +2010,55 @@ class MediaDownloader:
                 "download_status": ds, "available": reason == "ok",
                 "bytes": size, "reason": reason}
 
+    def silk_to_wav(self, silk_path: str, wav_path: Optional[str] = None,
+                    rate: int = 24000) -> Optional[str]:
+        """SILK → WAV（默认 24kHz 单声道 16bit），需 silkdec.exe（见 wechatauto/bin/README.md）。
+
+        解码器查找顺序见 :func:`_find_silkdec`；不可用时返回 None（调用方退回 .silk）。
+        WAV 封装用标准库 wave（PCM 由 silkdec 解出，16bit 小端）。
+        """
+        exe = _find_silkdec()
+        if not exe:
+            return None
+        wav_path = wav_path or (os.path.splitext(silk_path)[0] + ".wav")
+        fd, pcm_path = tempfile.mkstemp(suffix=".pcm")
+        os.close(fd)
+        try:
+            proc = subprocess.run([exe, silk_path, pcm_path, str(rate)],
+                                  capture_output=True, timeout=60)
+            if proc.returncode != 0 or not os.path.exists(pcm_path) \
+                    or os.path.getsize(pcm_path) == 0:
+                wxlog.debug("silk→wav 失败：%s"
+                            % (proc.stderr or b"").decode("utf-8", "ignore")[:160])
+                return None
+            with open(pcm_path, "rb") as f:
+                pcm = f.read()
+            with wave.open(wav_path, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(rate)
+                wf.writeframes(pcm)
+            return wav_path
+        except Exception as e:
+            wxlog.debug("silk→wav 异常：%s: %s" % (type(e).__name__, str(e)[:120]))
+            return None
+        finally:
+            try:
+                os.remove(pcm_path)
+            except OSError:
+                pass
+
     def download_voice(self, user: str, local_id: int, save_dir: Optional[str] = None,
-                       shard: Optional[str] = None) -> Optional[str]:
+                       shard: Optional[str] = None, to_wav: bool = False) -> Optional[str]:
         """语音：media_*.db VoiceInfo.voice_data（SILK 二进制），落盘 .silk
 
         ``shard``：把消息行里的 ``shard``（分片库文件名）原样传回，用于跨分片
             同号时锁定那一条；不传则按 ``sort_seq`` 取最新并告警。
+
+        ``to_wav``：True 时用 silkdec.exe（包内 ``wechatauto/bin/silkdec.exe``，
+            2026-11-21 起随库分发）把 .silk 解码成 24kHz 单声道 WAV 并返回 .wav
+            路径（.silk 仍保留）；解码器不可用时退回 .silk。SILK 为明文流，
+            与图片密钥体系无关。
 
         微信按账号/时间把语音分片存到多个 media_*.db，逐个搜索直到找到。
 
@@ -2032,6 +2094,12 @@ class MediaDownloader:
                 out_path = self._out(save_dir, "%s_%s.silk" % (user, local_id))
                 with open(out_path, "wb") as f:
                     f.write(v["voice_data"])
+                if to_wav:
+                    wav = self.silk_to_wav(out_path)
+                    if wav:
+                        return wav
+                    wxlog.debug("语音 %s/%s silk→wav 不可用（找不到 silkdec.exe），返回 .silk"
+                                % (user, local_id))
                 return out_path
         st = self.voice_status(user, local_id)
         wxlog.debug("语音 %s/%s 取不到音频，原因=%s（download_status=%s）"
