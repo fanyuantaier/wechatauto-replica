@@ -130,6 +130,14 @@ class MediaDownloader:
         cfg_dword = self._cfg_dword
         if cfg_dword is None:
             cfg_dword = getattr(self.db, "cfg_dword", None)
+        # 4.2.0.53：db.extract_image_key_seed 已解出 MD5hex32（image_digest）——
+        # 存储摘要前 16 字符就是 ASCII AES key，优先于复算（复算依赖 cfgDword 精确值）。
+        digest = getattr(self.db, "image_digest", None)
+        if digest and re.fullmatch(r"[0-9a-f]{32}", digest):
+            aes_key = digest[:16]
+            xor_key = cfg_dword & 0xFF if cfg_dword else None
+            if self._validate_key(aes_key, probe):
+                return aes_key, (xor_key or 0)
         if not cfg_dword:
             return None
         aes_key, xor_key = self.derive_image_keys(cfg_dword, self.db.wxid)
