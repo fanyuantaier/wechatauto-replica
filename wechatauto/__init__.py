@@ -14,6 +14,7 @@ from .moment import Moment, MomentDB
 from .moment_observer import MomentObserver
 from .db import WeChatDB, GroupMemberWatcher, auto_detect_db_dir, list_accounts
 from .media import MediaDownloader
+from .auto_download import AutoFileDownloader
 from .recall import RecallGuard
 from .guia import (
     WeChatGUI,
