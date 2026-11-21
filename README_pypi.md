@@ -1,4 +1,4 @@
-﻿# wechatauto-replica — 微信 4.x Windows 自动化 / WeChat 4.x Automation
+# wechatauto-replica — 微信 4.x Windows 自动化 / WeChat 4.x Automation
 
 > **中文版** 在下方 · **English version below**
 
@@ -49,9 +49,9 @@ discovery still selects main windows, with existing HWND/PID checks preserved.
 本项目复刻上游 wxauto 项目，目标是实现对当前微信 4.x Windows 客户端的自动化
 （读取消息、发送消息、媒体下载、朋友圈），非网页版，直接操作本机客户端。
 
-> 当前版本：1.2.10
+> 当前版本：1.3.0
 >
-> **兼容范围**：Windows 10/11 ｜ Python 3.9+（已在 3.12 验证）｜ 微信 **4.1.12+**（已在 4.1.15.53 / 4.2.0.11 验证）
+> **兼容范围**：Windows 10/11 ｜ Python 3.9+（已在 3.12 验证）｜ 微信 **4.1.12+**（已在 4.1.15.53 / 4.2.0.11 / 4.2.0.53 验证）
 > （数据库读取路线对微信版本不敏感；坐标+OCR 发送路线依赖 4.1.12+ 自绘渲染
 > 布局，UIA 控件树随小版本变化——4.1.15 起搜索入口改为收起式，已适配；
 > 其它小版本可能需校准 `guia.py` 布局常量与 gate RVA 表）。
@@ -114,6 +114,15 @@ wechatauto 朋友圈 --me              # 看自己发的朋友圈
 ---
 
 ## 版本记录
+
+### v1.3.0（2026-11-21）
+
+- ⚠️ **重要修复：微信 4.2.0.53 图片密钥适配（`extract_image_key_seed`）。** 旧 `global_config` 地标 + 0x138 链失效，新被动只读链（dll+0xBB6B788 单例 → account → cfgDword/掩码摘要），派生公式未变（`MD5(str(N)+wxid)` hex 前 16 字符）；全程 ReadProcessMemory。真机 probe 解 PNG 头。回应 #23。
+- **新增：原图获取离线快路**——XML `length` 判定本机 .dat 即原件，多数图免界面直接落盘；timeout 30→60s。回应 #30。
+- **新增：文件自动下载监听器 `AutoFileDownloader`**——只读 DB 轮询（水位持久化、全量监听+新会话发现），未落盘挂待办重试，CLI `python -m wechatauto.auto_download`。绝不驱动界面。
+- **新增：语音解码器随库分发 + `download_voice(to_wav=True)`**——语音为明文 SILK v3（与密钥体系无关），`silkdec.exe` 随 PyPI 分发直出 24kHz WAV。
+- **社区 PR 合并**：#59 密钥扫描超时+预览保存；#54 复合文件类型+身份核验（#53）；#56 标签移出成员定位（#55）；#58 数据库自动探测；#61 INPUT 结构修复（#62）；#60 群聊机器人示例；ChatWindow 4.2.0.53 右键回退；OCR 兼容 Python 3.11+（winsdk/winrt 双后端）；免责声明强化。
+- 判定：`tests/` 7 文件 unittest 全过；`tools/selftest.py` 562/0；真机 4.2.0.53 验证（图片密钥/原图快路/语音解码/自动下载）。
 
 ### v1.2.10（2026-11-08）
 
@@ -1104,7 +1113,7 @@ quick_send_file(r'D:\资料\报告.pdf', '文件传输助手')
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.2.10 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13 / 4.2.0.13)
+> **Current version:** 1.3.0 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13 / 4.2.0.13 / 4.2.0.53)
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -1307,6 +1316,15 @@ Three real technical routes: **read** = decrypt local SQLite/SQLCipher files (`R
 - Performance: parallel export / first-scan, incremental memory-scan cache
 
 ## 📝 Changelog
+
+### v1.3.0 (2026-11-21)
+
+- ⚠️ **Important fix: WeChat 4.2.0.53 image-key adaptation — `extract_image_key_seed`.** The old `global_config`+0x138 chain broke; new read-only chain walks a manager singleton (dll+0xBB6B788 → mgr+0x68 → account+0x40 cfgDword / +0x2B8 masked digest). Derivation formula unchanged — `MD5(str(N)+wxid)` hex[:16]; the “1e8 brute-force miss ⇒ algorithm changed” conclusion was wrong (real N≈1.37e9). ReadProcessMemory only. (#23)
+- **New: original-image offline fast path** — XML `length` == decrypted .dat size ⇒ it IS the original; most images return with zero UI interaction; timeout 30→60s. (#30)
+- **New: `AutoFileDownloader`** — read-only DB-polling listener (persisted watermark, discovers new chats), auto-copies files with pending-retry; CLI `python -m wechatauto.auto_download`.
+- **New: bundled SILK decoder + `download_voice(to_wav=True)`** — voices are plaintext SILK v3 (unrelated to the image-key system); `silkdec.exe` ships with the package, yields 24kHz WAV.
+- **Merged community PRs:** #59 key-scan timeout + preview-save; #54 composite file types + identity checks (#53); #56 label-removal geometry (#55); #58 DB auto-detect; #61 INPUT union fix (#62); #60 chatbot example; ChatWindow 4.2.0.53 fallback; OCR deps compatible with Python 3.11+ (winsdk/winrt); hardened disclaimer.
+- Validation: `tests/` 7 unittest files all green; `tools/selftest.py` 562/0; live-verified on 4.2.0.53.
 
 ### v1.2.10 (2026-11-08)
 

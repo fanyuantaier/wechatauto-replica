@@ -19,9 +19,9 @@
 本项目复刻上游 wxauto 项目，目标是实现对当前微信 4.x Windows 客户端的自动化
 （读取消息、发送消息、媒体下载、朋友圈），非网页版，直接操作本机客户端。
 
-> 当前版本：1.2.10
+> 当前版本：1.3.0
 >
-> **兼容范围**：Windows 10/11 ｜ Python 3.9+（已在 3.12 验证）｜ 微信 **4.1.12+**（已在 4.1.15.53 / 4.2.0.11 验证）
+> **兼容范围**：Windows 10/11 ｜ Python 3.9+（已在 3.12 验证）｜ 微信 **4.1.12+**（已在 4.1.15.53 / 4.2.0.11 / 4.2.0.53 验证）
 > （数据库读取路线对微信版本不敏感；坐标+OCR 发送路线依赖 4.1.12+ 自绘渲染
 > 布局，UIA 控件树随小版本变化——4.1.15 起搜索入口改为收起式，已适配；
 > 其它小版本可能需校准 `guia.py` 布局常量与 gate RVA 表）。
@@ -95,6 +95,15 @@ wechatauto 朋友圈 --me              # 看自己发的朋友圈
 ---
 
 ## 版本记录
+
+### v1.3.0（2026-11-21）
+
+- ⚠️ **重要修复：微信 4.2.0.53 图片密钥适配（`extract_image_key_seed`）。** 4.2.0.53 中旧的 `global_config` 地标 + 0x138 指针链失效——新增被动只读提取链：`*(dll+0xBB6B788)` 管理器单例 → `*(mgr+0x68)` account → `cfgDword=*(account+0x40)`、`imageDigest=account+0x2B8` 掩码串 XOR DLL movabs 材料（i%32）解出 MD5hex32，全程 ReadProcessMemory，无注入无调试器；MGR 槽无效时回退旧 cfg 链。派生公式确认**未变**（`MD5(str(N)+wxid)` hex 前 16 字符）——修正「1 亿穷举零命中→算法已变」的误判（真实 N≈13.7 亿超出旧扫描范围）。真机：cfg_dword=1367748144、digest=726ed56a8a7b3ee16b5d442bc9404988，probe 密文解出 PNG 头。回应 #23。
+- **新增：原图获取重做——`download_image_original` 离线快路。** 消息 XML 的 `length` 是原件字节数：本机 `.dat` 解密后尺寸一致（且文件头为合法图片容器）即原件，直接解密落盘，**多数图零界面交互**（实测 40 条：32 条本机已有、1 条快路命中、仅 7 条进点击流）；默认 timeout 30→60s。wxgf 动图场景 XML md5 非容器 md5，按尺寸+文件头判定。回应 #30「只能下载缩略图」。
+- **新增：文件自动下载监听器 `AutoFileDownloader`。** 基于 `db.Listener` 只读 DB 轮询（水位持久化重启不重推、`add_all` 全量监听并自动发现新会话），命中文件消息即复制到 `<save_dir>/<会话名>/`；未落盘挂待办 10s 复查、30 分钟超时；状态账本 json（原子写）。CLI：`python -m wechatauto.auto_download --chat X --save D:\downloads --types file,image`。绝不驱动界面。
+- **新增：语音解码器随库分发 + `download_voice(to_wav=True)`。** 探测定案：`VoiceInfo.voice_data` 为明文 SILK v3（`\x02#!SILK_V3`，1371/1371），与密钥体系无关；`silkdec.exe`（pilk 内置 Silk SDK 独立编译，clang/mingw，sha256 DA0FBB2D…）随 PyPI 分发，`to_wav=True` 直出 24kHz 单声道 WAV。ffmpeg 8.x 解不了裸 SILK 流，故需独立解码器。
+- **社区 PR 合并**：#59 图片导出密钥扫描超时上限（`ImageKeyUnavailable`）+ 微信预览窗「保存」兜底；#54 文件消息复合类型兼容（subtype=6）+ 原名/摘要核验 + 同名附件内容确认（#53）；#56 标签移出成员按选择列几何定位并核验人数（#55）；#58 Windows 文档重定向后的数据库自动探测；#61 64 位 INPUT 结构补 MOUSEINPUT/HARDWAREINPUT（SendInput 报错 87，#62）；#60 可配置群聊机器人示例与教程（examples/chatbot/）；ChatWindow 双击失败回退右键菜单「独立窗口显示」（4.2.0.53）；OCR 依赖兼容 Python 3.11+（winsdk 停更，winsdk/winrt 双后端）；免责声明升级为硬性使用边界 + 「为什么这不是 hook/注入」说明段。
+- 判定：`tests/` 7 文件 unittest 全过（含 18+14 用例）；`tools/selftest.py` 562/0；真机 4.2.0.53：图片密钥活体验证（probe 解 PNG 头）、原图快路（filehelper 40 条分类 32/1/7）、语音解码（24kHz WAV）、自动下载冒烟。
 
 ### v1.2.10（2026-11-08）
 

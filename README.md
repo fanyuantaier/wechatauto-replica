@@ -17,7 +17,7 @@
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.2.10 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13 / 4.2.0.13)
+> **Current version:** 1.3.0 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13 / 4.2.0.13 / 4.2.0.53)
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -245,6 +245,15 @@ Three real technical routes: **read** = decrypt local SQLite/SQLCipher files (`R
 
 ## 📝 Changelog
 
+
+### v1.3.0 (2026-11-21)
+
+- ⚠️ **Important fix: WeChat 4.2.0.53 image-key adaptation — `extract_image_key_seed`.** The old `global_config`+0x138 pointer chain broke in 4.2.0.53; the new read-only chain walks a manager singleton (`dll+0xBB6B788` → `mgr+0x68` → `account+0x40` cfgDword / `account+0x2B8` masked digest XOR movabs material). Derivation formula unchanged — `MD5(str(N)+wxid)` hex[:16]; the earlier “1e8 brute-force miss ⇒ algorithm changed” conclusion was wrong (real N≈1.37e9, beyond the old scan range). ReadProcessMemory only, no injection, no debugger; falls back to the old chain when the singleton slot is invalid. (#23)
+- **New: original-image offline fast path.** The message XML `length` field is the original byte size: when the local `.dat` decrypts to exactly that size with a valid image header, it IS the original — most images now return without any UI interaction (40-message sample: 32 already local, 1 fast-path hit, 7 UI). Default timeout 30→60s. (#30)
+- **New: `AutoFileDownloader`** — read-only DB-polling listener (persisted watermark, discovers new chats) that auto-copies file messages to `<save_dir>/<chat>/`, with pending-retry (10s) and a 30-min timeout ledger. CLI: `python -m wechatauto.auto_download`.
+- **New: bundled SILK decoder + `download_voice(to_wav=True)`.** Voice blobs are plaintext SILK v3 (`\x02#!SILK_V3`, 1371/1371 verified) — unrelated to the image-key system. `silkdec.exe` (standalone build from pilk's bundled Silk SDK) ships with the package and yields 24kHz mono WAV. ffmpeg 8.x cannot decode raw SILK streams.
+- **Merged community PRs:** #59 key-scan timeout cap (`ImageKeyUnavailable`) + preview-window Save fallback; #54 composite file messages (subtype=6) + original-name/digest identity checks (#53); #56 label-removal column geometry + selection count check (#55); #58 DB auto-detect after Windows Docs redirection; #61 full 64-bit INPUT union (SendInput error 87, #62); #60 configurable chatbot example (`examples/chatbot/`); ChatWindow double-click fallback to right-click “open in standalone window” on 4.2.0.53; OCR deps compatible with Python 3.11+ (winsdk/winrt dual backend); hardened usage-boundary disclaimer + “why this is not a hook/injection” section.
+- Validation: `tests/` 7 unittest files all green (incl. 18+14 cases); `tools/selftest.py` 562/0; live-verified on 4.2.0.53 (image key probe → PNG header, original fast path, voice → 24kHz WAV, auto-download smoke).
 
 ### v1.2.10 (2026-11-08)
 
