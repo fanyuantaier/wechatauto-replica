@@ -2278,9 +2278,37 @@ class MediaDownloader:
                    len(data) // 1024, note, hit[0])
         return self._write_decrypted(data, "%s_%s" % (user, local_id), save_dir)
 
+    def _xml_image_meta(self, row: dict) -> dict:
+        """从图片消息 content 的 XML 提取元数据：length/md5/aeskey/hevc_mid_size。
+
+        ``content`` 在 4.x 是 zstd 压缩的 XML（走 db 的 ``_friendly_content`` 解压）。
+        ``length`` 是**原件字节数**（与 cdnthumblength/hevc_mid_size 区分）。
+        解析失败返回空 dict。
+        """
+        raw = row.get("content")
+        text = None
+        if isinstance(raw, bytes):
+            friendly = getattr(self.db, "_friendly_content", None)
+            if friendly is not None:
+                text = friendly(raw, "图片")
+        elif isinstance(raw, str):
+            text = raw
+        if not text or "<img" not in text:
+            return {}
+        out = {}
+        for key in ("length", "hevc_mid_size"):
+            m = re.search(r'\b%s="(\d+)"' % key, text)
+            if m:
+                out[key] = int(m.group(1))
+        for key in ("md5", "originsourcemd5", "aeskey"):
+            m = re.search(r'\b%s="([0-9a-fA-F]{32})"' % key, text)
+            if m:
+                out[key] = m.group(1).lower()
+        return out
+
     def download_image_original(self, user: str, local_id: int, save_dir: Optional[str] = None,
                               aes_key: Optional[str] = None, xor_key: Optional[int] = None,
-                              timeout: float = 30.0, chat_name: Optional[str] = None,
+                              timeout: float = 60.0, chat_name: Optional[str] = None,
                               min_bytes: int = 1024, scroll: bool = True,
                               max_scrolls: int = 6,
                               shard: Optional[str] = None) -> Optional[str]:
@@ -2301,7 +2329,9 @@ class MediaDownloader:
 
         Args:
             timeout: 点击之后等 ``_h.dat`` 出现并下完的**总**上限（秒）。
-                以前这个参数是摆设（代码里只 ``sleep(3)`` 一次就判失败）。
+                以前这个参数是摆设（代码里只 ``sleep(3)`` 一次就判失败）；
+                默认 30→60（2026-11-21）：实测多个气泡逐个点击时 30s 会截断在
+                「还剩 N 个气泡没试」。
             min_bytes: ``_h.dat`` 的下限字节数（挡空壳）；「下完没」看的是
                 :meth:`original_ready`（非空 + 不小于 ``min_bytes``）加上大小不再变化，
                 **不拿它和别的档比大小**（那条比例判据被实测否掉了）。
@@ -2349,6 +2379,35 @@ class MediaDownloader:
             wxlog.info("这条图是自己发出去的，本机只有 .dat（实测 554 条自发图片里只有 "
                        "19 条有 _h.dat）；仍然走点击路径确认一下 —— .dat 有时本身就是"
                        "预览版。只想拿本机那份的话用 download_image(tier='full')。")
+
+        # 离线快路（2026-11-21 新增）：消息 XML 的 ``length`` 是**原件字节数**。
+        # 把本机 .dat 解出来，尺寸与它一致（XML 带 md5 时再核 md5）就说明这份
+        # .dat 本来就是完整原件——这类图（小图/未压缩场景）根本不用碰界面。
+        # CDN blob（cdnmidimgurl）在 4.x 是无 URL 的 filekey，凭证只在客户端
+        # 内部，直下不可行（2026-11-21 实测），界面仍是拿不到原件时的唯一出路。
+        try:
+            meta = self._xml_image_meta(row)
+        except Exception as e:
+            meta = {}
+            wxlog.debug("图片 XML 元数据解析失败：%s: %s", type(e).__name__, str(e)[:120])
+        want_len = meta.get("length")
+        if want_len and files.get('mid'):
+            try:
+                data = self.decrypt_image(files['mid'][0], aes_key, xor_key)
+            except Exception as e:
+                data = b""
+                wxlog.debug("离线快路解密失败：%s: %s", type(e).__name__, str(e)[:120])
+            if data and len(data) == want_len and _jpeg_like(data):
+                xmd5 = meta.get("md5")
+                if xmd5 and hashlib.md5(data).hexdigest() != xmd5:
+                    # wxgf/动图容器场景：XML md5 非容器 md5（实测 2026-11-21），
+                    # 尺寸一致 + 文件头合法已足以判定，不否决
+                    wxlog.info("本机 .dat 即原件（解密 %dB == XML length；md5 与 XML "
+                               "不符——wxgf 等容器场景属正常，按尺寸+文件头判定）", len(data))
+                else:
+                    wxlog.info("本机 .dat 即原件（解密 %dB == XML length%s），免界面",
+                               len(data), "，md5 一致" if xmd5 else "，XML 无 md5")
+                return self._write_decrypted(data, "%s_%s" % (user, local_id), save_dir)
 
         from .uia_driver import WeChatUIA
         from .guia import WinInput
