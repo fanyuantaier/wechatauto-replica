@@ -38,6 +38,7 @@ from __future__ import annotations
 import ctypes
 import glob
 import hashlib
+import html
 import json
 import os
 import re
@@ -58,6 +59,10 @@ AES16_RE = re.compile(rb"[0-9a-zA-Z]{16,32}")
 DEFAULT_SAVE_PATH = os.path.join(os.path.expanduser("~"), "Documents", "wechatauto_media")
 # 49 是旧版文件码；复合应用消息只接受 subtype=6，不能把链接/引用也当文件。
 _FILE_TYPES = (49, (6 << 32) | 49)
+# 合并转发（聊天记录卡片）：appmsg subtype 19。内嵌 recordinfo 里 datatype=8 的
+# 文件项带原文件名（datatitle）与 fullmd5/datasize，微信打开过即落在
+# msg/file/<YYYY-MM>/<原文件名>（与普通文件同构），可按名导出。
+FORWARD_TYPE = (19 << 32) | 49
 
 
 def _jpeg_like(pt: bytes) -> bool:
@@ -2292,6 +2297,115 @@ class MediaDownloader:
         finally:
             if temporary and os.path.exists(temporary):
                 os.remove(temporary)
+
+    def download_forward_files(self, user: str, local_id: int,
+                               save_dir: Optional[str] = None,
+                               shard: Optional[str] = None,
+                               max_depth: int = 3) -> Optional[dict]:
+        """导出合并转发（聊天记录卡片，local_type=(19<<32)|49）内嵌的文件。
+
+        解析消息 XML 的 recordinfo（CDATA 转义，需 html.unescape），收集 datatype=8
+        的文件项（datatitle=完整原文件名、fullmd5/datasize 可核验）；微信打开过/
+        下载过的文件落在 ``msg/file/<YYYY-MM>/<原文件名>``（与普通文件同构），
+        按名查找并复制到 ``<save_dir>``，复制后重新校验大小/摘要。datatype=17
+        的嵌套聊天记录递归展开（depth 限 max_depth）。
+
+        CDN 侧只有无 URL 的 filekey blob（离线直下不可行），未落盘的文件只能列清单
+        报原因（与 voice_status 同口径）。
+
+        Returns:
+            manifest dict：``files``（已导出，含 title/path/size/md5_ok）、
+            ``missing``（微信未落盘，含 reason）、``nested_records``（嵌套记录数）、
+            ``total``（记录内文件总数）；该 local_id 不是合并转发时返回 ``None``。
+            文件名冲突用序号消歧：``<user>_<local_id>_<序号>_<原文件名>``。
+        """
+        rows = [r for r in self.db.get_message_rows_for_media(user, local_id)
+                if r["local_type"] == FORWARD_TYPE and (not shard or r.get("shard") == shard)]
+        if not rows:
+            return None
+        row = self.db.get_message_row(user, local_id, local_type=FORWARD_TYPE, shard=shard) or rows[0]
+        text = self.db._friendly_content(row["content"], "文件")
+        if not text or "<recorditem>" not in text:
+            wxlog.warning("合并转发 %s/%s 解不出 recorditem（content %d 字符）"
+                          % (user, local_id, len(row.get("content") or "")))
+            return None
+        files, nested = [], []
+        self._collect_forward_files(text, files, nested, 0, max_depth)
+        if not files and not nested:
+            wxlog.info("合并转发 %s/%s 内没有文件项（纯文本/图片等），无需导出"
+                       % (user, local_id))
+
+        base = os.path.join(self.db.account_dir, "msg", "file")
+        index = {}
+        if os.path.isdir(base):
+            for root, _, fs in os.walk(base):
+                for f in fs:
+                    index.setdefault(f, []).append(os.path.join(root, f))
+
+        saved, missing, seq = [], [], 0
+        for info in files:
+            seq += 1
+            candidates = index.get(info["title"], [])
+            candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+            source = next((p for p in candidates
+                           if self._file_matches(p, info["datasize"], info["fullmd5"])), None)
+            if source is None:
+                missing.append(dict(info, reason="not_downloaded" if not candidates
+                                    else "size_md5_mismatch"))
+                wxlog.debug("合并转发内文件未导出：%s（%s）"
+                            % (info["title"], missing[-1]["reason"]))
+                continue
+            out = self._out(save_dir or self.save_dir,
+                            "%s_%s_%d_%s" % (user, local_id, seq, info["title"]))
+            shutil.copyfile(source, out)
+            md5_ok = self._file_matches(out, info["datasize"], info["fullmd5"])
+            saved.append({"title": info["title"], "path": out,
+                          "size": os.path.getsize(out), "md5_ok": md5_ok})
+            wxlog.info("合并转发文件已导出：%s%s", out,
+                       "" if md5_ok else "（摘要与 fullmd5 不符）")
+        return {"files": saved, "missing": missing,
+                "nested_records": len(nested), "total": len(files)}
+
+    def _collect_forward_files(self, content: str, files: List[dict], nested: List[str],
+                               depth: int, max_depth: int) -> None:
+        """从消息 XML 里取 recorditem → 解转义/剥 CDATA → 递归收集文件项。"""
+        ri = re.search(r"<recorditem>(.*?)</recorditem>", content, re.S)
+        if not ri:
+            return
+        inner = html.unescape(ri.group(1))
+        inner = inner.replace("<![CDATA[", "").replace("]]>", "")
+        self._collect_forward_dataitems(inner, files, nested, depth, max_depth)
+
+    def _collect_forward_dataitems(self, inner: str, files: List[dict], nested: List[str],
+                                   depth: int, max_depth: int) -> None:
+        """遍历 recordinfo 下的 dataitem：datatype 8 收集文件、17 递归嵌套记录。"""
+        for it in re.findall(r"<dataitem[^>]*>.*?</dataitem>", inner, re.S):
+            dt = re.search(r'<dataitem[^>]*\bdatatype="(\d+)"', it)
+            k = dt.group(1) if dt else ""
+            if k == "8":
+                title = re.search(r"<datatitle>(.*?)</datatitle>", it, re.S)
+                name = (title.group(1).strip() if title else "").replace("\\", "/").split("/")[-1]
+                if not name:
+                    continue
+                fmt = re.search(r"<datafmt>(.*?)</datafmt>", it, re.S)
+                if fmt and "." not in name:
+                    name = name + "." + fmt.group(1).strip().lstrip(".")
+                md5m = re.search(r"<fullmd5>(.*?)</fullmd5>", it, re.S)
+                szm = re.search(r"<datasize>(\d+)</datasize>", it, re.S)
+                files.append({
+                    "title": name,
+                    "fullmd5": md5m.group(1).lower() if md5m else None,
+                    "datasize": int(szm.group(1)) if szm else None,
+                })
+            elif k == "17" and depth < max_depth:
+                nested.append(it[:120])
+                if "<recorditem>" in it:
+                    self._collect_forward_files(it, files, nested, depth + 1, max_depth)
+                elif "<recordinfo>" in it:
+                    sub = re.search(r"<recordinfo>.*?</recordinfo>", it, re.S)
+                    if sub:
+                        self._collect_forward_dataitems(sub.group(0), files, nested,
+                                                        depth + 1, max_depth)
 
     @staticmethod
     def _find_preview_button(ctrl, name, max_depth=8):
