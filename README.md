@@ -17,7 +17,7 @@
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.3.0 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13 / 4.2.0.13 / 4.2.0.53)
+> **Current version:** 1.3.0.1 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13 / 4.2.0.13 / 4.2.0.53)
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -245,6 +245,11 @@ Three real technical routes: **read** = decrypt local SQLite/SQLCipher files (`R
 
 ## 📝 Changelog
 
+
+### v1.3.0.1 (2026-11-22)
+
+- **New: export files inside merged-forward chat records — `download_forward_files(user, local_id)`.** Merged-forward messages are composite `local_type=(19<<32)|49` and were invisible to the media pipeline. The parser reads the recordinfo (CDATA-escaped XML, `html.unescape`) and collects datatype=8 file items (`datatitle` original filename, `fullmd5`/`datasize` for verification); files WeChat already stored under `msg/file/<YYYY-MM>/<name>` are copied to `<save_dir>` with post-copy size/md5 re-check; datatype=17 nested records recurse (depth≤3); not-yet-stored files are listed in the manifest with reasons (`not_downloaded` / `size_md5_mismatch`) instead of faking success. Findings: recorditem is CDATA-escaped; datatype 8=file / 6=location / 5=link card / 17=nested record; CDN blobs carry no URL — GUI is the only way for un-stored files.
+- Validation: live 241 merged-forward records → 257 file items + 7 nested records fully collected; end-to-end docx export (20288B) passes fullmd5 check; missing-list sample (PDF not on disk).
 
 ### v1.3.0 (2026-11-21)
 

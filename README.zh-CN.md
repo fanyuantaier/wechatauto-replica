@@ -19,7 +19,7 @@
 本项目复刻上游 wxauto 项目，目标是实现对当前微信 4.x Windows 客户端的自动化
 （读取消息、发送消息、媒体下载、朋友圈），非网页版，直接操作本机客户端。
 
-> 当前版本：1.3.0
+> 当前版本：1.3.0.1
 >
 > **兼容范围**：Windows 10/11 ｜ Python 3.9+（已在 3.12 验证）｜ 微信 **4.1.12+**（已在 4.1.15.53 / 4.2.0.11 / 4.2.0.53 验证）
 > （数据库读取路线对微信版本不敏感；坐标+OCR 发送路线依赖 4.1.12+ 自绘渲染
@@ -95,6 +95,11 @@ wechatauto 朋友圈 --me              # 看自己发的朋友圈
 ---
 
 ## 版本记录
+
+### v1.3.0.1（2026-11-22）
+
+- **新增：合并转发聊天记录中的文件导出——`download_forward_files(user, local_id, save_dir=None, shard=None, max_depth=3)`。** 合并转发在 4.x 是复合 `local_type=(19<<32)|49`（此前完全不被媒体链路识别）。实现：解析消息 XML 的 recordinfo（CDATA 转义，需 html.unescape）收集 datatype=8 文件项（`datatitle`=完整原文件名、`fullmd5`/`datasize` 可核验），微信已落盘的文件（`msg/file/<YYYY-MM>/<原文件名>`，与普通文件同构）按名查找复制到 `<save_dir>`（命名 `<user>_<local_id>_<序号>_<原名>`），复制后 `_file_matches` 二次校验；datatype=17 嵌套聊天记录递归展开（depth≤3）；未落盘的文件返回 manifest['missing'] 清单（reason=not_downloaded / size_md5_mismatch，不虚构成功，口径与 voice_status 一致）。探究定案：recorditem 为 CDATA 转义 XML，datatype 8=文件/6=位置/5=链接卡片/17=嵌套记录；CDN blob 无 URL 不可直下，未落盘的只能 GUI 取。
+- 判定：真机 241 条合并转发 → 257 文件项 + 7 嵌套记录全收集（与探针分布一致）；端到端导出 docx（20288B）fullmd5 校验通过；缺失清单样本（PDF 未落盘 reason=not_downloaded）。py_compile 过。
 
 ### v1.3.0（2026-11-21）
 

@@ -49,7 +49,7 @@ discovery still selects main windows, with existing HWND/PID checks preserved.
 本项目复刻上游 wxauto 项目，目标是实现对当前微信 4.x Windows 客户端的自动化
 （读取消息、发送消息、媒体下载、朋友圈），非网页版，直接操作本机客户端。
 
-> 当前版本：1.3.0
+> 当前版本：1.3.0.1
 >
 > **兼容范围**：Windows 10/11 ｜ Python 3.9+（已在 3.12 验证）｜ 微信 **4.1.12+**（已在 4.1.15.53 / 4.2.0.11 / 4.2.0.53 验证）
 > （数据库读取路线对微信版本不敏感；坐标+OCR 发送路线依赖 4.1.12+ 自绘渲染
@@ -114,6 +114,10 @@ wechatauto 朋友圈 --me              # 看自己发的朋友圈
 ---
 
 ## 版本记录
+
+### v1.3.0.1（2026-11-22）
+
+- **新增：合并转发聊天记录中的文件导出 `download_forward_files(user, local_id, save_dir=None, shard=None, max_depth=3)`**——合并转发是复合 `local_type=(19<<32)|49`（此前不被媒体链路识别）；解析 recordinfo（CDATA 转义）收集 datatype=8 文件项，已落盘的按名复制并二次校验（fullmd5/datasize），datatype=17 嵌套记录递归；未落盘项返回 manifest['missing'] 清单（不虚构成功）。实测 241 条→257 文件项+7 嵌套全收集，docx 端到端导出 md5 过。
 
 ### v1.3.0（2026-11-21）
 
@@ -1113,7 +1117,7 @@ quick_send_file(r'D:\资料\报告.pdf', '文件传输助手')
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.3.0 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13 / 4.2.0.13 / 4.2.0.53)
+> **Current version:** 1.3.0.1 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13 / 4.2.0.13 / 4.2.0.53)
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -1316,6 +1320,10 @@ Three real technical routes: **read** = decrypt local SQLite/SQLCipher files (`R
 - Performance: parallel export / first-scan, incremental memory-scan cache
 
 ## 📝 Changelog
+
+### v1.3.0.1 (2026-11-22)
+
+- **New: export files inside merged-forward chat records — `download_forward_files(user, local_id)`.** Merged-forward messages are composite `local_type=(19<<32)|49` and were invisible to the media pipeline; the parser reads recordinfo (CDATA-escaped) and copies datatype=8 file items WeChat already stored (with size/md5 re-check), recursing into nested records; un-stored files are listed with reasons instead of faking success. Live: 241 records → 257 file items + 7 nested collected; docx end-to-end export passes fullmd5.
 
 ### v1.3.0 (2026-11-21)
 
