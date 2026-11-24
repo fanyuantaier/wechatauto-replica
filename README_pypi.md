@@ -49,7 +49,7 @@ discovery still selects main windows, with existing HWND/PID checks preserved.
 本项目复刻上游 wxauto 项目，目标是实现对当前微信 4.x Windows 客户端的自动化
 （读取消息、发送消息、媒体下载、朋友圈），非网页版，直接操作本机客户端。
 
-> 当前版本：1.3.0.1
+> 当前版本：1.3.0.2
 >
 > **兼容范围**：Windows 10/11 ｜ Python 3.9+（已在 3.12 验证）｜ 微信 **4.1.12+**（已在 4.1.15.53 / 4.2.0.11 / 4.2.0.53 验证）
 > （数据库读取路线对微信版本不敏感；坐标+OCR 发送路线依赖 4.1.12+ 自绘渲染
@@ -114,6 +114,13 @@ wechatauto 朋友圈 --me              # 看自己发的朋友圈
 ---
 
 ## 版本记录
+
+### v1.3.0.2（2026-11-24）
+
+- ⚠️ **修复：微信 4.2.0.53 原图下载的保存链路。** 旧代码只扫桌面直接子节点，认不出嵌在预览窗下的 Windows 另存框；随后可能把只读「名称」属性框当成文件名框，或因保存按钮没有 `InvokePattern` 而假成功。现在会等待真实文件名框与保存按钮就绪，并把文件写到调用方指定的 `save_dir`。
+- **修复：恢复 `labels.CHECKBOX_INSET_PX` 常量。** 11-08 的标签成员选择改造误删了这个仍被转发/收藏转发导入的 70px 实测锚点，导致两个模块无法导入；本次加回并纳入发版门。
+- **预览窗稳健性**：忽略最小化残留窗口；修正当前 `uiautomation` 不支持 `WalkControl(max_depth=...)` 导致工具栏被误判退化的问题；预览窗保存按钮与另存框按钮均保留拟人坐标点击兜底。
+- 判定：微信 4.2.0.53 真机，文件传输助手一张仅有压缩档的图片 20.9 秒完成，指定目录产出 202,409 字节 JPEG（本机压缩档解密后 27,222 字节），PIL 校验通过；`image` 回归 206/206；完整 `selftest` 567/1，唯一红项为无关的实时 OCR 会话定位抖动（本次 `定时任务`，前次 `WorkBuddy`）。
 
 ### v1.3.0.1（2026-11-22）
 
@@ -1117,7 +1124,7 @@ quick_send_file(r'D:\资料\报告.pdf', '文件传输助手')
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.3.0.1 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13 / 4.2.0.13 / 4.2.0.53)
+> **Current version:** 1.3.0.2 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13 / 4.2.0.13 / 4.2.0.53)
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -1320,6 +1327,13 @@ Three real technical routes: **read** = decrypt local SQLite/SQLCipher files (`R
 - Performance: parallel export / first-scan, incremental memory-scan cache
 
 ## 📝 Changelog
+
+### v1.3.0.2 (2026-11-24)
+
+- ⚠️ **Fix: the original-image save chain on WeChat 4.2.0.53.** The old code only scanned direct desktop children, so it missed the Windows save dialog nested under the preview window; it could then mistake the read-only “名称” property field for the filename box or report a false success when the save button had no `InvokePattern`. It now waits for the real filename field and save button, then writes to the caller's `save_dir`.
+- **Fix: restore `labels.CHECKBOX_INSET_PX`.** The 11-08 label-member selection change removed this measured 70px anchor even though message/favorite forwarding still imports it, making both modules unimportable; it is restored and covered by the release gate.
+- **Preview-window robustness:** minimized stale windows are ignored; the unsupported `WalkControl(max_depth=...)` call that falsely marked a healthy toolbar as degraded is removed; preview save buttons and dialog buttons keep a rhythm-aware coordinate-click fallback.
+- Verdict: live on WeChat 4.2.0.53, an image with only a compressed local tier completed in 20.9 s and produced a 202,409-byte JPEG in the requested directory (the decrypted compressed tier is 27,222 bytes); Pillow verification passed; image regressions 206/206; full selftest 567/1, with the sole failure being an unrelated live-OCR session-location flake (`定时任务` this run, `WorkBuddy` previously).
 
 ### v1.3.0.1 (2026-11-22)
 

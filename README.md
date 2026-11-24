@@ -17,7 +17,7 @@
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.3.0.1 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13 / 4.2.0.13 / 4.2.0.53)
+> **Current version:** 1.3.0.2 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13 / 4.2.0.13 / 4.2.0.53)
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -245,6 +245,13 @@ Three real technical routes: **read** = decrypt local SQLite/SQLCipher files (`R
 
 ## 📝 Changelog
 
+
+### v1.3.0.2 (2026-11-24)
+
+- ⚠️ **Fix: the original-image save chain on WeChat 4.2.0.53.** The old code only scanned direct desktop children, so it missed the Windows save dialog nested under the preview window; it could then mistake the read-only “名称” property field for the filename box or report a false success when the save button had no `InvokePattern`. It now waits for the real filename field and save button, then writes to the caller's `save_dir`.
+- **Fix: restore `labels.CHECKBOX_INSET_PX`.** The 11-08 label-member selection change removed this measured 70px anchor even though message/favorite forwarding still imports it, making both modules unimportable; it is restored and covered by the release gate.
+- **Preview-window robustness:** minimized stale windows are ignored; the unsupported `WalkControl(max_depth=...)` call that falsely marked a healthy toolbar as degraded is removed; preview save buttons and dialog buttons keep a rhythm-aware coordinate-click fallback.
+- Verdict: live on WeChat 4.2.0.53, an image with only a compressed local tier completed in 20.9 s and produced a 202,409-byte JPEG in the requested directory (the decrypted compressed tier is 27,222 bytes); Pillow verification passed; image regressions 206/206; full selftest 567/1, with the sole failure being an unrelated live-OCR session-location flake (`定时任务` this run, `WorkBuddy` previously).
 
 ### v1.3.0.1 (2026-11-22)
 
