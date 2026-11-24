@@ -897,6 +897,19 @@ class MediaDownloader:
     _PREVIEW_TITLES = ("图片和视频",)
 
     @staticmethod
+    def _window_available(h) -> bool:
+        """真实窗口才过滤最小化/离屏残留；测试用的假句柄原样保留。"""
+        if not h:
+            return True
+        try:
+            u = ctypes.windll.user32
+            if u.IsWindow(h):
+                return bool(u.IsWindowVisible(h)) and not bool(u.IsIconic(h))
+        except Exception:
+            pass
+        return True
+
+    @staticmethod
     def _preview_windows(recheck: bool = True):
         """当前所有预览窗 ``[(窗口句柄, 控件), ...]``。
 
@@ -934,22 +947,14 @@ class MediaDownloader:
                 h = w.NativeWindowHandle or id(w)
             except Exception:
                 h = id(w)
+            if not MediaDownloader._window_available(h):
+                continue
             out.append((h, inner))
         if out and recheck:
             # 4.2.0 退化检测：控件存在但整棵树只剩壳（没有任何命名按钮）
             import uiautomation as auto
-            dead = True
-            for _h, ctrl in out:
-                try:
-                    for _c, _d in auto.WalkControl(ctrl, max_depth=8):
-                        if "Button" in (_c.ControlTypeName or "") \
-                                and (_c.Name or "").strip():
-                            dead = False
-                            break
-                except Exception:
-                    pass
-                if not dead:
-                    break
+            dead = not any(MediaDownloader._has_named_button(ctrl)
+                           for _h, ctrl in out)
             if dead:
                 try:
                     from wechatauto.uia_driver import WeChatUIA
@@ -1539,30 +1544,50 @@ class MediaDownloader:
     def _save_dialog():
         """找微信「保存」弹出的 Windows 通用另存为对话框。
 
-        实机结构：顶层类名 ``#32770``，但**标题是「保存」而不是「另存为」**——
-        按标题里有没有「另存」去匹配会认不出。判据改成「``#32770`` + 里面有以
-        「保存」开头的按钮」，标题只当辅助。
+        实机结构：类名 ``#32770``，但**标题是「保存」而不是「另存为」**——
+        4.2.0 起它可能嵌在预览窗下面，不再是桌面的直接子节点；判据是「``#32770``
+        + 里面有以「保存」开头的按钮」，并在预览窗子树里继续找。
         """
         import uiautomation as auto
         try:
             tops = auto.GetRootControl().GetChildren()
         except Exception:
             return None
+
+        def find_dialog(ctrl, depth=0):
+            if depth > 3:
+                return None
+            try:
+                if (ctrl.ClassName or "") == "#32770":
+                    if MediaDownloader._window_available(
+                            getattr(ctrl, "NativeWindowHandle", 0)) and \
+                            MediaDownloader._find_button(
+                                ctrl, lambda n: n.startswith("保存")) is not None:
+                        return ctrl
+                    return None
+                for kid in ctrl.GetChildren():
+                    got = find_dialog(kid, depth + 1)
+                    if got is not None:
+                        return got
+            except Exception:
+                pass
+            return None
+
         for w in tops:
             try:
-                if (w.ClassName or "") != "#32770":
-                    continue
-                if MediaDownloader._find_button(
-                        w, lambda n: n.startswith("保存")) is None:
-                    continue
-                return w
+                cls, name = w.ClassName or "", (w.Name or "").strip()
+                if cls == "#32770" or "PreviewWindow" in cls or (
+                        name in MediaDownloader._PREVIEW_TITLES and cls.startswith("Qt")):
+                    got = find_dialog(w)
+                    if got is not None:
+                        return got
             except Exception:
                 continue
         return None
 
     # 「保存」对话框里**不能往里写值**的那几颗 Edit：文件格式选择器（保存类型:）里面
     # 也有一颗 Edit，实机就把目标路径写进过那儿；右上角搜索栏也是 Edit。
-    _BAD_EDIT_WORDS = ("类型", "格式", "搜索")
+    _BAD_EDIT_WORDS = ("类型", "格式", "搜索", "地址")
 
     @staticmethod
     def _find_button(ctrl, pred, max_depth=14, _d=0):
@@ -1595,6 +1620,40 @@ class MediaDownloader:
                                for x in names))
 
     @staticmethod
+    def _activate_control(ctrl) -> bool:
+        if ctrl is None:
+            return False
+        try:
+            pattern = ctrl.GetInvokePattern()
+            if pattern is not None:
+                pattern.Invoke()
+                return True
+        except Exception:
+            pass
+        try:
+            pattern = ctrl.GetLegacyIAccessiblePattern()
+            if pattern is not None:
+                pattern.DoDefaultAction()
+                return True
+        except Exception:
+            pass
+        try:
+            r = ctrl.BoundingRectangle
+            if r.right - r.left >= 8 and r.bottom - r.top >= 8:
+                try:
+                    ctrl.SetFocus()
+                except Exception:
+                    pass
+                from .guia import WinInput
+                from . import rhythm
+                x, y = rhythm.point((r.left, r.top, r.right, r.bottom))
+                WinInput().real_click(x, y)
+                return True
+        except Exception:
+            pass
+        return False
+
+    @staticmethod
     def _first_edit(root, max_depth=14):
         """子树里第一个**能用**的 Edit：跳过「搜索框」和「保存类型」那两颗假的。
 
@@ -1622,12 +1681,22 @@ class MediaDownloader:
         walk(root)
         for e in found:
             try:
-                blob = (e.Name or "") + " " + (e.ClassName or "")
+                cls = e.ClassName or ""
+            except Exception:
+                cls = ""
+            if cls == "UIProperty":
+                continue
+            try:
+                blob = (e.Name or "") + " " + cls
             except Exception:
                 blob = ""
             if any(w in blob for w in MediaDownloader._BAD_EDIT_WORDS):
                 # 「保存类型」那颗下拉框里也有一颗 Edit（当前格式就显示在那儿）。
                 # 实机撞到过：文件名框没认出来、值写进了格式选择器，保存当然没发生。
+                continue
+            try:
+                e.GetValuePattern()
+            except Exception:
                 continue
             return e
         return None
@@ -1659,13 +1728,13 @@ class MediaDownloader:
             return False
         try:
             edit.GetValuePattern().SetValue(target)
-        except Exception:
+        except Exception as e:
+            wxlog.debug("另存框写入文件名失败：%s: %s", type(e).__name__, str(e)[:160])
             return False
-        try:
-            btn.GetInvokePattern().Invoke()
-            return True
-        except Exception:
+        if not MediaDownloader._activate_control(btn):
+            wxlog.debug("另存框点击保存失败：Invoke/默认动作/坐标点击都不可用")
             return False
+        return True
 
     @staticmethod
     def _cancel_save_dialog(dlg):
@@ -1673,11 +1742,7 @@ class MediaDownloader:
         btn = MediaDownloader._dialog_button(dlg, ("取消", "Cancel"))
         if btn is None:
             return False
-        try:
-            btn.GetInvokePattern().Invoke()
-            return True
-        except Exception:
-            return False
+        return MediaDownloader._activate_control(btn)
 
     @staticmethod
     def _looks_preview(size, ref_thumb=None, ref_mid=None):
@@ -1802,14 +1867,37 @@ class MediaDownloader:
         before = {}
         for r in roots:
             before.update(self._recent_images(r, since))
-        # 4.2.0 预览窗：Click() 不抛异常但**事件被吞、永远无效**（假成功），
-        # 所以主通道直接用 accDoDefaultAction；Click 降级为异常兜底。
+        # 4.2.0 的 accDoDefaultAction 会假成功（不抛异常但另存框没出来）；预览窗按钮
+        # 的 UIA 矩形是真实可点击区域，优先走带拟人轨迹的坐标点击。
         sent = False
         try:
-            btn.GetLegacyIAccessiblePattern().DoDefaultAction()
-            sent = True
+            r = btn.BoundingRectangle
+            if r.right - r.left >= 8 and r.bottom - r.top >= 8:
+                preview_h = getattr(win, "NativeWindowHandle", 0)
+                try:
+                    btn.SetFocus()
+                except Exception:
+                    pass
+                if preview_h:
+                    user32 = ctypes.windll.user32
+                    if user32.GetForegroundWindow() != preview_h:
+                        user32.SetForegroundWindow(preview_h)
+                        time.sleep(0.2)
+                    if user32.GetForegroundWindow() != preview_h:
+                        raise RuntimeError("预览窗没有获得前台，跳过坐标点击")
+                from .guia import WinInput
+                from . import rhythm
+                x, y = rhythm.point((r.left, r.top, r.right, r.bottom))
+                WinInput().real_click(x, y)
+                sent = True
         except Exception:
             pass
+        if not sent:
+            try:
+                btn.GetLegacyIAccessiblePattern().DoDefaultAction()
+                sent = True
+            except Exception:
+                pass
         if not sent:
             try:
                 btn.Click()
@@ -1838,9 +1926,27 @@ class MediaDownloader:
             dlg = self._save_dialog()
             if dlg is not None:
                 dialog_seen = True
+                ready_until = min(deadline, time.time() + 4.0)
+                while True:
+                    dlg = self._save_dialog()
+                    if dlg is None:
+                        break
+                    if self._file_name_edit(dlg) is not None and \
+                            self._dialog_button(dlg, ("保存", "Save")) is not None:
+                        break
+                    if time.time() >= ready_until:
+                        break
+                    time.sleep(0.2)
+                if dlg is None:
+                    continue
+                if self._file_name_edit(dlg) is None or \
+                        self._dialog_button(dlg, ("保存", "Save")) is None:
+                    wxlog.warning("「保存」对话框已出现，但文件名框/保存按钮一直没渲染出来")
+                    self._cancel_save_dialog(self._save_dialog() or dlg)
+                    return None
                 if not self._fill_save_dialog(dlg, target):
                     wxlog.warning("「保存」对话框里找不到可写的「文件名:」框或「保存」按钮")
-                    self._cancel_save_dialog(dlg)
+                    self._cancel_save_dialog(self._save_dialog() or dlg)
                     return None
                 # 点完「保存」，对话框**必须关掉**——这是唯一能证明那一下点中的是按钮的
                 # 信号。实机就点到过旁边那颗「选择文件格式」下拉框：模态框还开着、文件
@@ -2408,6 +2514,23 @@ class MediaDownloader:
                                                         depth + 1, max_depth)
 
     @staticmethod
+    def _has_named_button(ctrl, max_depth=8, _d=0):
+        if _d > max_depth:
+            return False
+        try:
+            for kid in ctrl.GetChildren():
+                try:
+                    if "Button" in (kid.ControlTypeName or "") and (kid.Name or "").strip():
+                        return True
+                except Exception:
+                    pass
+                if MediaDownloader._has_named_button(kid, max_depth, _d + 1):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    @staticmethod
     def _find_preview_button(ctrl, name, max_depth=8):
         """在预览窗里按 Name 找按钮。``name`` 可以是字符串，也可以是**候选名元组**
         ——那颗缩放键的 Name 会随显示状态在「图片原始大小」/「图片适应窗口大小」之间
@@ -2417,7 +2540,8 @@ class MediaDownloader:
         names = (name,) if isinstance(name, str) else tuple(name or ())
         for kid in ctrl.GetChildren():
             try:
-                if (kid.Name or "").strip() in names:
+                if "Button" in (kid.ControlTypeName or "") \
+                        and (kid.Name or "").strip() in names:
                     return kid
                 found = MediaDownloader._find_preview_button(kid, name, max_depth - 1)
                 if found:

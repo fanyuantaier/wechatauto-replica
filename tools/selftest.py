@@ -2630,7 +2630,7 @@ def t_image() -> None:
             return self._k
 
     class BtnNode(Node):
-        ClassName = "mmui::XButton"
+        ClassName, ControlTypeName = "mmui::XButton", "ButtonControl"
 
         def __init__(self, name):
             self.Name = name
@@ -2643,6 +2643,12 @@ def t_image() -> None:
     check("只给老名字「图片原始大小」时找不到（这正是提前返回、兜底跑不到的原因）",
           MediaDownloader._find_preview_button(
               zoom_tree, MediaDownloader.ZOOM_REQUEST) is None)
+
+    class DialogNode(Node):
+        ClassName, ControlTypeName, Name = "#32770", "WindowControl", "保存"
+
+    check("预览窗查找只认按钮，不把同名另存框根节点当成「保存」按钮",
+          MediaDownloader._find_preview_button(Dlg([DialogNode()]), "保存") is None)
 
     # 实机 dump 出来的「保存」对话框结构（顶层类名 #32770，**标题就是「保存」**）：
     #   AppControlHost ComboBox name='文件名:' → Edit name='文件名:'（可写值）
@@ -2693,6 +2699,33 @@ def t_image() -> None:
     check("Name 也叫「保存」的那颗下拉框不算按钮——绝不点它（实机就点到过它）",
           MediaDownloader._dialog_button(dlg, ("保存", "Save")) is not type_combo
           and "Button" not in (type_combo.ControlTypeName or ""))
+
+    class CoordBtn(DlgBtn):
+        BoundingRectangle = R(100, 100, 180, 160)
+
+        def GetInvokePattern(self):
+            return None
+
+        def GetLegacyIAccessiblePattern(self):
+            return None
+
+        def SetFocus(self):
+            pass
+
+    import wechatauto.guia as _gui_mod
+    _orig_real_click = _gui_mod.WinInput.real_click
+    coord_hits = []
+    _gui_mod.WinInput.real_click = lambda self, x, y: coord_hits.append((x, y))
+    try:
+        coord_btn = CoordBtn("保存(S)")
+        check("对话框按钮 InvokePattern 缺失时走拟人坐标点击兜底",
+              MediaDownloader._activate_control(coord_btn) is True
+              and len(coord_hits) == 1
+              and 100 <= coord_hits[0][0] <= 180
+              and 100 <= coord_hits[0][1] <= 160, str(coord_hits))
+    finally:
+        _gui_mod.WinInput.real_click = _orig_real_click
+
     check("填路径 + 点「保存(S)」全程用 ValuePattern/Invoke，不发键盘",
           ms._fill_save_dialog(dlg, r"D:\out\pic.jpg") is True
           and fn_edit.value == r"D:\out\pic.jpg" and btn_save.invoked == 1,
@@ -2729,6 +2762,12 @@ def t_image() -> None:
           got_e is fn_edit, str(got_e))
     check("Edit 自身属性读取抛 → 不炸出去（宁可当成可填的框）",
           MediaDownloader._first_edit(SaveDlg([BrokenEdit()])) is not None)
+
+    class PropertyEdit(Edit):
+        ClassName, Name = "UIProperty", "名称"
+
+    check("只读「名称」属性框不会冒充文件名输入框",
+          MediaDownloader._first_edit(SaveDlg([PropertyEdit(), fn_edit])) is fn_edit)
     _orig_root3 = _auto.GetRootControl
 
     class Top(Node):
@@ -2751,6 +2790,10 @@ def t_image() -> None:
         _auto.GetRootControl = lambda: RootOf([Top("Qt51514QWindowIcon", "微信"),
                                                Top("#32770", "保存", [dlg])])
         check("标题是「保存」而不是「另存为」的对话框也认得（按类名+保存按钮）",
+              MediaDownloader._save_dialog() is not None)
+        _auto.GetRootControl = lambda: RootOf(
+            [Top("mmui::PreviewWindow", "图片和视频", [dlg])])
+        check("4.2.0 另存框嵌在预览窗下面也能找到（不再只扫桌面直接子节点）",
               MediaDownloader._save_dialog() is not None)
         _auto.GetRootControl = lambda: RootOf([Top("#32770", "属性", [Node()])])
         check("没有「保存」按钮的 #32770 不算（别的应用的通用对话框）",
@@ -2987,6 +3030,25 @@ def t_image() -> None:
         check("主窗和同名非 Qt 窗口不算预览窗",
               all((w.ClassName or "") != "Notepad" and (w.Name or "") != "微信"
                   for _h, w in got))
+
+        class FakeBtn:
+            ClassName, ControlTypeName, Name = "mmui::XButton", "ButtonControl", "保存"
+
+            def GetChildren(self):
+                return []
+
+        live_preview = FakeTop("mmui::PreviewWindow", "图片和视频", [FakeBtn()], 55)
+        from wechatauto.uia_driver import WeChatUIA as _WU
+        _orig_materialized = _WU.ensure_materialized
+        reactivated = []
+        _WU.ensure_materialized = lambda self, *a, **k: (reactivated.append(1) or True)
+        _auto.GetRootControl = lambda: FakeRoot([live_preview])
+        try:
+            got_live = MediaDownloader._preview_windows()
+            check("预览工具栏有命名按钮时不会误判退化并重复热激活",
+                  len(got_live) == 1 and reactivated == [], str(reactivated))
+        finally:
+            _WU.ensure_materialized = _orig_materialized
     finally:
         _auto.GetRootControl = _orig_root
 
