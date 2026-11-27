@@ -50,6 +50,7 @@ import time
 import wave
 import xml.etree.ElementTree as ET
 from typing import List, Optional, Tuple
+from wechatauto.db import _protect_key_cache, _replace_cache_file, _unprotect_key_cache
 from wechatauto.logger import wxlog
 
 V1_MAGIC = b"\x07\x08\x05\x56\x02\x05"
@@ -209,30 +210,31 @@ class MediaDownloader:
     def _key_store(self) -> str:
         return os.path.join(self.db.workdir, "image_keys.json")
 
+    def _read_key_store(self) -> dict:
+        # 兼容旧明文；新写入统一使用当前 Windows 用户的 DPAPI。
+        try:
+            with open(self._key_store(), "rb") as f:
+                saved = json.loads(_unprotect_key_cache(f.read()))
+        except FileNotFoundError:
+            return {}
+        if not isinstance(saved, dict):
+            raise ValueError("图片密钥缓存格式无效")
+        return saved
+
     def _load_persisted_key(self, probe: Optional[bytes] = None) -> Optional[str]:
         try:
-            with open(self._key_store(), "r", encoding="utf-8") as f:
-                saved = json.load(f)
-            key = saved.get(self.db.account)
-        except (OSError, ValueError, json.JSONDecodeError):
+            key = self._read_key_store().get(self.db.account)
+        except (OSError, ValueError):
             return None
         if key and self._validate_key(key, probe):
             return key
         return None
 
     def _persist_key(self, aes_key: str) -> None:
-        try:
-            with open(self._key_store(), "r", encoding="utf-8") as f:
-                saved = json.load(f)
-        except (OSError, ValueError, json.JSONDecodeError):
-            saved = {}
+        saved = self._read_key_store()
         saved[self.db.account] = aes_key
-        try:
-            os.makedirs(os.path.dirname(self._key_store()), exist_ok=True)
-            with open(self._key_store(), "w", encoding="utf-8") as f:
-                json.dump(saved, f, indent=2)
-        except OSError:
-            pass
+        blob = _protect_key_cache(json.dumps(saved).encode("utf-8"))
+        _replace_cache_file(self._key_store(), blob)
 
     def _collect_templates(self, limit: int = 32, keep: int = 16) -> List[str]:
         """递归收集 *_t.dat 缩略图模板: 按修改时间降序取前 keep 个"""

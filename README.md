@@ -245,6 +245,10 @@ Three real technical routes: **read** = decrypt local SQLite/SQLCipher files (`R
 
 ## 📝 Changelog
 
+### Unreleased
+
+- New database and image key cache writes require Windows DPAPI. If protection fails, the save raises an error before writing. Legacy plaintext caches remain readable and are encrypted on the next successful save, including the database cache backup.
+
 
 ### v1.3.0.2 (2026-11-24)
 

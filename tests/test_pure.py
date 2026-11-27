@@ -15,6 +15,9 @@ import os
 import struct
 import sys
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
@@ -25,11 +28,13 @@ from wechatauto.db import (  # noqa: E402
     RESERVE_SZ,
     WeChatDB,
     _protect_key_cache,
+    _replace_cache_file,
     _unprotect_key_cache,
     _verify_enc_key,
 )
 from wechatauto.uia_driver import _aid_hit  # noqa: E402
 from wechatauto import rhythm  # noqa: E402
+from wechatauto.media import MediaDownloader
 
 
 def _make_page1(key: bytes, salt: bytes, body_seed: int = 7) -> bytes:
@@ -162,13 +167,74 @@ class TestKeyCacheCrypto(unittest.TestCase):
     def test_round_trip(self):
         payload = b'{"chat_a.db": "aabb", "chat_b.db": "ccdd"}'
         blob = _protect_key_cache(payload)
-        if blob.startswith(b"dpapi1:"):
-            # DPAPI 可用环境：密文不等于明文，且能解回
-            self.assertNotIn(b"aabb", blob)
-            self.assertEqual(_unprotect_key_cache(blob), payload)
-        else:
-            # 无 pywin32 环境：退回明文（与旧版行为一致）
-            self.assertEqual(blob, payload)
+        self.assertTrue(blob.startswith(b"dpapi1:"))
+        self.assertNotEqual(blob, payload)
+        self.assertEqual(_unprotect_key_cache(blob), payload)
+
+    def _fixture(self, folder):
+        db = object.__new__(WeChatDB)
+        db.account = "fixture"
+        db.workdir = folder
+        db.keys_file = str(Path(folder) / "keys.json")
+        db._keys = {"example.db": b"test data"}
+        db._stable_key_file = lambda: str(Path(folder) / "stable.json")
+        media = object.__new__(MediaDownloader)
+        media.db = db
+        return db, media
+
+    def test_failure_preserves_existing_files(self):
+        with TemporaryDirectory() as folder:
+            db, media = self._fixture(folder)
+            db._save_keys()
+            db._save_keys()
+            media._persist_key("fixture-image-key")
+
+            def snapshot():
+                return {p.name: p.read_bytes() for p in Path(folder).iterdir()}
+
+            before = snapshot()
+            with patch("win32crypt.CryptProtectData", side_effect=OSError("fixture")):
+                with self.assertRaisesRegex(RuntimeError, "DPAPI"):
+                    db._save_keys()
+                with self.assertRaisesRegex(RuntimeError, "DPAPI"):
+                    media._persist_key("replacement")
+            self.assertEqual(snapshot(), before)
+
+    def test_failed_replace_cleans_up_and_keeps_previous_cache(self):
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "stable.json"
+            old = _protect_key_cache(b"old fixture")
+            path.write_bytes(old)
+            with patch("os.replace", side_effect=PermissionError("fixture")):
+                with self.assertRaises(PermissionError):
+                    _replace_cache_file(str(path), _protect_key_cache(b"new fixture"))
+            self.assertEqual(list(Path(folder).iterdir()), [path])
+            self.assertEqual(path.read_bytes(), old)
+
+    def test_missing_dpapi_writes_nothing(self):
+        with TemporaryDirectory() as folder, patch.dict(sys.modules, {"win32crypt": None}):
+            db, media = self._fixture(folder)
+            for save in (db._save_keys, lambda: media._persist_key("fixture")):
+                with self.assertRaisesRegex(RuntimeError, "DPAPI"):
+                    save()
+            self.assertEqual(list(Path(folder).iterdir()), [])
+
+    def test_migrate_legacy_backup_and_image_store(self):
+        for source in ("keys.json", "keys.json.bak"):
+            with self.subTest(source=source), TemporaryDirectory() as folder:
+                db, media = self._fixture(folder)
+                old = b'{"previous.db":"aabb"}'
+                (Path(folder) / source).write_bytes(old)
+                Path(media._key_store()).write_bytes(b'{"other":"previous image key"}')
+                db._save_keys()
+                media._persist_key("fixture-image-key")
+                for p in Path(folder).iterdir():
+                    self.assertTrue(p.read_bytes().startswith(b"dpapi1:"))
+                backup = (Path(folder) / "keys.json.bak").read_bytes()
+                self.assertEqual(_unprotect_key_cache(backup), old)
+                self.assertEqual(db._load_key_cache(db._stable_key_file()), db._keys)
+                self.assertEqual(media._read_key_store(),
+                                 {"other": "previous image key", "fixture": "fixture-image-key"})
 
     def test_plaintext_passthrough(self):
         old = b'{"chat.db": "eeff"}'

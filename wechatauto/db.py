@@ -191,10 +191,8 @@ def _verify_enc_key(enc_key: bytes, page1: bytes, salt: Optional[bytes] = None) 
 # ---------------------------------------------------------------------------
 # 密钥缓存加密（DPAPI）
 # ---------------------------------------------------------------------------
-# keys.json 曾明文落盘两处（TEMP 工作目录 + 用户目录稳定副本），谁的 SQLCipher
-# 密钥谁能解库 —— 值得按当前 Windows 用户加密。无前缀 = 旧明文缓存，读取时
-# 原样解析（兼容），下一次保存自然升级为密文；没有 pywin32 的环境保存时退回
-# 明文（与旧版行为一致，不新增失败模式）。
+# 新写入的主缓存、备份和稳定副本均须经当前用户的 DPAPI 保护。
+# 旧明文缓存仍可读取；保存时先完成加密，再打开目标文件。
 
 _KEY_CACHE_PREFIX = b"dpapi1:"
 
@@ -203,10 +201,26 @@ def _protect_key_cache(payload: bytes) -> bytes:
     try:
         import win32crypt
         blob = win32crypt.CryptProtectData(
-            payload, "wechatauto-keys", None, None, None, 0)
+            payload, "wechatauto-keys", None, None, None, 1)
+        if not blob:
+            raise ValueError("DPAPI 未返回密文")
         return _KEY_CACHE_PREFIX + base64.b64encode(blob)
     except Exception:
-        return payload
+        raise RuntimeError("Windows DPAPI 无法保护密钥缓存，已中止保存") from None
+
+
+def _replace_cache_file(path: str, ciphertext: bytes) -> None:
+    """同目录临时写入并替换；失败时保留原文件并清理本次临时文件。"""
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".wechatauto-cache-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(ciphertext)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 def _unprotect_key_cache(raw: bytes) -> bytes:
@@ -1371,30 +1385,19 @@ class WeChatDB:
             return
         data = {k: v.hex() for k, v in self._keys.items()}
         blob = _protect_key_cache(json.dumps(data, indent=2).encode("utf-8"))
-        try:
-            os.makedirs(os.path.dirname(self.keys_file), exist_ok=True)
-            tmp = self.keys_file + ".tmp"
-            with open(tmp, "wb") as f:
-                f.write(blob)
-            if os.path.exists(self.keys_file):
-                try:
-                    with open(self.keys_file, "rb") as src, \
-                            open(self.keys_file + ".bak", "wb") as dst:
-                        dst.write(src.read())
-                except OSError:
-                    pass
-            os.replace(tmp, self.keys_file)
-        except OSError:
-            pass
-        # 稳定副本
+        backup = self.keys_file + ".bak"
+        # 主缓存缺失时也升级单独留存的旧备份。
+        previous = self.keys_file if os.path.isfile(self.keys_file) else backup
+        if os.path.isfile(previous):
+            with open(previous, "rb") as src:
+                old = src.read()
+            if not old.startswith(_KEY_CACHE_PREFIX):
+                old = _protect_key_cache(old)
+            _replace_cache_file(backup, old)
+        _replace_cache_file(self.keys_file, blob)
         sf = self._stable_key_file()
         if sf:
-            try:
-                os.makedirs(os.path.dirname(sf), exist_ok=True)
-                with open(sf, "wb") as f:
-                    f.write(blob)
-            except OSError:
-                pass
+            _replace_cache_file(sf, blob)
 
     # ------------------------------------------------------------------
     # 解密与查询
